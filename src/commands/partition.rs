@@ -5,10 +5,12 @@ use crate::sequence_index::{SequenceIndex, UnifiedSequenceIndex};
 use coitrees::Interval;
 use log::{debug, info};
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 //use std::time::Instant;
 
 /// Helper function to create output file path with optional output folder
@@ -1476,4 +1478,928 @@ fn parse_range(range_parts: &[&str]) -> io::Result<(i32, i32)> {
     }
 
     Ok((start, end))
+}
+
+// ==================== BY-DEPTH MODE IMPLEMENTATION ====================
+
+/// Alignment information for depth-based partitioning
+#[derive(Debug, Clone)]
+struct DepthAlignmentInfo {
+    query_seq: String,
+    query_start: i32,
+    query_end: i32,
+    ref_start: i32,
+    ref_end: i32,
+    identity: f64,
+}
+
+/// Window with depth information
+#[derive(Debug, Clone)]
+struct DepthWindow {
+    window_id: usize,
+    target_seq: String,
+    start: i32,
+    end: i32,
+    depth: usize,
+    n_samples: usize,
+    alignments: Vec<Arc<DepthAlignmentInfo>>,  // Phase 1: Arc for cheap cloning
+    overlap_cache: Vec<(i32, i32, i32)>,       // Phase 2: (overlap_start, overlap_end, coverage_len)
+}
+
+/// Chunk definition for parallel processing
+#[derive(Debug, Clone)]
+struct SampleChunk {
+    seq_id: u32,
+    core_start: i32,
+    core_end: i32,
+    buffer_start: i32,
+    buffer_end: i32,
+}
+
+/// Deduplication tracker for processed regions
+struct ProcessedRegions {
+    regions: FxHashMap<String, Vec<(i32, i32)>>,
+}
+
+impl ProcessedRegions {
+    fn new() -> Self {
+        ProcessedRegions {
+            regions: FxHashMap::default(),
+        }
+    }
+
+    /// Get unprocessed intervals within [start, end]
+    fn get_unprocessed_intervals(&self, seq_name: &str, start: i32, end: i32) -> Vec<(i32, i32)> {
+        let Some(processed) = self.regions.get(seq_name) else {
+            return vec![(start, end)];
+        };
+
+        // Merge overlapping processed intervals
+        let mut merged = processed.clone();
+        if merged.is_empty() {
+            return vec![(start, end)];
+        }
+
+        merged.sort_by_key(|&(s, _)| s);
+        let mut merged_result = vec![merged[0]];
+        for &(s, e) in &merged[1..] {
+            let last_idx = merged_result.len() - 1;
+            if s <= merged_result[last_idx].1 {
+                merged_result[last_idx].1 = merged_result[last_idx].1.max(e);
+            } else {
+                merged_result.push((s, e));
+            }
+        }
+
+        // Find gaps (unprocessed regions)
+        let mut gaps = Vec::new();
+        let mut current = start;
+        for &(proc_start, proc_end) in &merged_result {
+            if current < proc_start {
+                gaps.push((current, proc_start.min(end)));
+            }
+            current = current.max(proc_end);
+            if current >= end {
+                break;
+            }
+        }
+
+        if current < end {
+            gaps.push((current, end));
+        }
+
+        gaps
+    }
+
+    /// Mark region as processed
+    fn mark(&mut self, seq_name: String, start: i32, end: i32) {
+        self.regions
+            .entry(seq_name)
+            .or_default()
+            .push((start, end));
+    }
+
+    /// Phase 4: Batch mark multiple regions
+    fn batch_mark(&mut self, marks: Vec<(String, i32, i32)>) {
+        for (seq_name, start, end) in marks {
+            self.regions
+                .entry(seq_name)
+                .or_default()
+                .push((start, end));
+        }
+    }
+}
+
+/// Event for sweep line algorithm
+#[derive(Debug, Clone, Copy)]
+enum EventType {
+    Start,
+    End,
+}
+
+#[derive(Debug, Clone)]
+struct Event {
+    pos: i32,
+    event_type: EventType,
+    aln_idx: usize,
+}
+
+impl Eq for Event {}
+
+impl PartialEq for Event {
+    fn eq(&self, other: &Self) -> bool {
+        self.pos == other.pos && matches!((self.event_type, other.event_type), (EventType::Start, EventType::Start) | (EventType::End, EventType::End))
+    }
+}
+
+impl Ord for Event {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.pos.cmp(&other.pos).then_with(|| {
+            // End events before Start events at same position
+            match (&self.event_type, &other.event_type) {
+                (EventType::End, EventType::Start) => Ordering::Less,
+                (EventType::Start, EventType::End) => Ordering::Greater,
+                _ => Ordering::Equal,
+            }
+        })
+    }
+}
+
+impl PartialOrd for Event {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Extract species name from PanSN formatted sequence name
+fn extract_species_name(seq_name: &str, delimiter: &str) -> String {
+    seq_name
+        .split(delimiter)
+        .next()
+        .unwrap_or(seq_name)
+        .to_string()
+}
+
+/// Merge alignments that are close on both target and query sequences
+fn merge_close_alignments(
+    alignments: &mut Vec<DepthAlignmentInfo>,
+    max_gap: i32,
+) {
+    if alignments.is_empty() || max_gap < 0 {
+        return;
+    }
+
+    // Sort by query_seq, then by ref_start
+    alignments.sort_by(|a, b| {
+        a.query_seq
+            .cmp(&b.query_seq)
+            .then_with(|| a.ref_start.cmp(&b.ref_start))
+    });
+
+    let mut write_idx = 0;
+    for read_idx in 1..alignments.len() {
+        let can_merge = {
+            let curr = &alignments[write_idx];
+            let next = &alignments[read_idx];
+
+            // Must be same query sequence
+            if curr.query_seq != next.query_seq {
+                false
+            } else {
+                // Check gaps on both target and query
+                let ref_gap = next.ref_start - curr.ref_end;
+                let query_gap = if curr.query_start <= curr.query_end && next.query_start <= next.query_end {
+                    next.query_start - curr.query_end
+                } else if curr.query_start > curr.query_end && next.query_start > next.query_end {
+                    curr.query_start - next.query_end  // Both reverse
+                } else {
+                    i32::MAX  // Different orientations, don't merge
+                };
+
+                ref_gap >= 0 && ref_gap <= max_gap && query_gap >= 0 && query_gap <= max_gap
+            }
+        };
+
+        if can_merge {
+            // Merge next into current
+            alignments[write_idx].ref_end = alignments[read_idx].ref_end;
+            if alignments[write_idx].query_start <= alignments[write_idx].query_end {
+                alignments[write_idx].query_end = alignments[read_idx].query_end;
+            } else {
+                alignments[write_idx].query_start = alignments[read_idx].query_start;
+            }
+            // Recalculate identity as weighted average
+            let len1 = (alignments[write_idx].ref_end - alignments[write_idx].ref_start) as f64;
+            let len2 = (alignments[read_idx].ref_end - alignments[read_idx].ref_start) as f64;
+            alignments[write_idx].identity =
+                (alignments[write_idx].identity * len1 + alignments[read_idx].identity * len2) / (len1 + len2);
+        } else {
+            write_idx += 1;
+            if write_idx != read_idx {
+                alignments[write_idx] = alignments[read_idx].clone();
+            }
+        }
+    }
+
+    alignments.truncate(write_idx + 1);
+}
+
+/// Build depth windows using sweep line algorithm with Phase 1+2 optimizations
+fn build_depth_windows_sweep_line(
+    target_seq: &str,
+    interval_start: i32,
+    interval_end: i32,
+    alignments: &[DepthAlignmentInfo],
+    min_depth: usize,
+    sample_delimiter: &str,
+) -> Vec<DepthWindow> {
+    if alignments.is_empty() {
+        return Vec::new();
+    }
+
+    // Phase 5a: Pre-allocate with capacity
+    let mut events = Vec::with_capacity(alignments.len() * 2);
+
+    // Create events for each alignment
+    for (idx, aln) in alignments.iter().enumerate() {
+        events.push(Event {
+            pos: aln.ref_start.max(interval_start),
+            event_type: EventType::Start,
+            aln_idx: idx,
+        });
+        events.push(Event {
+            pos: aln.ref_end.min(interval_end),
+            event_type: EventType::End,
+            aln_idx: idx,
+        });
+    }
+
+    // Sort events
+    events.sort();
+
+    let mut windows = Vec::new();
+    let mut active_alignments: FxHashSet<usize> = FxHashSet::default();
+    let mut window_start = interval_start;
+
+    for event in events {
+        if event.pos > window_start && event.pos <= interval_end {
+            // Current depth (+1 for reference)
+            let depth = active_alignments.len() + 1;
+
+            if depth >= min_depth {
+                // Phase 1: Collect alignments as Arc for cheap cloning
+                let window_alignments: Vec<Arc<DepthAlignmentInfo>> = active_alignments
+                    .iter()
+                    .map(|&idx| Arc::new(alignments[idx].clone()))
+                    .collect();
+
+                // Calculate n_samples
+                let unique_samples: FxHashSet<String> = window_alignments
+                    .iter()
+                    .map(|aln| extract_species_name(&aln.query_seq, sample_delimiter))
+                    .collect();
+                let n_samples = unique_samples.len();
+
+                // Phase 2: Pre-compute overlap cache
+                let window_end = event.pos;
+                let overlap_cache: Vec<(i32, i32, i32)> = window_alignments
+                    .iter()
+                    .map(|aln| {
+                        let overlap_start = aln.ref_start.max(window_start);
+                        let overlap_end = aln.ref_end.min(window_end);
+                        let coverage_len = if overlap_end >= overlap_start {
+                            overlap_end - overlap_start + 1
+                        } else {
+                            0
+                        };
+                        (overlap_start, overlap_end, coverage_len)
+                    })
+                    .collect();
+
+                windows.push(DepthWindow {
+                    window_id: 0, // Will be assigned later
+                    target_seq: target_seq.to_string(),
+                    start: window_start,
+                    end: window_end,
+                    depth,
+                    n_samples,
+                    alignments: window_alignments,
+                    overlap_cache,
+                });
+            }
+
+            window_start = event.pos;
+        }
+
+        // Update active alignments
+        match event.event_type {
+            EventType::Start => {
+                active_alignments.insert(event.aln_idx);
+            }
+            EventType::End => {
+                active_alignments.remove(&event.aln_idx);
+            }
+        }
+    }
+
+    windows
+}
+
+/// Calculate effective window size (shortest best coverage among all species)
+fn calculate_effective_window_size(window: &DepthWindow, sample_delimiter: &str) -> i32 {
+    if window.alignments.is_empty() {
+        return window.end - window.start;
+    }
+
+    // For each species, find the longest alignment coverage
+    let mut species_to_best_len: FxHashMap<String, i32> = FxHashMap::default();
+
+    for (idx, aln) in window.alignments.iter().enumerate() {
+        let species = extract_species_name(&aln.query_seq, sample_delimiter);
+
+        // Phase 2: Use cached overlap instead of recalculating
+        let (_overlap_start, _overlap_end, coverage_len) = window.overlap_cache[idx];
+
+        species_to_best_len
+            .entry(species)
+            .and_modify(|best| *best = (*best).max(coverage_len))
+            .or_insert(coverage_len);
+    }
+
+    // Return minimum of best coverages
+    species_to_best_len
+        .values()
+        .min()
+        .copied()
+        .unwrap_or(window.end - window.start)
+}
+
+/// Merge small windows with neighbors (skip Phase 3 multi-pass approach)
+fn merge_small_windows(
+    windows: &mut Vec<DepthWindow>,
+    min_window_size: i32,
+    sample_delimiter: &str,
+) {
+    if windows.is_empty() {
+        return;
+    }
+
+    let mut i = 0;
+    while i < windows.len() {
+        let effective_size = calculate_effective_window_size(&windows[i], sample_delimiter);
+
+        if effective_size < min_window_size {
+            let can_merge_left = i > 0 && windows[i - 1].target_seq == windows[i].target_seq;
+            let can_merge_right =
+                i + 1 < windows.len() && windows[i].target_seq == windows[i + 1].target_seq;
+
+            if can_merge_left && can_merge_right {
+                // Choose direction with smaller total size
+                let left_total = windows[i].end - windows[i - 1].start;
+                let right_total = windows[i + 1].end - windows[i].start;
+
+                if left_total <= right_total {
+                    merge_windows_into_left(windows, i, sample_delimiter);
+                    // Don't increment i, check merged window again
+                } else {
+                    merge_windows_into_right(windows, i, sample_delimiter);
+                    // Don't increment i, check merged window again
+                }
+            } else if can_merge_left {
+                merge_windows_into_left(windows, i, sample_delimiter);
+            } else if can_merge_right {
+                merge_windows_into_right(windows, i, sample_delimiter);
+            } else {
+                // Cannot merge, keep as is
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Merge window[i] into window[i-1]
+fn merge_windows_into_left(windows: &mut Vec<DepthWindow>, i: usize, sample_delimiter: &str) {
+    // Extract data we need
+    let new_end = windows[i].end;
+    let additional_alignments: Vec<Arc<DepthAlignmentInfo>> = windows[i].alignments.iter().map(Arc::clone).collect();
+
+    // Extend left window
+    windows[i - 1].end = new_end;
+    windows[i - 1].alignments.extend(additional_alignments);
+
+    // Recompute overlap cache for merged window
+    let window_start = windows[i - 1].start;
+    let window_end = windows[i - 1].end;
+    windows[i - 1].overlap_cache = windows[i - 1]
+        .alignments
+        .iter()
+        .map(|aln| {
+            let overlap_start = aln.ref_start.max(window_start);
+            let overlap_end = aln.ref_end.min(window_end);
+            let coverage_len = if overlap_end >= overlap_start {
+                overlap_end - overlap_start + 1
+            } else {
+                0
+            };
+            (overlap_start, overlap_end, coverage_len)
+        })
+        .collect();
+
+    // Recalculate depth and n_samples
+    windows[i - 1].depth = windows[i - 1].alignments.len() + 1;
+    let unique_samples: FxHashSet<String> = windows[i - 1]
+        .alignments
+        .iter()
+        .map(|aln| extract_species_name(&aln.query_seq, sample_delimiter))
+        .collect();
+    windows[i - 1].n_samples = unique_samples.len();
+
+    // Remove merged window
+    windows.remove(i);
+}
+
+/// Merge window[i] into window[i+1]
+fn merge_windows_into_right(windows: &mut Vec<DepthWindow>, i: usize, sample_delimiter: &str) {
+    // Extend right window
+    windows[i + 1].start = windows[i].start;
+    let mut merged_alignments = windows[i].alignments.clone();
+    merged_alignments.extend(windows[i + 1].alignments.iter().map(Arc::clone));
+    windows[i + 1].alignments = merged_alignments;
+
+    // Recompute overlap cache for merged window
+    let window_start = windows[i + 1].start;
+    let window_end = windows[i + 1].end;
+    windows[i + 1].overlap_cache = windows[i + 1]
+        .alignments
+        .iter()
+        .map(|aln| {
+            let overlap_start = aln.ref_start.max(window_start);
+            let overlap_end = aln.ref_end.min(window_end);
+            let coverage_len = if overlap_end >= overlap_start {
+                overlap_end - overlap_start + 1
+            } else {
+                0
+            };
+            (overlap_start, overlap_end, coverage_len)
+        })
+        .collect();
+
+    // Recalculate depth and n_samples
+    windows[i + 1].depth = windows[i + 1].alignments.len() + 1;
+    let unique_samples: FxHashSet<String> = windows[i + 1]
+        .alignments
+        .iter()
+        .map(|aln| extract_species_name(&aln.query_seq, sample_delimiter))
+        .collect();
+    windows[i + 1].n_samples = unique_samples.len();
+
+    // Remove merged window
+    windows.remove(i);
+}
+
+/// Write window to table/matrix output
+fn write_window_to_table_matrix(
+    writer: &mut BufWriter<File>,
+    window: &DepthWindow,
+    all_species: &[String],
+    sample_delimiter: &str,
+) -> io::Result<()> {
+    // Build species -> best alignment map
+    let mut species_to_aln: FxHashMap<String, &DepthAlignmentInfo> = FxHashMap::default();
+
+    for aln in &window.alignments {
+        let species = extract_species_name(&aln.query_seq, sample_delimiter);
+
+        species_to_aln
+            .entry(species.clone())
+            .and_modify(|best| {
+                let best_len = best.ref_end - best.ref_start;
+                let curr_len = aln.ref_end - aln.ref_start;
+                if curr_len > best_len {
+                    *best = aln;
+                }
+            })
+            .or_insert(aln);
+    }
+
+    // Write table row
+    write!(
+        writer,
+        "{}\t{}\t{}\t{}\t{}\t{}",
+        window.window_id,
+        window.target_seq,
+        window.start,
+        window.end,
+        window.depth,
+        window.n_samples
+    )?;
+
+    // Write matrix columns for each species
+    for species in all_species {
+        if let Some(aln) = species_to_aln.get(species) {
+            let start = if aln.query_start <= aln.query_end {
+                aln.query_start
+            } else {
+                aln.query_end
+            };
+            let end = if aln.query_start <= aln.query_end {
+                aln.query_end
+            } else {
+                aln.query_start
+            };
+            let strand = if aln.query_start <= aln.query_end {
+                '+'
+            } else {
+                '-'
+            };
+
+            write!(
+                writer,
+                "\t{}:{}-{}:{}:{:.4}",
+                aln.query_seq, start, end, strand, aln.identity
+            )?;
+        } else {
+            write!(writer, "\t.")?;
+        }
+    }
+
+    writeln!(writer)?;
+    Ok(())
+}
+/// Process a single chunk and write results
+#[allow(clippy::too_many_arguments)]
+fn process_chunk(
+    impg: &Impg,
+    chunk: &SampleChunk,
+    processed_regions: &Arc<Mutex<ProcessedRegions>>,
+    window_id_counter: &Arc<Mutex<usize>>,
+    min_depth: usize,
+    min_window_size: i32,
+    sample_delimiter: &str,
+    merge_gap: i32,
+    table_writer: &Option<Arc<Mutex<BufWriter<File>>>>,
+    fasta_writer: &Option<Arc<Mutex<BufWriter<File>>>>,
+    paf_writer: &Option<Arc<Mutex<BufWriter<File>>>>,
+    all_species: &[String],
+    sequence_index: Option<&UnifiedSequenceIndex>,
+) -> io::Result<()> {
+    let seq_name = impg.seq_index.get_name(chunk.seq_id).unwrap();
+    
+    // Phase 4: Atomic check-and-mark under lock
+    let intervals_with_alignments = {
+        let mut processed = processed_regions.lock().unwrap();
+        
+        let unprocessed = processed.get_unprocessed_intervals(seq_name, chunk.buffer_start, chunk.buffer_end);
+        
+        let mut result = Vec::new();
+        for (int_start, int_end) in unprocessed {
+            // Query with extended range
+            let query_start = int_start.saturating_sub(1_000_000);
+            let query_end = int_end.saturating_add(1_000_000);
+            
+            let overlaps = impg.query(chunk.seq_id, query_start, query_end, false, None);
+
+            // Convert to DepthAlignmentInfo
+            let mut alignments: Vec<DepthAlignmentInfo> = overlaps
+                .into_iter()
+                .filter_map(|(query_interval, cigar, target_interval)| {
+                    let query_name = impg.seq_index.get_name(query_interval.metadata)?;
+                    let query_start = query_interval.first;
+                    let query_end = query_interval.last;
+
+                    // Use target_interval for ref coordinates
+                    let ref_start = target_interval.first.min(target_interval.last);
+                    let ref_end = target_interval.first.max(target_interval.last);
+
+                    let identity = if !cigar.is_empty() {
+                        calculate_identity(&cigar)
+                    } else {
+                        1.0
+                    };
+
+                    Some(DepthAlignmentInfo {
+                        query_seq: query_name.to_string(),
+                        query_start,
+                        query_end,
+                        ref_start,
+                        ref_end,
+                        identity,
+                    })
+                })
+                .collect();
+            
+            // Merge close alignments if requested
+            if merge_gap > 0 {
+                merge_close_alignments(&mut alignments, merge_gap);
+            }
+            
+            // Phase 4: Batch mark all query regions
+            let marks: Vec<(String, i32, i32)> = alignments
+                .iter()
+                .map(|aln| {
+                    let q_start = aln.query_start.min(aln.query_end);
+                    let q_end = aln.query_start.max(aln.query_end);
+                    (aln.query_seq.clone(), q_start, q_end)
+                })
+                .collect();
+            
+            processed.batch_mark(marks);
+            
+            result.push((int_start, int_end, alignments));
+        }
+        
+        result
+    }; // Lock released here
+    
+    // Build windows from alignments
+    let mut all_windows = Vec::new();
+    
+    for (int_start, int_end, alignments) in intervals_with_alignments {
+        let windows = build_depth_windows_sweep_line(
+            seq_name,
+            int_start,
+            int_end,
+            &alignments,
+            min_depth,
+            sample_delimiter,
+        );
+        
+        all_windows.extend(windows);
+    }
+    
+    // Merge small windows if needed
+    if min_window_size > 0 {
+        merge_small_windows(&mut all_windows, min_window_size, sample_delimiter);
+    }
+    
+    // Clip windows to core region
+    for window in &mut all_windows {
+        if window.start < chunk.core_start {
+            window.start = chunk.core_start;
+        }
+        if window.end > chunk.core_end {
+            window.end = chunk.core_end;
+        }
+    }
+    
+    // Filter windows outside core
+    all_windows.retain(|w| w.start < chunk.core_end && w.end > chunk.core_start);
+    
+    // Assign window IDs and write output
+    for mut window in all_windows {
+        // Get unique window ID
+        let window_id = {
+            let mut counter = window_id_counter.lock().unwrap();
+            let id = *counter;
+            *counter += 1;
+            id
+        };
+        
+        window.window_id = window_id;
+        
+        // Write to table if needed
+        if let Some(tw) = table_writer {
+            let mut writer = tw.lock().unwrap();
+            write_window_to_table_matrix(&mut writer, &window, all_species, sample_delimiter)?;
+        }
+        
+        // Write to FASTA if needed (simplified, sequence extraction would go here)
+        // Write to PAF if needed (alignment writing would go here)
+    }
+    
+    Ok(())
+}
+
+/// Calculate identity from CIGAR operations
+fn calculate_identity(cigar: &[CigarOp]) -> f64 {
+    let mut matches = 0u64;
+    let mut total = 0u64;
+    
+    for op in cigar {
+        let len = op.len() as u64;
+        match op.op() {
+            '=' => {
+                matches += len;
+                total += len;
+            }
+            'X' => {
+                total += len;
+            }
+            'M' => {
+                matches += len;
+                total += len;
+            }
+            _ => {}
+        }
+    }
+    
+    if total > 0 {
+        matches as f64 / total as f64
+    } else {
+        1.0
+    }
+}
+
+/// Create chunks for a sample's sequences
+fn create_sample_chunks(impg: &Impg, seq_ids: &[u32], buffer_size: i32) -> Vec<SampleChunk> {
+    let total_length: i64 = seq_ids
+        .iter()
+        .filter_map(|&id| impg.seq_index.get_len_from_id(id))
+        .map(|len| len as i64)
+        .sum();
+    
+    let num_threads = rayon::current_num_threads();
+    let num_chunks = (num_threads * 2).max(1);
+    let chunk_size = ((total_length / num_chunks as i64).max(1_000_000)) as i32;
+    
+    let mut chunks = Vec::new();
+    
+    for &seq_id in seq_ids {
+        let seq_len = impg.seq_index.get_len_from_id(seq_id).unwrap() as i32;
+        let mut pos = 0;
+        
+        while pos < seq_len {
+            let core_end = (pos + chunk_size).min(seq_len);
+            let buffer_start = pos.saturating_sub(buffer_size).max(0);
+            let buffer_end = core_end.saturating_add(buffer_size).min(seq_len);
+            
+            chunks.push(SampleChunk {
+                seq_id,
+                core_start: pos,
+                core_end,
+                buffer_start,
+                buffer_end,
+            });
+            
+            pos = core_end;
+        }
+    }
+    
+    chunks
+}
+
+/// Main entry point for by-depth partitioning with deduplication
+#[allow(clippy::too_many_arguments)]
+pub fn partition_by_depth_dedup(
+    impg: &Impg,
+    output_formats: &str,
+    output_folder: Option<&str>,
+    sequence_index: Option<&UnifiedSequenceIndex>,
+    min_depth: Option<usize>,
+    min_window_size: Option<i32>,
+    target_sequences: Option<&str>,
+    sample_delimiter: &str,
+    merge_gap_distance: Option<i32>,
+    buffer_size: i32,
+    _verbose: bool,
+) -> io::Result<()> {
+    let min_depth = min_depth.unwrap_or(2);
+    let min_window_size = min_window_size.unwrap_or(0);
+    let merge_gap = merge_gap_distance.unwrap_or(0);
+    
+    info!("Starting by-depth partitioning with min_depth={}, min_window_size={}", min_depth, min_window_size);
+    
+    // Parse output formats
+    let formats: Vec<&str> = output_formats.split(',').collect();
+    let needs_table = formats.contains(&"table");
+    let needs_fasta = formats.contains(&"fasta");
+    let needs_paf = formats.contains(&"paf");
+    
+    // Create output folder if needed
+    if let Some(folder) = output_folder {
+        std::fs::create_dir_all(folder)?;
+    }
+    
+    // Phase 5b: Parallel species collection
+    let all_species: Vec<String> = {
+        let species_set: FxHashSet<String> = (0..impg.seq_index.len() as u32)
+            .into_par_iter()
+            .filter_map(|seq_id| {
+                impg.seq_index.get_name(seq_id).map(|seq_name| {
+                    extract_species_name(seq_name, sample_delimiter)
+                })
+            })
+            .collect();
+        
+        let mut species_vec: Vec<String> = species_set.into_iter().collect();
+        species_vec.sort();
+        species_vec
+    };
+    
+    info!("Found {} unique species", all_species.len());
+    
+    // Initialize output writers
+    let table_writer = if needs_table {
+        let filename = create_output_path(output_folder, "by_depth_windows.tsv")?;
+        let file = File::create(filename)?;
+        let mut writer = BufWriter::new(file);
+        
+        // Write header
+        write!(&mut writer, "window_id\ttarget_seq\tstart\tend\tdepth\tn_samples")?;
+        for species in &all_species {
+            write!(&mut writer, "\t{}", species)?;
+        }
+        writeln!(&mut writer)?;
+        
+        Some(Arc::new(Mutex::new(writer)))
+    } else {
+        None
+    };
+    
+    let fasta_writer = if needs_fasta {
+        let filename = create_output_path(output_folder, "by_depth_sequences.fasta")?;
+        let file = File::create(filename)?;
+        Some(Arc::new(Mutex::new(BufWriter::new(file))))
+    } else {
+        None
+    };
+    
+    let paf_writer = if needs_paf {
+        let filename = create_output_path(output_folder, "by_depth_alignments.paf")?;
+        let file = File::create(filename)?;
+        Some(Arc::new(Mutex::new(BufWriter::new(file))))
+    } else {
+        None
+    };
+    
+    // Initialize global state
+    let processed_regions = Arc::new(Mutex::new(ProcessedRegions::new()));
+    let window_id_counter = Arc::new(Mutex::new(0usize));
+    
+    // Group sequences by sample
+    let mut sample_to_seqs: FxHashMap<String, Vec<u32>> = FxHashMap::default();
+    
+    for seq_id in 0..impg.seq_index.len() as u32 {
+        if let Some(seq_name) = impg.seq_index.get_name(seq_id) {
+            // Filter by target_sequences if specified
+            if let Some(target_file) = target_sequences {
+                // Load target list (simplified)
+                let targets: FxHashSet<String> = std::fs::read_to_string(target_file)?
+                    .lines()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .collect();
+                
+                if !targets.contains(seq_name) {
+                    continue;
+                }
+            }
+            
+            let sample = extract_species_name(seq_name, sample_delimiter);
+            sample_to_seqs.entry(sample).or_default().push(seq_id);
+        }
+    }
+    
+    let mut samples: Vec<String> = sample_to_seqs.keys().cloned().collect();
+    samples.sort();
+    
+    info!("Processing {} samples serially", samples.len());
+    
+    // Process each sample serially (for deduplication)
+    for (sample_idx, sample) in samples.iter().enumerate() {
+        let seqs = &sample_to_seqs[sample];
+        info!("Processing sample {}/{}: {} ({} sequences)", 
+              sample_idx + 1, samples.len(), sample, seqs.len());
+        
+        // Create chunks for this sample
+        let chunks = create_sample_chunks(impg, seqs, buffer_size);
+        
+        info!("  Created {} chunks for sample {}", chunks.len(), sample);
+        
+        // Process chunks in parallel
+        chunks.par_iter().try_for_each(|chunk| -> io::Result<()> {
+            process_chunk(
+                impg,
+                chunk,
+                &processed_regions,
+                &window_id_counter,
+                min_depth,
+                min_window_size,
+                sample_delimiter,
+                merge_gap,
+                &table_writer,
+                &fasta_writer,
+                &paf_writer,
+                &all_species,
+                sequence_index,
+            )
+        })?;
+    }
+    
+    info!("By-depth partitioning complete");
+    
+    // Flush all writers
+    if let Some(tw) = table_writer {
+        tw.lock().unwrap().flush()?;
+    }
+    if let Some(fw) = fasta_writer {
+        fw.lock().unwrap().flush()?;
+    }
+    if let Some(pw) = paf_writer {
+        pw.lock().unwrap().flush()?;
+    }
+    
+    Ok(())
 }
