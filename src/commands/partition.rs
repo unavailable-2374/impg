@@ -2146,29 +2146,39 @@ fn process_chunk(
     
     // Filter windows outside core
     all_windows.retain(|w| w.start < chunk.core_end && w.end > chunk.core_start);
-    
-    // Assign window IDs and write output
-    for mut window in all_windows {
-        // Get unique window ID
-        let window_id = {
-            let mut counter = window_id_counter.lock().unwrap();
-            let id = *counter;
-            *counter += 1;
-            id
-        };
-        
-        window.window_id = window_id;
-        
-        // Write to table if needed
-        if let Some(tw) = table_writer {
-            let mut writer = tw.lock().unwrap();
-            write_window_to_table_matrix(&mut writer, &window, all_species, sample_delimiter)?;
-        }
 
-        // Write to FASTA if needed
-        if let Some(fw) = fasta_writer {
-            if let Some(seq_index) = sequence_index {
-                let mut writer = fw.lock().unwrap();
+    if all_windows.is_empty() {
+        return Ok(());
+    }
+
+    // Phase 6: Batch assign window IDs (get lock once for all windows)
+    let base_window_id = {
+        let mut counter = window_id_counter.lock().unwrap();
+        let base = *counter;
+        *counter += all_windows.len();
+        base
+    };
+
+    // Assign window IDs
+    for (i, window) in all_windows.iter_mut().enumerate() {
+        window.window_id = base_window_id + i;
+    }
+
+    // Phase 6: Batch write to table (get lock once for all windows)
+    if let Some(tw) = table_writer {
+        let mut writer = tw.lock().unwrap();
+        for window in &all_windows {
+            write_window_to_table_matrix(&mut writer, window, all_species, sample_delimiter)?;
+        }
+    }
+
+    // Phase 6: Batch write to FASTA (get lock once for all windows)
+    if let Some(fw) = fasta_writer {
+        if let Some(seq_index) = sequence_index {
+            let mut writer = fw.lock().unwrap();
+
+            for window in &all_windows {
+                let window_id = window.window_id;
 
                 // Write target sequence
                 let target_seq = seq_index.fetch_sequence(seq_name, window.start, window.end)?;
@@ -2208,10 +2218,14 @@ fn process_chunk(
                 }
             }
         }
+    }
 
-        // Write to PAF if needed
-        if let Some(pw) = paf_writer {
-            let mut writer = pw.lock().unwrap();
+    // Phase 6: Batch write to PAF (get lock once for all windows)
+    if let Some(pw) = paf_writer {
+        let mut writer = pw.lock().unwrap();
+
+        for window in &all_windows {
+            let window_id = window.window_id;
 
             // Write PAF records for each alignment in the window
             for aln in &window.alignments {
@@ -2262,7 +2276,7 @@ fn process_chunk(
             }
         }
     }
-    
+
     Ok(())
 }
 
