@@ -2199,6 +2199,11 @@ fn process_chunk(
                         (aln.query_end, aln.query_start, '-')
                     };
 
+                    // Skip if coordinates are invalid (negative or too large)
+                    if query_start < 0 || query_end < 0 || query_start >= query_end {
+                        continue;
+                    }
+
                     let mut query_seq = seq_index.fetch_sequence(&aln.query_seq, query_start, query_end)?;
 
                     // Reverse complement if negative strand
