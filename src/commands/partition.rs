@@ -2164,9 +2164,103 @@ fn process_chunk(
             let mut writer = tw.lock().unwrap();
             write_window_to_table_matrix(&mut writer, &window, all_species, sample_delimiter)?;
         }
-        
-        // Write to FASTA if needed (simplified, sequence extraction would go here)
-        // Write to PAF if needed (alignment writing would go here)
+
+        // Write to FASTA if needed
+        if let Some(fw) = fasta_writer {
+            if let Some(seq_index) = sequence_index {
+                let mut writer = fw.lock().unwrap();
+
+                // Write target sequence
+                let target_seq = seq_index.fetch_sequence(seq_name, window.start, window.end)?;
+                writeln!(
+                    writer,
+                    ">window{}_target_{}:{}-{}",
+                    window_id, seq_name, window.start, window.end
+                )?;
+                for line in target_seq.chunks(80) {
+                    writeln!(writer, "{}", String::from_utf8_lossy(line))?;
+                }
+
+                // Write aligned sequences
+                for aln in &window.alignments {
+                    let (query_start, query_end, strand) = if aln.query_start <= aln.query_end {
+                        (aln.query_start, aln.query_end, '+')
+                    } else {
+                        (aln.query_end, aln.query_start, '-')
+                    };
+
+                    let mut query_seq = seq_index.fetch_sequence(&aln.query_seq, query_start, query_end)?;
+
+                    // Reverse complement if negative strand
+                    if strand == '-' {
+                        query_seq = crate::graph::reverse_complement(&query_seq);
+                    }
+
+                    let header_suffix = if strand == '-' { "/rc" } else { "" };
+                    writeln!(
+                        writer,
+                        ">window{}_query_{}:{}-{}{} identity={:.4}",
+                        window_id, aln.query_seq, query_start, query_end, header_suffix, aln.identity
+                    )?;
+                    for line in query_seq.chunks(80) {
+                        writeln!(writer, "{}", String::from_utf8_lossy(line))?;
+                    }
+                }
+            }
+        }
+
+        // Write to PAF if needed
+        if let Some(pw) = paf_writer {
+            let mut writer = pw.lock().unwrap();
+
+            // Write PAF records for each alignment in the window
+            for aln in &window.alignments {
+                let query_name = &aln.query_seq;
+                let query_len = impg.seq_index.get_id(query_name)
+                    .and_then(|id| impg.seq_index.get_len_from_id(id))
+                    .unwrap_or(0) as i32;
+
+                let (query_start, query_end, strand) = if aln.query_start <= aln.query_end {
+                    (aln.query_start, aln.query_end, '+')
+                } else {
+                    (aln.query_end, aln.query_start, '-')
+                };
+
+                let target_name = seq_name;
+                let target_len = impg.seq_index.get_id(target_name)
+                    .and_then(|id| impg.seq_index.get_len_from_id(id))
+                    .unwrap_or(0) as i32;
+
+                // Use alignment coordinates on target
+                let target_start = aln.ref_start;
+                let target_end = aln.ref_end;
+
+                // Calculate alignment statistics
+                let aln_len = (query_end - query_start).max(target_end - target_start);
+                let num_matches = (aln_len as f64 * aln.identity) as i32;
+                let mapq = 60; // High quality mapping
+
+                // Write PAF record
+                writeln!(
+                    writer,
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tid:f:{:.4}\twindow_id:i:{}",
+                    query_name,
+                    query_len,
+                    query_start,
+                    query_end,
+                    strand,
+                    target_name,
+                    target_len,
+                    target_start,
+                    target_end,
+                    num_matches,
+                    aln_len,
+                    mapq,
+                    aln.identity,
+                    window_id
+                )?;
+            }
+        }
     }
     
     Ok(())
