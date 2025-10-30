@@ -450,16 +450,102 @@ enum Args {
         #[clap(flatten)]
         paf: PafOpts,
 
-        /// Window size for partitioning
+        /// Partition mode: 'fixed-size' or 'by-depth'
         #[arg(help_heading = "Partition options")]
+        #[clap(long, value_parser, default_value = "fixed-size")]
+        mode: String,
+
+        // Fixed-size mode options
+        /// [fixed-size only] Window size for partitioning (required)
+        #[arg(help_heading = "Fixed-size mode options")]
         #[clap(short = 'w', long, value_parser)]
-        window_size: usize,
+        window_size: Option<usize>,
 
-        /// Output format: 'bed', 'gfa' (v1.0), 'maf', or 'fasta' ('gfa', 'maf', and 'fasta' require --sequence-files or --sequence-list)
-        #[arg(help_heading = "Output options")]
-        #[clap(short = 'o', long, value_parser, default_value = "bed")]
-        output_format: String,
+        /// [fixed-size only] Output format: 'bed', 'gfa' (v1.0), 'maf', or 'fasta'
+        #[arg(help_heading = "Fixed-size mode options")]
+        #[clap(short = 'o', long, value_parser)]
+        output_format: Option<String>,
 
+        /// [fixed-size only] Maximum distance between regions to merge
+        #[arg(help_heading = "Fixed-size mode options")]
+        #[clap(short = 'd', long, value_parser)]
+        merge_distance: Option<i32>,
+
+        /// [fixed-size only] Path to the file with sequence names to start with (one per line)
+        #[arg(help_heading = "Fixed-size mode options")]
+        #[clap(long, value_parser)]
+        starting_sequences_file: Option<String>,
+
+        #[arg(help_heading = "Fixed-size mode options")]
+        #[clap(
+            long,
+            value_parser,
+            help = "[fixed-size only] Selection mode for next sequence:\n\
+                - \"longest\": sequence with longest single missing region\n\
+                - \"total\": sequence with highest total missing regions\n\
+                - \"sample[,separator]\": sample with highest total missing regions\n\
+                - \"haplotype[,separator]\": haplotype highest total missing regions\n\
+                The sample/haplotype modes assume PanSN naming; '#' is the default separator."
+        )]
+        selection_mode: Option<String>,
+
+        /// [fixed-size only] Minimum region size for missing regions
+        #[arg(help_heading = "Fixed-size mode options")]
+        #[clap(long, value_parser)]
+        min_missing_size: Option<i32>,
+
+        /// [fixed-size only] Minimum distance from sequence start/end
+        #[arg(help_heading = "Fixed-size mode options")]
+        #[clap(long, value_parser)]
+        min_boundary_distance: Option<i32>,
+
+        /// [fixed-size only] Output separate files for each partition when 'bed'
+        #[arg(help_heading = "Fixed-size mode options")]
+        #[clap(long, action)]
+        separate_files: bool,
+
+        /// [fixed-size only] Minimum gap-compressed identity threshold (0.0-1.0)
+        #[arg(help_heading = "Fixed-size mode options")]
+        #[clap(long, value_parser)]
+        min_identity: Option<f64>,
+
+        // By-depth mode options
+        /// [by-depth only] Output formats (comma-separated): 'table', 'fasta', 'paf'
+        #[arg(help_heading = "By-depth mode options")]
+        #[clap(long, value_parser)]
+        output_formats: Option<String>,
+
+        /// [by-depth only] Minimum depth threshold (skip windows with depth < this value)
+        #[arg(help_heading = "By-depth mode options")]
+        #[clap(long, value_parser)]
+        min_depth: Option<usize>,
+
+        /// [by-depth only] Minimum window size in bp (skip windows smaller than this)
+        #[arg(help_heading = "By-depth mode options")]
+        #[clap(long, value_parser)]
+        min_window_size: Option<i32>,
+
+        /// [by-depth only] Only process specified sequences (one per line in file)
+        #[arg(help_heading = "By-depth mode options")]
+        #[clap(long, value_parser)]
+        target_sequences: Option<String>,
+
+        /// [by-depth only] PanSN delimiter for extracting sample names
+        #[arg(help_heading = "By-depth mode options")]
+        #[clap(long, value_parser, default_value = "#")]
+        sample_delimiter: String,
+
+        /// [by-depth only] Merge alignments with gaps <= this value on BOTH target and query (0 = no merging)
+        #[arg(help_heading = "By-depth mode options")]
+        #[clap(long, value_parser)]
+        merge_gap_distance: Option<i32>,
+
+        /// [by-depth only] Buffer size in bp for chunk boundaries (default: 500000)
+        #[arg(help_heading = "By-depth mode options")]
+        #[clap(long, value_parser, default_value_t = 500000)]
+        buffer_size: i32,
+
+        // Shared options
         /// Output folder for partition files (default: current directory)
         #[arg(help_heading = "Output options")]
         #[clap(long, value_parser)]
@@ -468,52 +554,8 @@ enum Args {
         #[clap(flatten)]
         gfa_maf_fasta: GfaMafFastaOpts,
 
-        /// Maximum distance between regions to merge
-        #[arg(help_heading = "Filtering and merging")]
-        #[clap(short = 'd', long, value_parser, default_value_t = 100000)]
-        merge_distance: i32,
-
-        /// Minimum gap-compressed identity threshold (0.0-1.0)
-        #[arg(help_heading = "Filtering and merging")]
-        #[clap(long, value_parser)]
-        min_identity: Option<f64>,
-
         #[clap(flatten)]
         transitive_opts: TransitiveOpts,
-
-        /// Path to the file with sequence names to start with (one per line)
-        #[arg(help_heading = "Partition options")]
-        #[clap(long, value_parser)]
-        starting_sequences_file: Option<String>,
-
-        #[arg(help_heading = "Partition options")]
-        #[clap(
-            long,
-            value_parser,
-            default_value = "longest",
-            help = "Selection mode for next sequence:\n\
-                - \"longest\": sequence with longest single missing region\n\
-                - \"total\": sequence with highest total missing regions\n\
-                - \"sample[,separator]\": sample with highest total missing regions\n\
-                - \"haplotype[,separator]\": haplotype highest total missing regions\n\
-                The sample/haplotype modes assume PanSN naming; '#' is the default separator."
-        )]
-        selection_mode: String,
-
-        /// Minimum region size for missing regions
-        #[arg(help_heading = "Partition options")]
-        #[clap(long, value_parser, default_value_t = 3000)]
-        min_missing_size: i32,
-
-        /// Minimum distance from sequence start/end - closer regions will be extended to the boundaries
-        #[arg(help_heading = "Partition options")]
-        #[clap(long, value_parser, default_value_t = 3000)]
-        min_boundary_distance: i32,
-
-        /// Output separate files for each partition when 'bed'
-        #[arg(help_heading = "Partition options")]
-        #[clap(long, action)]
-        separate_files: bool,
 
         #[clap(flatten)]
         common: CommonOpts,
@@ -736,6 +778,7 @@ fn main() -> io::Result<()> {
         Args::Partition {
             common,
             paf,
+            mode,
             window_size,
             output_format,
             output_folder,
@@ -748,61 +791,125 @@ fn main() -> io::Result<()> {
             min_missing_size,
             min_boundary_distance,
             separate_files,
+            output_formats,
+            min_depth,
+            min_window_size,
+            target_sequences,
+            sample_delimiter,
+            merge_gap_distance,
+            buffer_size,
         } => {
             initialize_threads_and_log(&common);
 
-            validate_selection_mode(&selection_mode)?;
-            validate_output_format(&output_format, &["bed", "gfa", "maf", "fasta", "fasta-aln"])?;
-
-            validate_region_size(
-                0,
-                window_size as i32,
-                &output_format,
-                merge_distance,
-                gfa_maf_fasta.force_large_region,
-            )?;
-
-            // Validate single-file output compatibility
-            if !separate_files && output_format != "bed" {
+            // Validate mode
+            if mode != "fixed-size" && mode != "by-depth" {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!(
-                        "Single-file output is only supported for BED format. Use --separate-files for {} format.",
-                        output_format.to_uppercase()
-                    ),
+                    format!("Invalid mode: {}. Must be 'fixed-size' or 'by-depth'", mode),
                 ));
             }
 
-            // Extract reverse_complement before moving gfa_maf_fasta
-            let reverse_complement = gfa_maf_fasta.reverse_complement;
-
-            // Setup POA/sequence resources
-            let (sequence_index, scoring_params) =
-                gfa_maf_fasta.setup_output_resources(&output_format, false)?;
-
             let impg = initialize_impg(&common, &paf)?;
 
-            partition::partition_alignments(
-                &impg,
-                window_size,
-                starting_sequences_file.as_deref(),
-                &selection_mode,
-                merge_distance,
-                min_identity,
-                min_missing_size,
-                min_boundary_distance,
-                transitive_opts.transitive_dfs,
-                transitive_opts.max_depth,
-                transitive_opts.min_transitive_len,
-                transitive_opts.min_distance_between_ranges,
-                &output_format,
-                output_folder.as_deref(),
-                sequence_index.as_ref(),
-                scoring_params,
-                reverse_complement,
-                common.verbose > 1,
-                separate_files,
-            )?;
+            match mode.as_str() {
+                "fixed-size" => {
+                    // Validate fixed-size mode parameters
+                    let window_size = window_size.ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "fixed-size mode requires --window-size",
+                        )
+                    })?;
+                    let output_format = output_format.as_deref().unwrap_or("bed");
+                    let selection_mode = selection_mode.as_deref().unwrap_or("longest");
+                    let merge_distance = merge_distance.unwrap_or(100000);
+                    let min_missing_size = min_missing_size.unwrap_or(3000);
+                    let min_boundary_distance = min_boundary_distance.unwrap_or(3000);
+
+                    validate_selection_mode(selection_mode)?;
+                    validate_output_format(output_format, &["bed", "gfa", "maf", "fasta", "fasta-aln"])?;
+
+                    validate_region_size(
+                        0,
+                        window_size as i32,
+                        output_format,
+                        merge_distance,
+                        gfa_maf_fasta.force_large_region,
+                    )?;
+
+                    // Validate single-file output compatibility
+                    if !separate_files && output_format != "bed" {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "Single-file output is only supported for BED format. Use --separate-files for {} format.",
+                                output_format.to_uppercase()
+                            ),
+                        ));
+                    }
+
+                    // Extract reverse_complement before moving gfa_maf_fasta
+                    let reverse_complement = gfa_maf_fasta.reverse_complement;
+
+                    // Setup POA/sequence resources
+                    let (sequence_index, scoring_params) =
+                        gfa_maf_fasta.setup_output_resources(output_format, false)?;
+
+                    partition::partition_alignments(
+                        &impg,
+                        window_size,
+                        starting_sequences_file.as_deref(),
+                        selection_mode,
+                        merge_distance,
+                        min_identity,
+                        min_missing_size,
+                        min_boundary_distance,
+                        transitive_opts.transitive_dfs,
+                        transitive_opts.max_depth,
+                        transitive_opts.min_transitive_len,
+                        transitive_opts.min_distance_between_ranges,
+                        output_format,
+                        output_folder.as_deref(),
+                        sequence_index.as_ref(),
+                        scoring_params,
+                        reverse_complement,
+                        common.verbose > 1,
+                        separate_files,
+                    )?;
+                }
+                "by-depth" => {
+                    // Validate by-depth mode parameters
+                    let output_formats = output_formats.as_deref().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "by-depth mode requires --output-formats",
+                        )
+                    })?;
+
+                    // Setup sequence index if needed for fasta/paf output
+                    let sequence_index = if output_formats.contains("fasta") || output_formats.contains("paf") {
+                        let (seq_idx, _) = gfa_maf_fasta.setup_output_resources("fasta", false)?;
+                        seq_idx
+                    } else {
+                        None
+                    };
+
+                    partition::partition_by_depth_dedup(
+                        &impg,
+                        output_formats,
+                        output_folder.as_deref(),
+                        sequence_index.as_ref(),
+                        min_depth,
+                        min_window_size,
+                        target_sequences.as_deref(),
+                        &sample_delimiter,
+                        merge_gap_distance,
+                        buffer_size,
+                        common.verbose > 0,
+                    )?;
+                }
+                _ => unreachable!("Mode already validated above"),
+            }
         }
         Args::Query {
             common,
