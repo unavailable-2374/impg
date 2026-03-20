@@ -106,7 +106,7 @@ struct CommonOpts {
 struct AlnOpts {
     // --- Aligner backend ---
     /// Aligner
-    #[clap(long, value_parser = ["fastga", "wfmash"], default_value = "wfmash")]
+    #[clap(long, value_parser = ["fastga", "wfmash"], default_value = "fastga")]
     aligner: String,
 
     // --- General alignment options ---
@@ -174,11 +174,11 @@ struct AlnOpts {
     min_map_length: u64,
 
     // --- fastga-specific options ---
-    /// [fastga] K-mer frequency multiplier (frequency = num_sequences * multiplier)
+    /// [fastga] K-mer frequency multiplier (frequency = num_genomes * multiplier)
     #[clap(
         long = "fastga-frequency-multiplier",
         value_parser,
-        default_value_t = 10
+        default_value_t = 1
     )]
     fastga_frequency_multiplier: usize,
 
