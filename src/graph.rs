@@ -5,7 +5,7 @@ use spoa_rs::{AlignmentEngine, AlignmentType as SpoaAlignmentType, Graph as Spoa
 use std::io::{self, BufWriter, Write};
 
 // Gfasort imports for graph sorting
-use gfasort::gfa_parser::load_gfa;
+use gfasort::gfa_parser::{load_gfa, load_gfa_from_str};
 use gfasort::ygs::{unchop_only, ygs_sort, YgsParams};
 
 #[derive(Clone)]
@@ -713,14 +713,7 @@ pub fn reverse_complement(seq: &[u8]) -> Vec<u8> {
 /// Compact consecutive nodes (unchop) without sorting.
 /// Reduces 1-bp SPOA nodes into longer segments early, shrinking the graph for downstream steps.
 pub(crate) fn unchop_gfa(gfa_content: &str) -> io::Result<String> {
-    let temp_gfa = tempfile::Builder::new()
-        .suffix(".gfa")
-        .tempfile()
-        .map_err(|e| io::Error::other(format!("unchop: failed to create temp file: {}", e)))?;
-    std::fs::write(temp_gfa.path(), gfa_content)
-        .map_err(|e| io::Error::other(format!("unchop: failed to write temp file: {}", e)))?;
-
-    let mut graph = load_gfa(temp_gfa.path())
+    let mut graph = load_gfa_from_str(gfa_content)
         .map_err(|e| io::Error::other(format!("unchop: failed to load GFA: {}", e)))?;
 
     if graph.nodes.iter().filter(|n| n.is_some()).count() <= 1 {
@@ -751,17 +744,8 @@ pub fn normalize_and_sort(gfa: String, num_threads: usize) -> io::Result<String>
 }
 
 pub fn sort_gfa(gfa_content: &str, num_threads: usize) -> io::Result<String> {
-    // Write GFA to temp file (gfasort's load_gfa requires a file path)
-    let temp_gfa = tempfile::Builder::new()
-        .suffix(".gfa")
-        .tempfile()
-        .map_err(|e| io::Error::other(format!("Failed to create temp GFA file: {}", e)))?;
-
-    std::fs::write(temp_gfa.path(), gfa_content)
-        .map_err(|e| io::Error::other(format!("Failed to write temp GFA: {}", e)))?;
-
-    // Load GFA into gfasort's graph structure
-    let mut graph = load_gfa(temp_gfa.path())
+    // Load GFA directly from string (no temp file round-trip)
+    let mut graph = load_gfa_from_str(gfa_content)
         .map_err(|e| io::Error::other(format!("Failed to load GFA for sorting: {}", e)))?;
 
     // Skip sorting for trivial graphs (0 or 1 node)
