@@ -57,6 +57,8 @@ pub struct EngineOpts {
     pub sparse_factor: f32,
     pub transclose_batch: u64,
     pub disk_backed: bool,
+    /// Optional temp directory for intermediate files
+    pub temp_dir: Option<String>,
     // Smoothxg-style smoothing parameters (pggb engine)
     /// Target POA length(s) per pass — one value per smoothing pass (default: [700, 1100]).
     pub target_poa_lengths: Vec<usize>,
@@ -75,6 +77,11 @@ pub fn dispatch_gfa_engine(
     scoring_params: Option<(u8, u8, u8, u8, u8, u8)>,
     engine_opts: &EngineOpts,
 ) -> std::io::Result<String> {
+    // Set TMPDIR for external tools (FastGA, etc.) that read it
+    if let Some(ref temp_dir) = engine_opts.temp_dir {
+        std::env::set_var("TMPDIR", temp_dir);
+    }
+
     // Create debug dir once — needed by both seqwish and pggb pipelines.
     if let Some(ref dir) = engine_opts.debug_dir {
         std::fs::create_dir_all(dir).map_err(|e| {
@@ -107,6 +114,7 @@ pub fn dispatch_gfa_engine(
         sparse_factor: engine_opts.sparse_factor,
         transclose_batch: engine_opts.transclose_batch,
         use_in_memory: !engine_opts.disk_backed,
+        temp_dir: engine_opts.temp_dir.clone(),
         ..graph::SeqwishConfig::default()
     };
 
