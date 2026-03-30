@@ -331,6 +331,7 @@ impl EngineCliOpts {
             &self.seqwish,
             &self.smooth,
             self.debug_dir.clone(),
+            resolve_temp_dir(self.aln.temp_dir.clone()),
         )
     }
 }
@@ -2319,6 +2320,7 @@ fn build_engine_opts(
     seqwish: &SeqwishOpts,
     smooth: &SmoothOpts,
     debug_dir: Option<String>,
+    temp_dir: Option<String>,
 ) -> io::Result<EngineOpts> {
     Ok(EngineOpts {
         engine,
@@ -2344,6 +2346,7 @@ fn build_engine_opts(
         sparse_factor: seqwish.sparse_factor,
         transclose_batch: seqwish.transclose_batch,
         disk_backed: seqwish.disk_backed,
+        temp_dir,
         target_poa_lengths: smooth.parse_target_poa_lengths()?,
         max_node_length: smooth.max_node_length,
         poa_padding_fraction: smooth.poa_padding_fraction,
