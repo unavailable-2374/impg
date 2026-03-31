@@ -49,7 +49,9 @@ cargo fmt                      # Format code
 - `src/paf.rs`: PAF file parsing and CIGAR handling
 - `src/sequence_index.rs`: Unified sequence access for FASTA and AGC archives
 - `src/forest_map.rs`: Interval tree forest mapping sequences to their alignment trees
-- `src/commands/`: Subcommands (partition, refine, similarity, lace)
+- `src/commands/`: Subcommands (depth, partition, refine, similarity, lace)
+- `src/commands/depth.rs`: Depth computation — two-phase global depth, region queries, sweep-line algorithm
+- `src/multi_impg.rs`: Multi-file index with lazy sub-index loading and tree caching
 
 ### .1aln Format Details
 
@@ -74,6 +76,7 @@ The tool supports finding alignments connected through multiple hops:
 ## Commands
 
 - **query**: Query overlapping alignments for a region or BED file
+- **depth**: Compute per-position coverage depth across samples (see `notes/DEPTH_COMMAND.md`)
 - **partition**: Partition alignments into windows across sequences
 - **refine**: Refine loci to maximize sample support
 - **similarity**: Compute pairwise similarity matrices with optional PCA
@@ -138,6 +141,16 @@ Test data is in `tests/test_data/` with sample FASTA and AGC files. Key testing 
 - Test transitive queries at various depths (-m 1, -m 2, -m 10)
 - Compare approximate mode results to normal mode for accuracy
 - Test edge cases: reverse strand alignments, overlapping intervals
+
+### Depth Command Architecture
+
+The depth command (`src/commands/depth.rs`) computes per-position coverage depth:
+
+- **Two-phase global depth**: Phase 1 processes hub sequences (high degree or `--ref` sample) as anchors; Phase 2 processes remaining unprocessed regions. `ConcurrentProcessedTracker` prevents double-counting.
+- **Transitive depth**: Default uses raw-interval BFS (`depth_transitive_bfs()`) with linear interpolation — faster, no CIGAR needed. `--use-BFS` flag enables CIGAR-precise BFS for base-level precision.
+- **Sweep-line depth counting**: `sweep_line_depth()` is a pure sweep-line that counts unique samples per position. Callers add a synthetic anchor alignment covering `[region_start, region_end]` so depth naturally includes the anchor sample. depth = total unique samples sharing each position.
+- **5MB chunk splitting** (`TRANSITIVE_CHUNK_SIZE`): Global transitive mode splits large sequences into 5MB chunks for BFS to limit memory.
+- **Pre-scan memory**: When using `--index-mode per-file` with many files, tree cache must be disabled during `compute_alignment_degrees()` pre-scan to prevent loading all sub-indices simultaneously (`set_tree_cache_enabled(false)` + `clear_sub_index_cache()`).
 
 ## Debugging
 
