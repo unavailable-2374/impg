@@ -100,12 +100,16 @@ impl Default for SampleFilter {
 /// Statistics for depth distribution across all sequences
 #[derive(Debug, Clone, Default)]
 pub struct DepthStats {
-    /// Total bases analyzed
+    /// Total bases analyzed (anchor perspective: sum of anchor interval lengths)
     pub total_bases: i64,
-    /// Distribution: depth -> total bases at that depth
+    /// Distribution: depth -> total bases at that depth (anchor perspective)
     pub depth_distribution: FxHashMap<usize, i64>,
     /// Per-depth intervals for output files: depth -> Vec<(seq_name, start, end)>
     pub depth_intervals: FxHashMap<usize, Vec<(String, i64, i64)>>,
+    /// Total pangenome bases: sum of all samples' actual query bases (union per sample)
+    pub pangenome_total_bases: i64,
+    /// Pangenome distribution: depth -> total pangenome bases at that depth
+    pub pangenome_depth_distribution: FxHashMap<usize, i64>,
 }
 
 impl DepthStats {
@@ -114,8 +118,8 @@ impl DepthStats {
         Self::default()
     }
 
-    /// Add an interval with a specific depth
-    pub fn add_interval(&mut self, seq_name: &str, start: i64, end: i64, depth: usize) {
+    /// Add an interval with a specific depth and pangenome bases
+    pub fn add_interval(&mut self, seq_name: &str, start: i64, end: i64, depth: usize, pangenome_bases: i64) {
         let length = end - start;
         if length <= 0 {
             return;
@@ -126,6 +130,8 @@ impl DepthStats {
             .entry(depth)
             .or_default()
             .push((seq_name.to_string(), start, end));
+        self.pangenome_total_bases += pangenome_bases;
+        *self.pangenome_depth_distribution.entry(depth).or_insert(0) += pangenome_bases;
     }
 
     /// Merge another DepthStats into this one
@@ -139,6 +145,10 @@ impl DepthStats {
                 .entry(*depth)
                 .or_default()
                 .extend(intervals.iter().cloned());
+        }
+        self.pangenome_total_bases += other.pangenome_total_bases;
+        for (&depth, &bases) in &other.pangenome_depth_distribution {
+            *self.pangenome_depth_distribution.entry(depth).or_insert(0) += bases;
         }
     }
 
@@ -160,11 +170,26 @@ impl DepthStats {
 
     /// Write summary to a writer
     pub fn write_summary<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        writeln!(writer, "Total bases: {}", self.total_bases)?;
-        writeln!(writer, "Depth distribution:")?;
+        writeln!(writer, "Anchor-perspective depth distribution:")?;
+        writeln!(writer, "Total anchor bases: {}", self.total_bases)?;
         for (depth, bases) in self.get_sorted_distribution() {
             let pct = if self.total_bases > 0 {
                 100.0 * bases as f64 / self.total_bases as f64
+            } else {
+                0.0
+            };
+            writeln!(writer, "  depth={}: {} bp ({:.2}%)", depth, bases, pct)?;
+        }
+        writeln!(writer)?;
+        writeln!(writer, "Pangenome-wide depth distribution:")?;
+        writeln!(writer, "Total pangenome bases: {}", self.pangenome_total_bases)?;
+        let mut pg_dist: Vec<_> = self.pangenome_depth_distribution.iter()
+            .map(|(&d, &c)| (d, c))
+            .collect();
+        pg_dist.sort_by_key(|&(d, _)| d);
+        for (depth, bases) in pg_dist {
+            let pct = if self.pangenome_total_bases > 0 {
+                100.0 * bases as f64 / self.pangenome_total_bases as f64
             } else {
                 0.0
             };
@@ -223,12 +248,16 @@ impl DepthIntervalWithSamples {
 /// Statistics with sample tracking for combined output
 #[derive(Debug, Clone, Default)]
 pub struct DepthStatsWithSamples {
-    /// Total bases analyzed
+    /// Total bases analyzed (anchor perspective)
     pub total_bases: i64,
-    /// Distribution: depth -> total bases at that depth
+    /// Distribution: depth -> total bases at that depth (anchor perspective)
     pub depth_distribution: FxHashMap<usize, i64>,
     /// All intervals with samples (unsorted, to be sorted at output time)
     pub intervals: Vec<DepthIntervalWithSamples>,
+    /// Total pangenome bases: sum of all samples' actual query bases
+    pub pangenome_total_bases: i64,
+    /// Pangenome distribution: depth -> total pangenome bases at that depth
+    pub pangenome_depth_distribution: FxHashMap<usize, i64>,
 }
 
 impl DepthStatsWithSamples {
@@ -236,8 +265,8 @@ impl DepthStatsWithSamples {
         Self::default()
     }
 
-    /// Add an interval with depth and sample list
-    pub fn add_interval(&mut self, seq_name: &str, start: i64, end: i64, depth: usize, samples: Vec<String>) {
+    /// Add an interval with depth, sample list, and pangenome bases
+    pub fn add_interval(&mut self, seq_name: &str, start: i64, end: i64, depth: usize, samples: Vec<String>, pangenome_bases: i64) {
         let length = end - start;
         if length <= 0 {
             return;
@@ -251,6 +280,8 @@ impl DepthStatsWithSamples {
             depth,
             samples,
         ));
+        self.pangenome_total_bases += pangenome_bases;
+        *self.pangenome_depth_distribution.entry(depth).or_insert(0) += pangenome_bases;
     }
 
     /// Merge another DepthStatsWithSamples into this one
@@ -260,6 +291,10 @@ impl DepthStatsWithSamples {
             *self.depth_distribution.entry(depth).or_insert(0) += bases;
         }
         self.intervals.extend(other.intervals);
+        self.pangenome_total_bases += other.pangenome_total_bases;
+        for (&depth, &bases) in &other.pangenome_depth_distribution {
+            *self.pangenome_depth_distribution.entry(depth).or_insert(0) += bases;
+        }
     }
 
     /// Get sorted list of depths with their base counts
@@ -280,11 +315,26 @@ impl DepthStatsWithSamples {
 
     /// Write summary to a writer
     pub fn write_summary<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        writeln!(writer, "Total bases: {}", self.total_bases)?;
-        writeln!(writer, "Depth distribution:")?;
+        writeln!(writer, "Anchor-perspective depth distribution:")?;
+        writeln!(writer, "Total anchor bases: {}", self.total_bases)?;
         for (depth, bases) in self.get_sorted_distribution() {
             let pct = if self.total_bases > 0 {
                 100.0 * bases as f64 / self.total_bases as f64
+            } else {
+                0.0
+            };
+            writeln!(writer, "  depth={}: {} bp ({:.2}%)", depth, bases, pct)?;
+        }
+        writeln!(writer)?;
+        writeln!(writer, "Pangenome-wide depth distribution:")?;
+        writeln!(writer, "Total pangenome bases: {}", self.pangenome_total_bases)?;
+        let mut pg_dist: Vec<_> = self.pangenome_depth_distribution.iter()
+            .map(|(&d, &c)| (d, c))
+            .collect();
+        pg_dist.sort_by_key(|&(d, _)| d);
+        for (depth, bases) in pg_dist {
+            let pct = if self.pangenome_total_bases > 0 {
+                100.0 * bases as f64 / self.pangenome_total_bases as f64
             } else {
                 0.0
             };
@@ -1327,6 +1377,10 @@ struct SparseDepthInterval {
     /// Sparse sample positions - only stores samples that are present
     /// Sorted by sample_id for binary search lookup
     samples: Vec<SamplePosition>,
+    /// Total pangenome bases: sum of all samples' union query lengths for this interval.
+    /// Accounts for multiple overlapping alignments from the same sample by computing
+    /// the union of their query-side projections (grouped by contig).
+    pangenome_bases: i64,
 }
 
 impl SparseDepthInterval {
@@ -1375,10 +1429,19 @@ fn split_intervals_by_window(intervals: Vec<SparseDepthInterval>, window_size: i
                 (sid, qid, new_qs, new_qe)
             }).collect();
 
+            // Proportionally split pangenome_bases
+            let chunk_frac = if interval_len > 0 {
+                (chunk_end - pos) as f64 / interval_len as f64
+            } else {
+                1.0
+            };
+            let chunk_pangenome_bases = (interval.pangenome_bases as f64 * chunk_frac).round() as i64;
+
             result.push(SparseDepthInterval {
                 start: pos,
                 end: chunk_end,
                 samples,
+                pangenome_bases: chunk_pangenome_bases,
             });
             pos = chunk_end;
         }
@@ -1415,6 +1478,7 @@ fn merge_sparse_intervals(intervals: Vec<SparseDepthInterval>, tolerance: f64) -
         if interval.start == current.end && within_tolerance {
             // Merge: extend end, union samples, update depth range
             current.end = interval.end;
+            current.pangenome_bases += interval.pangenome_bases;
             current_min_depth = new_min;
             current_max_depth = new_max;
 
@@ -2273,6 +2337,32 @@ fn process_anchor_region_transitive_cigar(
     }
 }
 
+/// Compute the total length of the union of a set of intervals.
+/// Intervals may overlap; overlapping regions are counted only once.
+fn interval_union_length(intervals: &mut Vec<(i64, i64)>) -> i64 {
+    if intervals.is_empty() {
+        return 0;
+    }
+    if intervals.len() == 1 {
+        return (intervals[0].1 - intervals[0].0).max(0);
+    }
+    intervals.sort_unstable_by_key(|&(s, _)| s);
+    let mut total = 0i64;
+    let mut merged_start = intervals[0].0;
+    let mut merged_end = intervals[0].1;
+    for &(s, e) in &intervals[1..] {
+        if s <= merged_end {
+            merged_end = merged_end.max(e);
+        } else {
+            total += merged_end - merged_start;
+            merged_start = s;
+            merged_end = e;
+        }
+    }
+    total += merged_end - merged_start;
+    total.max(0)
+}
+
 /// Sweep-line algorithm: given alignments, produce depth intervals with sample tracking.
 /// Callers must include the anchor sample as an alignment covering [region_start, region_end]
 /// so that depth naturally counts all samples (including the anchor itself).
@@ -2317,18 +2407,50 @@ fn sweep_line_depth(
                 let clipped_end = interval_end.min(region_end);
 
                 if clipped_start < clipped_end {
-                    // Build SPARSE sample positions
+                    // Build SPARSE sample positions + compute pangenome bases
                     let mut samples: Vec<SamplePosition> = Vec::new();
+                    let mut pangenome_bases: i64 = 0;
 
                     for sample_id in active_bitmap.active_samples() {
                         let alns = &active_alns[sample_id as usize];
-                        if let Some(&best_idx) = alns.iter().max_by_key(|&&idx| {
+
+                        // Compute query projections for ALL active alignments of this sample,
+                        // grouped by query_id (contig) to correctly compute union lengths.
+                        let mut query_intervals_by_contig: FxHashMap<u32, Vec<(i64, i64)>> = FxHashMap::default();
+                        let mut best_idx: Option<usize> = None;
+                        let mut best_overlap: i64 = -1;
+
+                        for &idx in alns {
                             let aln = &alignments[idx];
                             let overlap_start = clipped_start.max(aln.target_start);
                             let overlap_end = clipped_end.min(aln.target_end);
-                            overlap_end - overlap_start
-                        }) {
-                            let aln = &alignments[best_idx];
+                            let overlap = overlap_end - overlap_start;
+
+                            if overlap <= 0 {
+                                continue;
+                            }
+
+                            let (q_start, q_end) = map_target_to_query_linear(
+                                &[],
+                                aln.target_start, aln.target_end,
+                                aln.query_start, aln.query_end,
+                                clipped_start, clipped_end,
+                                aln.is_reverse,
+                            );
+                            query_intervals_by_contig
+                                .entry(aln.query_id)
+                                .or_default()
+                                .push((q_start, q_end));
+
+                            if overlap > best_overlap {
+                                best_overlap = overlap;
+                                best_idx = Some(idx);
+                            }
+                        }
+
+                        // Best alignment for TSV output (same as before)
+                        if let Some(idx) = best_idx {
+                            let aln = &alignments[idx];
                             let (q_start, q_end) = map_target_to_query_linear(
                                 &[],
                                 aln.target_start, aln.target_end,
@@ -2338,6 +2460,11 @@ fn sweep_line_depth(
                             );
                             samples.push((sample_id, aln.query_id, q_start, q_end));
                         }
+
+                        // Pangenome bases: union of query projections per contig
+                        for (_, intervals) in query_intervals_by_contig.iter_mut() {
+                            pangenome_bases += interval_union_length(intervals);
+                        }
                     }
 
                     if !samples.is_empty() {
@@ -2346,6 +2473,7 @@ fn sweep_line_depth(
                             start: clipped_start,
                             end: clipped_end,
                             samples,
+                            pangenome_bases,
                         });
                     }
                 }
@@ -2642,7 +2770,7 @@ pub fn compute_depth_global(
                     // Stats add-on: accumulate depth distribution and intervals
                     let depth = interval.depth();
                     if let Some(ref mut ls) = local_stats {
-                        ls.add_interval(seq_name, interval.start, interval.end, depth);
+                        ls.add_interval(seq_name, interval.start, interval.end, depth, interval.pangenome_bases);
                     }
                     if let Some(ref mut lc) = local_combined {
                         let sample_names: Vec<String> = interval.samples.iter()
@@ -2650,7 +2778,7 @@ pub fn compute_depth_global(
                                 sample_index.get_name(sid).map(|s| s.to_string())
                             })
                             .collect();
-                        lc.add_interval(seq_name, interval.start, interval.end, depth, sample_names);
+                        lc.add_interval(seq_name, interval.start, interval.end, depth, sample_names, interval.pangenome_bases);
                     }
                 } else {
                     // Normal mode: write TSV row to buf
@@ -2987,14 +3115,15 @@ pub fn compute_depth_global(
             }
 
             if stats_mode {
-                // Add depth=1 to stats accumulators
+                // Add depth=1 to stats accumulators (pangenome_bases = seq_len for single sample)
                 if let Some(ref acc) = stats_accumulator {
-                    acc.lock().unwrap().add_interval(seq_name, 0, seq_len, 1);
+                    acc.lock().unwrap().add_interval(seq_name, 0, seq_len, 1, seq_len);
                 }
                 if let Some(ref acc) = stats_combined_acc {
                     acc.lock().unwrap().add_interval(
                         seq_name, 0, seq_len, 1,
                         vec![sample_name.to_string()],
+                        seq_len,
                     );
                 }
             } else if let Some(ref w) = writer {
