@@ -43,6 +43,7 @@ fn parse_size(s: &str) -> Result<u64, String> {
 }
 
 /// Resolve the `--temp-dir` value: "ramdisk" → "/dev/shm" if available.
+/// When no value is provided, defaults to the current working directory.
 fn resolve_temp_dir(temp_dir: Option<String>) -> Option<String> {
     match temp_dir.as_deref() {
         Some("ramdisk") => {
@@ -50,11 +51,12 @@ fn resolve_temp_dir(temp_dir: Option<String>) -> Option<String> {
             if dev_shm.is_dir() {
                 Some("/dev/shm".to_string())
             } else {
-                log::warn!("--temp-dir ramdisk requested but /dev/shm is not available, using system default");
-                None
+                log::warn!("--temp-dir ramdisk requested but /dev/shm is not available, using current directory");
+                Some(".".to_string())
             }
         }
-        other => other.map(|s| s.to_string()),
+        Some(other) => Some(other.to_string()),
+        None => Some(".".to_string()),
     }
 }
 
