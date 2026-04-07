@@ -9,3 +9,4 @@ data
 paper-nmeth
 demo-results
 .cargo
+.guix/bin
