@@ -93,6 +93,26 @@ To build and "install" `impg` with guix, run:
 guix install -L .guix/modules --file=guix.scm
 ```
 
+### Development with Guix on older systems
+
+On systems with an older glibc (e.g. Debian Buster with glibc 2.28), a plain `cargo build` fails because wfmash requires cmake >= 3.16, GCC >= 9 (for C++17 `std::filesystem`), and several C libraries (htslib, gsl, jemalloc). Guix provides all of these, but its libraries are built against a newer glibc. To avoid mixing glibc versions, `env.sh` runs cargo and rustc under Guix's dynamic linker so everything uses Guix's toolchain consistently.
+
+Prerequisites (one-time):
+
+```sh
+guix install jemalloc   # needed by wfmash
+```
+
+Development workflow:
+
+```sh
+source ./env.sh              # once per shell session
+cargo build                  # debug build
+cargo build --release        # release build
+cargo test                   # run tests
+cargo install --path .       # install to ~/.cargo/bin
+```
+
 ## Commands
 
 ### Query
