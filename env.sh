@@ -57,6 +57,11 @@ export CPLUS_INCLUDE_PATH="$_guix_profile/include"
 export PKG_CONFIG_PATH="$_guix_profile/lib/pkgconfig"
 export LIBCLANG_PATH="$_guix_profile/lib"
 export CXXFLAGS="-include limits -include cstdint"
+# Suppress locale warnings from /bin/bash spawned by build scripts:
+# system bash (glibc 2.28) can't read Guix's 2.35 locale data.
+export LC_ALL=C
+export LANG=C
+unset LC_CTYPE
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$_guix_gcc/bin/gcc"
 export RUSTC="$_wrapper_dir/rustc"
 
