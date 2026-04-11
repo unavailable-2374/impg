@@ -32,7 +32,7 @@ spoa_rs = { git = "https://github.com/AndreaGuarracino/spoa-rs.git" }
 rust-htslib = { version = "1.0.0", default-features = false, features = ["libdeflate"] }
 
 # Dependencies for AGC format (for sequences) support
-ragc-core = { git = "https://github.com/AndreaGuarracino/ragc", rev = "e9e4a6f" }
+ragc-core = { git = "https://github.com/AndreaGuarracino/ragc", rev = "ebfa5eb243541a3d7a5e2f4e3ccb8961283149a0" }
 
 # Dependencies for 1ALN format (for alignments) support
 #onecode = { path = "/home/guarracino/git/onecode-rs" }
