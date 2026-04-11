@@ -2577,6 +2577,7 @@ fn build_engine_opts(
         transclose_batch: seqwish.transclose_batch,
         disk_backed: seqwish.disk_backed,
         temp_dir,
+        batch_bytes: aln.batch_bytes.clone(),
         partition_size,
         target_poa_lengths: smooth.parse_target_poa_lengths()?,
         max_node_length: smooth.max_node_length,

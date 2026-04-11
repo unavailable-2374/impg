@@ -59,6 +59,8 @@ pub struct EngineOpts {
     pub disk_backed: bool,
     /// Optional temp directory for intermediate files
     pub temp_dir: Option<String>,
+    /// Batch genome alignment to limit resource usage per batch (e.g. "2G", "500M").
+    pub batch_bytes: Option<String>,
     // Smoothxg-style smoothing parameters (pggb engine)
     /// Target POA length(s) per pass — one value per smoothing pass (default: [700, 1100]).
     pub target_poa_lengths: Vec<usize>,
@@ -113,6 +115,7 @@ pub fn dispatch_gfa_engine(
         transclose_batch: engine_opts.transclose_batch,
         use_in_memory: !engine_opts.disk_backed,
         temp_dir: engine_opts.temp_dir.clone(),
+        batch_bytes: engine_opts.batch_bytes.clone(),
         ..graph::SeqwishConfig::default()
     };
 

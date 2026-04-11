@@ -19,8 +19,9 @@ THREADS=12
 TIME="/usr/bin/time"
 ODGI=$(command -v odgi 2>/dev/null || true)
 
-REGION="CHM13#0#chr6:29000000-29200000"
+REGION="CHM13#0#chr6:29000000-30000000"
 PARTITION_SIZE=10000
+BATCH_BYTES="50M"
 
 mkdir -p "$OUTDIR"
 
@@ -169,11 +170,11 @@ fi
 
 FULL_GFA="${PREFIX}.full.pggb.gfa"
 echo ""
-echo "--- Run 1: full pggb --force-large-region ---"
+echo "--- Run 1: full pggb --force-large-region --batch-bytes ${BATCH_BYTES} ---"
 metrics=$(run_timed "${PREFIX}.full.pggb.log" $IMPG query \
     --alignment-list data/hprcv2/tpas/tpa-list.txt --sequence-files "$AGC" \
     -r "$REGION" -o gfa --gfa-engine pggb \
-    --force-large-region \
+    --force-large-region --batch-bytes "$BATCH_BYTES" \
     -O "${PREFIX}.full.pggb" -t "$THREADS" -v 1) || true
 read -r wall mem st <<< "$metrics"
 if [ "$st" -eq 0 ] && [ -s "$FULL_GFA" ]; then
