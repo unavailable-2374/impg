@@ -167,19 +167,6 @@ pub fn build_graph<W: Write>(
         }
     }
 
-    // Set up temp directory for all temp file operations (seqwish, sweepga, tempfile crate)
-    // Uses system default (/tmp) unless --temp-dir is specified
-    // For better I/O performance on systems with RAM-backed tmpfs, use --temp-dir /dev/shm
-    if let Some(ref temp_dir) = config.temp_dir {
-        // Set TMPDIR environment variable so Rust's tempfile crate uses it
-        std::env::set_var("TMPDIR", temp_dir);
-        // Also configure seqwish's internal temp file handling
-        seqwish::tempfile::set_dir(temp_dir);
-        if config.show_progress {
-            info!("[graph::temp] Using temp directory: {}", temp_dir);
-        }
-    }
-
     // 1) Count sequences and genomes, determine k-mer frequency
     if config.show_progress {
         info!(
@@ -946,15 +933,6 @@ pub fn align_sequences(
                 io::ErrorKind::NotFound,
                 format!("FASTA file not found: {}", path),
             ));
-        }
-    }
-
-    // Set up temp directory
-    if let Some(ref temp_dir) = config.temp_dir {
-        std::env::set_var("TMPDIR", temp_dir);
-        seqwish::tempfile::set_dir(temp_dir);
-        if config.show_progress {
-            info!("[graph::temp] Using temp directory: {}", temp_dir);
         }
     }
 

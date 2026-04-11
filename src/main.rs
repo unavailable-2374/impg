@@ -42,22 +42,83 @@ fn parse_size(s: &str) -> Result<u64, String> {
         .map_err(|e| format!("invalid number '{}': {}", num_str, e))
 }
 
-/// Resolve the `--temp-dir` value: "ramdisk" → "/dev/shm" if available.
-/// When no value is provided, defaults to the current working directory.
-fn resolve_temp_dir(temp_dir: Option<String>) -> Option<String> {
-    match temp_dir.as_deref() {
+/// Resolve the `--temp-dir` value to an absolute path.
+///
+/// - `None` → current working directory (absolute).
+/// - `Some("ramdisk")` → `/dev/shm` if available, else cwd.
+/// - `Some(path)` → `path` (created if it doesn't exist), canonicalized to absolute.
+///
+/// The returned path is guaranteed to exist and to be absolute, so downstream
+/// code can treat it as a stable, process-wide temp root.
+fn resolve_temp_dir(temp_dir: Option<String>) -> io::Result<String> {
+    let raw = match temp_dir.as_deref() {
         Some("ramdisk") => {
             let dev_shm = std::path::Path::new("/dev/shm");
             if dev_shm.is_dir() {
-                Some("/dev/shm".to_string())
+                "/dev/shm".to_string()
             } else {
-                log::warn!("--temp-dir ramdisk requested but /dev/shm is not available, using current directory");
-                Some(".".to_string())
+                log::warn!(
+                    "--temp-dir ramdisk requested but /dev/shm is not available, using current directory"
+                );
+                std::env::current_dir()?.to_string_lossy().into_owned()
             }
         }
-        Some(other) => Some(other.to_string()),
-        None => Some(".".to_string()),
+        Some(other) => other.to_string(),
+        None => std::env::current_dir()?.to_string_lossy().into_owned(),
+    };
+
+    // Ensure the directory exists before canonicalizing.
+    let p = std::path::Path::new(&raw);
+    if !p.exists() {
+        std::fs::create_dir_all(p).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("failed to create --temp-dir '{}': {}", raw, e),
+            )
+        })?;
+    } else if !p.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("--temp-dir '{}' exists but is not a directory", raw),
+        ));
     }
+
+    let abs = std::fs::canonicalize(p).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("failed to canonicalize --temp-dir '{}': {}", raw, e),
+        )
+    })?;
+    Ok(abs.to_string_lossy().into_owned())
+}
+
+/// Install `temp_dir` as the process-wide temp root for every tool that
+/// reads `TMPDIR` (FastGA/GIXmake via fastga-rs, wfmash, gfaffix, Rust's
+/// `tempfile` crate) **and** for seqwish's internal tempfile state.
+fn setup_temp_dir(temp_dir: &str) -> io::Result<()> {
+    // Sanity check
+    let p = std::path::Path::new(temp_dir);
+    if !p.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "setup_temp_dir: '{}' does not exist or is not a directory",
+                temp_dir
+            ),
+        ));
+    }
+
+    // 1. Environment: picked up by Rust's tempfile crate, FastGA-rs
+    //    (which calls tempfile::Builder::new().tempdir() when no explicit
+    //    temp_dir is passed), wfmash, and anything else that honors TMPDIR.
+    std::env::set_var("TMPDIR", temp_dir);
+
+    // 2. Seqwish has its own process-wide tempfile directory that must be
+    //    configured separately — setting TMPDIR alone is not sufficient.
+    seqwish::tempfile::set_dir(temp_dir);
+
+    log::info!("[temp] Using temp directory: {}", temp_dir);
+    Ok(())
 }
 
 use impg::{EngineOpts, GfaEngine};
@@ -385,6 +446,8 @@ impl EngineCliOpts {
             kmer_size: self.aln.mash_kmer_size,
             sketch_size: self.aln.mash_sketch_size,
         };
+        let temp_dir = resolve_temp_dir(self.aln.temp_dir.clone())?;
+        setup_temp_dir(&temp_dir)?;
         build_engine_opts(
             engine,
             num_threads,
@@ -394,7 +457,7 @@ impl EngineCliOpts {
             &self.seqwish,
             &self.smooth,
             self.debug_dir.clone(),
-            resolve_temp_dir(self.aln.temp_dir.clone()),
+            Some(temp_dir),
             partition_size,
         )
     }
@@ -1237,7 +1300,8 @@ fn run() -> io::Result<()> {
             reference,
         } => {
             initialize_threads_and_log(&common);
-            let temp_dir = resolve_temp_dir(temp_dir);
+            let temp_dir = resolve_temp_dir(temp_dir)?;
+            setup_temp_dir(&temp_dir)?;
 
             // Check that at least one input is provided
             if files.is_none() && file_list.is_none() {
@@ -1314,7 +1378,7 @@ fn run() -> io::Result<()> {
                     &compress,
                     fill_gaps,
                     skip_validation,
-                    temp_dir,
+                    Some(temp_dir),
                     sequence_index.as_ref(),
                     common.verbose,
                 )?;
@@ -2232,7 +2296,8 @@ fn run() -> io::Result<()> {
             initialize_threads_and_log(&common);
             let (parsed_engine, parsed_partition_size) = engine_cli.parse_engine()?;
             engine_cli.validate_engine_params(parsed_engine)?;
-            let temp_dir = resolve_temp_dir(engine_cli.aln.temp_dir.clone());
+            let temp_dir = resolve_temp_dir(engine_cli.aln.temp_dir.clone())?;
+            setup_temp_dir(&temp_dir)?;
 
             let fasta_files = fasta_input.resolve_sequence_files()?;
             if fasta_files.is_empty() {
@@ -2278,7 +2343,7 @@ fn run() -> io::Result<()> {
                     transclose_batch: engine_cli.seqwish.transclose_batch,
                     use_in_memory: !engine_cli.seqwish.disk_backed,
                     show_progress: common.verbose > 0,
-                    temp_dir,
+                    temp_dir: Some(temp_dir.clone()),
                     input_paf: paf_file,
                     aligner: engine_cli.aln.aligner,
                     no_filter: engine_cli.aln.no_filter,
@@ -2322,7 +2387,7 @@ fn run() -> io::Result<()> {
                     transclose_batch: engine_cli.seqwish.transclose_batch,
                     use_in_memory: !engine_cli.seqwish.disk_backed,
                     show_progress: common.verbose > 0,
-                    temp_dir,
+                    temp_dir: Some(temp_dir),
                     input_paf: paf_file,
                     aligner: engine_cli.aln.aligner,
                     no_filter: engine_cli.aln.no_filter,
@@ -2405,7 +2470,8 @@ fn run() -> io::Result<()> {
             common,
         } => {
             initialize_threads_and_log(&common);
-            let temp_dir = resolve_temp_dir(aln.temp_dir);
+            let temp_dir = resolve_temp_dir(aln.temp_dir)?;
+            setup_temp_dir(&temp_dir)?;
 
             let fasta_files = fasta_input.resolve_sequence_files()?;
             if fasta_files.is_empty() {
@@ -2454,7 +2520,7 @@ fn run() -> io::Result<()> {
                 output_format,
                 show_progress: common.verbose > 0,
                 aligner: aln.aligner,
-                temp_dir,
+                temp_dir: Some(temp_dir),
                 batch_bytes: aln.batch_bytes,
                 no_filter: aln.no_filter,
                 num_mappings: aln.num_mappings,

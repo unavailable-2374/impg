@@ -80,11 +80,6 @@ pub fn dispatch_gfa_engine(
     scoring_params: Option<(u8, u8, u8, u8, u8, u8)>,
     engine_opts: &EngineOpts,
 ) -> std::io::Result<String> {
-    // Set TMPDIR for external tools (FastGA, etc.) that read it
-    if let Some(ref temp_dir) = engine_opts.temp_dir {
-        std::env::set_var("TMPDIR", temp_dir);
-    }
-
     // Create debug dir once — needed by both seqwish and pggb pipelines.
     if let Some(ref dir) = engine_opts.debug_dir {
         std::fs::create_dir_all(dir).map_err(|e| {
