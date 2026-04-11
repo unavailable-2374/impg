@@ -201,15 +201,55 @@ pub fn partitioned_gfa_pipeline(
     }
 
     // 1. Generate per-partition GFAs sequentially (each partition uses all threads)
-    let mut sub_gfas: Vec<String> = Vec::with_capacity(partitions.len());
-    for (partition_num, intervals) in partitions {
+    let total_partitions = partitions.len();
+    // Total bp across all partitions
+    let total_bp: u64 = partitions
+        .iter()
+        .flat_map(|(_, ivs)| ivs.iter())
+        .map(|iv| (iv.last - iv.first).unsigned_abs() as u64)
+        .sum();
+    let mut sub_gfas: Vec<String> = Vec::with_capacity(total_partitions);
+    let mut total_partitioned_bp: u64 = 0;
+    for (idx, (partition_num, intervals)) in partitions.iter().enumerate() {
+        let num_regions = intervals.len();
+        let current_partition_length: u64 = intervals
+            .iter()
+            .map(|iv| (iv.last - iv.first).unsigned_abs() as u64)
+            .sum();
+        let current_percentage = if total_bp > 0 {
+            (current_partition_length as f64 / total_bp as f64) * 100.0
+        } else {
+            0.0
+        };
+        let total_percentage = if total_bp > 0 {
+            (total_partitioned_bp as f64 / total_bp as f64) * 100.0
+        } else {
+            0.0
+        };
+        let current_percentage_str = if current_percentage < 0.0001 {
+            format!("{current_percentage:.4e}%")
+        } else {
+            format!("{current_percentage:.4}%")
+        };
+        let total_percentage_str = if total_percentage < 0.0001 {
+            format!("{total_percentage:.4e}%")
+        } else {
+            format!("{total_percentage:.4}%")
+        };
         info!(
-            "[partitioned] Building GFA for partition {} ({} intervals)",
+            "[partitioned] Computed partition {} ({}/{}) with {} intervals: {} bp this partition ({}), {} bp total ({})",
             partition_num,
-            intervals.len()
+            idx + 1,
+            total_partitions,
+            num_regions,
+            current_partition_length,
+            current_percentage_str,
+            total_partitioned_bp,
+            total_percentage_str,
         );
         let gfa = dispatch_gfa_engine(impg, intervals, sequence_index, scoring_params, engine_opts)?;
         sub_gfas.push(gfa);
+        total_partitioned_bp += current_partition_length;
     }
 
     // 2. Lace all partition GFAs together
