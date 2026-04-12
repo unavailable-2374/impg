@@ -314,6 +314,8 @@ pub fn partitioned_gfa_pipeline(
         sub_gfas.len()
     );
     let laced = commands::lace::lace_subgraphs(&sub_gfas, None)?;
+    // Free all sub-partition GFAs before gfaffix/sort
+    drop(sub_gfas);
 
     // 3. Single final gfaffix normalization + sort
     info!("[partitioned] Running final gfaffix normalization");
