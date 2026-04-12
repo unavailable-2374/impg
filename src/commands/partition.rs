@@ -516,8 +516,15 @@ pub fn partition_alignments(
                     "Sequence files required for partitioned GFA output",
                 )
             })?;
+            // Strip the partition_num tags before handing to the pipeline.
+            // (The pipeline tracks partitions by array index, not by user-facing
+            // partition numbers; the usize is only needed for BED filename output.)
+            let partition_intervals: Vec<Vec<Interval<u32>>> = collected_partitions
+                .iter()
+                .map(|(_, v)| v.clone())
+                .collect();
             let final_gfa = crate::partitioned_gfa_pipeline(
-                &collected_partitions,
+                &partition_intervals,
                 impg,
                 seq_idx,
                 scoring_params,

@@ -3833,7 +3833,7 @@ fn output_results_gfa(
         scoring_params,
         engine_opts,
     )?;
-    writeln!(out, "{gfa_output}")?;
+    out.write_all(gfa_output.as_bytes())?;
 
     Ok(())
 }
@@ -3857,8 +3857,7 @@ fn output_results_gfa_partitioned(
     let ps = partition_size as i32;
 
     // Split into sub-windows
-    let mut partitions: Vec<(usize, Vec<Interval<u32>>)> = Vec::new();
-    let mut partition_num = 0;
+    let mut partitions: Vec<Vec<Interval<u32>>> = Vec::new();
     let mut window_start = start;
 
     while window_start < end {
@@ -3894,8 +3893,7 @@ fn output_results_gfa_partitioned(
                 .map(|(qi, _, _)| qi)
                 .collect();
 
-            partitions.push((partition_num, query_intervals));
-            partition_num += 1;
+            partitions.push(query_intervals);
         }
 
         window_start = window_end;
@@ -3908,7 +3906,7 @@ fn output_results_gfa_partitioned(
         scoring_params,
         engine_opts,
     )?;
-    writeln!(out, "{gfa_output}")?;
+    out.write_all(gfa_output.as_bytes())?;
 
     Ok(())
 }

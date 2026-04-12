@@ -1237,10 +1237,9 @@ pub fn run_graph_build_partitioned(
 
     // 4. Partition: split all sequences into windows and query each
     info!("[partitioned-graph] Partitioning with window size {}", partition_size);
-    let mut partitions: Vec<(usize, Vec<coitrees::Interval<u32>>)> = Vec::new();
+    let mut partitions: Vec<Vec<coitrees::Interval<u32>>> = Vec::new();
     let seq_index = impg.seq_index();
     let num_seqs = seq_index.len();
-    let mut partition_num = 0usize;
 
     for seq_id in 0..num_seqs as u32 {
         let seq_len = match seq_index.get_len_from_id(seq_id) {
@@ -1274,8 +1273,7 @@ pub fn run_graph_build_partitioned(
                     .into_iter()
                     .map(|(qi, _, _)| qi)
                     .collect();
-                partitions.push((partition_num, intervals));
-                partition_num += 1;
+                partitions.push(intervals);
             }
 
             window_start = window_end;

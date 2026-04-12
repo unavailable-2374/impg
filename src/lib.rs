@@ -188,7 +188,7 @@ pub fn dispatch_gfa_engine(
 /// each using all threads), lace them together, then run a single final
 /// gfaffix normalization + sort.
 pub fn partitioned_gfa_pipeline(
-    partitions: &[(usize, Vec<coitrees::Interval<u32>>)],
+    partitions: &[Vec<coitrees::Interval<u32>>],
     impg: &impl impg_index::ImpgIndex,
     sequence_index: &sequence_index::UnifiedSequenceIndex,
     scoring_params: Option<(u8, u8, u8, u8, u8, u8)>,
@@ -205,12 +205,12 @@ pub fn partitioned_gfa_pipeline(
     // Total bp across all partitions
     let total_bp: u64 = partitions
         .iter()
-        .flat_map(|(_, ivs)| ivs.iter())
+        .flat_map(|ivs| ivs.iter())
         .map(|iv| (iv.last - iv.first).unsigned_abs() as u64)
         .sum();
     let mut sub_gfas: Vec<String> = Vec::with_capacity(total_partitions);
     let mut total_partitioned_bp: u64 = 0;
-    for (idx, (partition_num, intervals)) in partitions.iter().enumerate() {
+    for (idx, intervals) in partitions.iter().enumerate() {
         let num_regions = intervals.len();
         let current_partition_length: u64 = intervals
             .iter()
@@ -237,8 +237,7 @@ pub fn partitioned_gfa_pipeline(
             format!("{total_percentage:.4}%")
         };
         info!(
-            "[partitioned] Computed partition {} ({}/{}) with {} intervals: {} bp this partition ({}), {} bp total ({})",
-            partition_num,
+            "[partitioned] Building GFA for partition {}/{} with {} intervals: {} bp this partition ({}), {} bp total ({})",
             idx + 1,
             total_partitions,
             num_regions,
