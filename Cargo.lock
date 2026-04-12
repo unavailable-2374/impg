@@ -1233,6 +1233,7 @@ dependencies = [
  "noodles",
  "num_cpus",
  "onecode 0.1.0 (git+https://github.com/pangenome/onecode-rs?rev=38182c7acf7cccc53509176b1d11001ae6ff2642)",
+ "parking_lot",
  "ragc-core",
  "rayon",
  "regex",
