@@ -1243,13 +1243,13 @@ pub fn run_graph_build_partitioned(
 
     for seq_id in 0..num_seqs as u32 {
         let seq_len = match seq_index.get_len_from_id(seq_id) {
-            Some(len) => len as i32,
+            Some(len) => len as i64,
             None => continue,
         };
 
-        let mut window_start = 0i32;
+        let mut window_start = 0i64;
         while window_start < seq_len {
-            let window_end = (window_start + partition_size as i32).min(seq_len);
+            let window_end = (window_start + partition_size as i64).min(seq_len);
 
             // Query this window
             let results = impg.query_transitive_bfs(
@@ -1334,14 +1334,14 @@ fn metadata_from_fasta_header(header: &str, seq_len: usize) -> crate::graph::Seq
         let (key, range_str) = header.split_at(last_colon);
         let range_str = &range_str[1..]; // skip ':'
         if let Some((start_str, end_str)) = range_str.split_once('-') {
-            if let (Ok(start), Ok(end)) = (start_str.parse::<i32>(), end_str.parse::<i32>()) {
+            if let (Ok(start), Ok(end)) = (start_str.parse::<i64>(), end_str.parse::<i64>()) {
                 if end > start {
                     return crate::graph::SequenceMetadata {
                         name: key.to_string(),
                         start,
-                        size: seq_len as i32,
+                        size: seq_len as i64,
                         strand: '+',
-                        total_length: (start + seq_len as i32) as usize,
+                        total_length: (start + seq_len as i64) as usize,
                     };
                 }
             }
@@ -1351,7 +1351,7 @@ fn metadata_from_fasta_header(header: &str, seq_len: usize) -> crate::graph::Seq
     crate::graph::SequenceMetadata {
         name: header.to_string(),
         start: 0,
-        size: seq_len as i32,
+        size: seq_len as i64,
         strand: '+',
         total_length: seq_len,
     }

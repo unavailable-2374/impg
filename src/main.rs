@@ -1940,7 +1940,7 @@ fn run() -> io::Result<()> {
                                 &mut find_output_stream(&output_prefix, "gfa")?,
                                 sequence_index.as_ref().unwrap(),
                                 &name,
-                                query.effective_merge_distance(),
+                                query.effective_merge_distance().into(),
                                 query.merge_strands_for_output("gfa"),
                                 scoring_params,
                                 &engine_opts,
@@ -4164,13 +4164,13 @@ fn output_results_gfa_partitioned(
     scoring_params: Option<(u8, u8, u8, u8, u8, u8)>,
     engine_opts: &EngineOpts,
     target_name: &str,
-    target_range: (i32, i32),
+    target_range: (i64, i64),
     partition_size: usize,
     query: &QueryOpts,
     subset_filter: Option<&SubsetFilter>,
 ) -> io::Result<()> {
     let (start, end) = target_range;
-    let ps = partition_size as i32;
+    let ps = partition_size as i64;
 
     // Split into sub-windows
     let mut partitions: Vec<Vec<Interval<u32>>> = Vec::new();
@@ -4186,7 +4186,7 @@ fn output_results_gfa_partitioned(
             (window_start, window_end),
             false, // no CIGAR needed for GFA
             query.min_identity,
-            query.min_output_length,
+            query.min_output_length.map(|x| x as i64),
             query.transitive,
             query.transitive_opts.transitive_dfs,
             &query.transitive_opts,
@@ -4199,7 +4199,7 @@ fn output_results_gfa_partitioned(
             // Merge intervals
             merge_query_adjusted_intervals(
                 &mut results,
-                query.effective_merge_distance(),
+                query.effective_merge_distance().into(),
                 query.merge_strands_for_output("gfa"),
             );
 

@@ -1395,7 +1395,7 @@ impl Impg {
                 let refined_pos = if boundary_name == "First" {
                     query_pos
                 } else {
-                    query_pos + query_delta
+                    query_pos + query_delta as i64
                 };
                 debug!(
                     "{} segment refinement: pure query insertion, abs_target_delta=0, query_delta={}, trace_diffs={}",
