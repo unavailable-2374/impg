@@ -32,14 +32,14 @@ pub fn partition_alignments(
     window_size: usize,
     starting_sequences_file: Option<&str>,
     selection_mode: &str,
-    merge_distance: i32,
+    merge_distance: i64,
     min_identity: Option<f64>,
-    min_missing_size: i32,
-    min_boundary_distance: i32,
+    min_missing_size: i64,
+    min_boundary_distance: i64,
     transitive_dfs: bool,
     max_depth: u16,
-    min_transitive_len: i32,
-    min_distance_between_ranges: i32,
+    min_transitive_len: i64,
+    min_distance_between_ranges: i64,
     output_format: &str,
     output_folder: Option<&str>,
     sequence_index: Option<&UnifiedSequenceIndex>,
@@ -51,7 +51,7 @@ pub fn partition_alignments(
     engine_config: &EngineOpts,
 ) -> io::Result<()> {
     // Initialize windows from starting sequences if provided
-    let mut windows = Vec::<(u32, i32, i32)>::new();
+    let mut windows = Vec::<(u32, i64, i64)>::new();
     if let Some(path) = starting_sequences_file {
         // Read sequences from starting-sequences file
         let file = File::open(path).map_err(|e| {
@@ -74,7 +74,7 @@ pub fn partition_alignments(
                 }
 
                 if let Some(seq_id) = impg.seq_index().get_id(trimmed_name) {
-                    let seq_length = impg.seq_index().get_len_from_id(seq_id).unwrap() as i32;
+                    let seq_length = impg.seq_index().get_len_from_id(seq_id).unwrap() as i64;
                     starting_sequences.push((seq_id, 0, seq_length));
                 } else if debug {
                     debug!("Sequence {trimmed_name} from starting file not found in index");
@@ -99,10 +99,10 @@ pub fn partition_alignments(
 
             let mut pos = start;
             while pos < end {
-                let window_end = std::cmp::min(pos + window_size as i32, end);
+                let window_end = std::cmp::min(pos + window_size as i64, end);
 
                 // If this tail-window is too small, merge it into the last one
-                if window_end - pos < window_size as i32
+                if window_end - pos < window_size as i64
                     && !windows.is_empty()
                     && windows.last().unwrap().0 == seq_id
                 {
@@ -122,7 +122,7 @@ pub fn partition_alignments(
         .into_par_iter()
         .map(|id| {
             let len = impg.seq_index().get_len_from_id(id).unwrap();
-            (id, SortedRanges::new(len as i32, 0))
+            (id, SortedRanges::new(len as i64, 0))
         })
         .collect();
 
@@ -131,8 +131,8 @@ pub fn partition_alignments(
         .into_par_iter()
         .map(|id| {
             let len = impg.seq_index().get_len_from_id(id).unwrap();
-            let mut ranges = SortedRanges::new(len as i32, 0);
-            ranges.insert((0, len as i32));
+            let mut ranges = SortedRanges::new(len as i64, 0);
+            ranges.insert((0, len as i64));
             (id, ranges)
         })
         .collect();
@@ -564,7 +564,7 @@ pub fn partition_alignments(
 
 // Helper function to select and window sequences based on selection_mode
 fn select_and_window_sequences(
-    windows: &mut Vec<(u32, i32, i32)>,
+    windows: &mut Vec<(u32, i64, i64)>,
     impg: &impl ImpgIndex,
     missing_regions: &FxHashMap<u32, SortedRanges>,
     selection_mode: &str,
@@ -630,7 +630,7 @@ fn select_and_window_sequences(
                 });
 
             if let Some((seq_id, max_total_missing)) = seq_with_most_missing {
-                let seq_length = impg.seq_index().get_len_from_id(seq_id).unwrap() as i32;
+                let seq_length = impg.seq_index().get_len_from_id(seq_id).unwrap() as i64;
                 let seq_name = impg.seq_index().get_name(seq_id).unwrap();
 
                 debug!(
@@ -738,7 +738,7 @@ fn select_and_window_sequences(
                             ranges_to_window.extend(
                                 seqs_with_len
                                     .into_iter()
-                                    .map(|(id, len)| (id, 0, len as i32)),
+                                    .map(|(id, len)| (id, 0, len as i64)),
                             );
                         }
                     }
@@ -760,16 +760,16 @@ fn select_and_window_sequences(
     }
 
     // Create windows from ranges
-    let new_windows: Vec<(u32, i32, i32)> = ranges_to_window
+    let new_windows: Vec<(u32, i64, i64)> = ranges_to_window
         .par_iter()
         .flat_map(|(seq_id, start, end)| {
-            let mut range_windows: Vec<(u32, i32, i32)> = Vec::new();
+            let mut range_windows: Vec<(u32, i64, i64)> = Vec::new();
             let mut pos = *start;
             while pos < *end {
-                let window_end = std::cmp::min(pos + window_size as i32, *end);
+                let window_end = std::cmp::min(pos + window_size as i64, *end);
 
                 // If this tail-window is too small, merge it into the last one
-                if window_end - pos < window_size as i32 && !range_windows.is_empty() {
+                if window_end - pos < window_size as i64 && !range_windows.is_empty() {
                     let last = range_windows.last_mut().unwrap();
                     last.2 = *end;
                 } else {
@@ -789,7 +789,7 @@ fn select_and_window_sequences(
 
 fn merge_overlaps(
     overlaps: &mut Vec<(Interval<u32>, Vec<CigarOp>, Interval<u32>)>,
-    merge_distance: i32,
+    merge_distance: i64,
 ) {
     if overlaps.len() > 1 && merge_distance >= 0 {
         // Sort by sequence ID and start position
@@ -830,17 +830,17 @@ fn mask_and_update_regions(
     overlaps: &mut Vec<(Interval<u32>, Vec<CigarOp>, Interval<u32>)>,
     masked_regions: &mut FxHashMap<u32, SortedRanges>,
     missing_regions: &mut FxHashMap<u32, SortedRanges>,
-    min_fragment_size: i32,
+    min_fragment_size: i64,
 ) -> Vec<(Interval<u32>, Vec<CigarOp>, Interval<u32>)> {
     fn process_sequence_overlaps(
         seq_id: u32,
         seq_overlaps: &mut Vec<(Interval<u32>, Vec<CigarOp>, Interval<u32>)>,
         masked_regions: &mut FxHashMap<u32, SortedRanges>,
         missing_regions: &mut FxHashMap<u32, SortedRanges>,
-        min_fragment_size: i32,
+        min_fragment_size: i64,
         result: &mut Vec<(Interval<u32>, Vec<CigarOp>, Interval<u32>)>,
-        extensions: &mut Vec<(i32, i32)>,
-        mask_buffer: &mut Vec<(i32, i32)>,
+        extensions: &mut Vec<(i64, i64)>,
+        mask_buffer: &mut Vec<(i64, i64)>,
     ) {
         if seq_overlaps.is_empty() {
             return;
@@ -986,7 +986,7 @@ fn mask_and_update_regions(
 
             let adjusted_target = Interval {
                 first: target_interval.first,
-                last: target_interval.first + (target_span * scale) as i32,
+                last: target_interval.first + (target_span * scale) as i64,
                 metadata: target_interval.metadata,
             };
 
@@ -1032,9 +1032,9 @@ fn mask_and_update_regions(
                         let segment_target_span = target_span * segment_ratio;
 
                         let new_target = Interval {
-                            first: target_interval.first + segment_offset as i32,
+                            first: target_interval.first + segment_offset as i64,
                             last: target_interval.first
-                                + (segment_offset + segment_target_span) as i32,
+                                + (segment_offset + segment_target_span) as i64,
                             metadata: target_interval.metadata,
                         };
 
@@ -1071,8 +1071,8 @@ fn mask_and_update_regions(
                     let segment_target_span = target_span * segment_ratio;
 
                     let new_target = Interval {
-                        first: target_interval.first + segment_offset as i32,
-                        last: target_interval.first + (segment_offset + segment_target_span) as i32,
+                        first: target_interval.first + segment_offset as i64,
+                        last: target_interval.first + (segment_offset + segment_target_span) as i64,
                         metadata: target_interval.metadata,
                     };
 
@@ -1179,8 +1179,8 @@ fn mask_and_update_regions(
 
     let mut result = Vec::new();
     let mut seq_overlaps: Vec<(Interval<u32>, Vec<CigarOp>, Interval<u32>)> = Vec::new();
-    let mut extensions: Vec<(i32, i32)> = Vec::new();
-    let mut mask_buffer: Vec<(i32, i32)> = Vec::new();
+    let mut extensions: Vec<(i64, i64)> = Vec::new();
+    let mut mask_buffer: Vec<(i64, i64)> = Vec::new();
 
     // Drain the already-sorted overlaps and process by contiguous sequence_id runs.
     let mut current_seq = overlaps[0].0.metadata;
@@ -1220,13 +1220,13 @@ fn mask_and_update_regions(
 fn extend_to_close_boundaries(
     overlaps: &mut [(Interval<u32>, Vec<CigarOp>, Interval<u32>)],
     impg: &impl ImpgIndex,
-    min_boundary_distance: i32,
+    min_boundary_distance: i64,
 ) {
     for (query_interval, _, target_interval) in overlaps.iter_mut() {
         let seq_len = impg
             .seq_index()
             .get_len_from_id(query_interval.metadata)
-            .unwrap() as i32;
+            .unwrap() as i64;
         let is_forward = query_interval.first <= query_interval.last;
 
         if is_forward {
@@ -1522,7 +1522,7 @@ fn write_single_partition_file(
     }
 }
 
-pub fn parse_bed_file(bed_file: &str) -> io::Result<Vec<(String, (i32, i32), String)>> {
+pub fn parse_bed_file(bed_file: &str) -> io::Result<Vec<(String, (i64, i64), String)>> {
     let file = File::open(bed_file)?;
     let reader = BufReader::new(file);
     let mut ranges = Vec::new();
@@ -1555,7 +1555,7 @@ pub fn parse_bed_file(bed_file: &str) -> io::Result<Vec<(String, (i32, i32), Str
     Ok(ranges)
 }
 
-pub fn parse_target_range(target_range: &str) -> io::Result<(String, (i32, i32), String)> {
+pub fn parse_target_range(target_range: &str) -> io::Result<(String, (i64, i64), String)> {
     let parts: Vec<&str> = target_range.rsplitn(2, ':').collect();
     if parts.len() != 2 {
         return Err(io::Error::new(
@@ -1569,7 +1569,7 @@ pub fn parse_target_range(target_range: &str) -> io::Result<(String, (i32, i32),
     Ok((parts[1].to_string(), (start, end), name))
 }
 
-fn parse_range(range_parts: &[&str]) -> io::Result<(i32, i32)> {
+fn parse_range(range_parts: &[&str]) -> io::Result<(i64, i64)> {
     if range_parts.len() != 2 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1578,10 +1578,10 @@ fn parse_range(range_parts: &[&str]) -> io::Result<(i32, i32)> {
     }
 
     let start = range_parts[0]
-        .parse::<i32>()
+        .parse::<i64>()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid start value"))?;
     let end = range_parts[1]
-        .parse::<i32>()
+        .parse::<i64>()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid end value"))?;
 
     if start >= end {

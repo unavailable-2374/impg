@@ -18,19 +18,19 @@ pub type Blacklist = FxHashMap<String, COITree<(), u32>>;
 /// Mirrors CLI flags and constrains how aggressively flanks can be explored while
 /// searching for loci that remain well supported at both boundaries.
 pub struct RefineConfig<'a> {
-    pub span_bp: i32,
+    pub span_bp: i64,
     /// Maximum per-side expansion; <=1 interpreted as fraction of the locus, >1 as absolute bp.
     pub max_extension: f64,
     /// Aggregation mode used when counting boundary support.
     pub support_mode: SupportMode,
-    pub extension_step: i32,
-    pub merge_distance: i32,
+    pub extension_step: i64,
+    pub merge_distance: i64,
     pub min_identity: Option<f64>,
     pub use_transitive_bfs: bool,
     pub use_transitive_dfs: bool,
     pub max_transitive_depth: u16,
-    pub min_transitive_len: i32,
-    pub min_distance_between_ranges: i32,
+    pub min_transitive_len: i64,
+    pub min_distance_between_ranges: i64,
     pub subset_filter: Option<&'a SubsetFilter>,
     pub blacklist: Option<&'a Blacklist>,
     pub approximate_mode: bool,
@@ -39,13 +39,13 @@ pub struct RefineConfig<'a> {
 /// Summary for each refined interval produced by [`run_refine`].
 pub struct RefineRecord {
     pub chrom: String,
-    pub refined_start: i32,
-    pub refined_end: i32,
-    pub original_start: i32,
-    pub original_end: i32,
+    pub refined_start: i64,
+    pub refined_end: i64,
+    pub original_start: i64,
+    pub original_end: i64,
     pub label: String,
-    pub applied_left_extension: i32,
-    pub applied_right_extension: i32,
+    pub applied_left_extension: i64,
+    pub applied_right_extension: i64,
     pub support_count: usize,
     pub original_support_count: usize,
     pub support_entities: Vec<SupportEntity>,
@@ -54,8 +54,8 @@ pub struct RefineRecord {
 #[derive(Clone, Debug)]
 pub struct SupportEntity {
     pub sequence: String,
-    pub start: i32,
-    pub end: i32,
+    pub start: i64,
+    pub end: i64,
 }
 
 /// How to aggregate PanSN identifiers when counting support.
@@ -91,19 +91,19 @@ impl From<RefineSupportArg> for SupportMode {
 }
 
 struct SampleInterval {
-    query_start: i32,
-    query_end: i32,
-    target_start: i32,
-    target_end: i32,
+    query_start: i64,
+    query_end: i64,
+    target_start: i64,
+    target_end: i64,
 }
 
 /// Candidate solution capturing a concrete left/right expansion and its support.
 #[derive(Clone)]
 struct CandidateResult {
-    start: i32,
-    end: i32,
-    left_extension: i32,
-    right_extension: i32,
+    start: i64,
+    end: i64,
+    left_extension: i64,
+    right_extension: i64,
     support_count: usize,
     support_entities: Vec<SupportEntity>,
 }
@@ -111,7 +111,7 @@ struct CandidateResult {
 /// Run the refinement procedure on the provided ranges
 pub fn run_refine(
     impg: &impl ImpgIndex,
-    ranges: &[(String, (i32, i32), String)],
+    ranges: &[(String, (i64, i64), String)],
     config: RefineConfig<'_>,
 ) -> io::Result<Vec<RefineRecord>> {
     info!(
@@ -175,8 +175,8 @@ pub fn run_refine(
 fn refine_single_range(
     impg: &impl ImpgIndex,
     chrom: &str,
-    orig_start: i32,
-    orig_end: i32,
+    orig_start: i64,
+    orig_end: i64,
     label: &str,
     config: &RefineConfig<'_>,
     sequence_index: Option<&UnifiedSequenceIndex>,
@@ -203,15 +203,15 @@ fn refine_single_range(
             format!("Length for sequence '{chrom}' missing from index"),
         ));
     };
-    let seq_len = seq_len as i32;
+    let seq_len = seq_len as i64;
 
     let locus_len = (orig_end - orig_start).max(0);
     let max_extension_bp = if config.max_extension <= 1.0 {
         ((locus_len as f64) * config.max_extension)
             .ceil()
-            .clamp(0.0, i32::MAX as f64) as i32
+            .clamp(0.0, i64::MAX as f64) as i64
     } else {
-        config.max_extension.ceil().clamp(0.0, i32::MAX as f64) as i32
+        config.max_extension.ceil().clamp(0.0, i64::MAX as f64) as i64
     };
     let max_extension_bp = max_extension_bp.max(0);
 
@@ -243,8 +243,8 @@ fn refine_single_range(
         );
         impg.populate_cigar_cache(
             target_id,
-            max_start,
-            max_end,
+            max_start as i64,
+            max_end as i64,
             config.min_identity,
             sequence_index,
             &mut cigar_cache,
@@ -268,7 +268,7 @@ fn refine_single_range(
         orig_end
     );
 
-    let evaluate = |left: i32, right: i32| -> Option<CandidateResult> {
+    let evaluate = |left: i64, right: i64| -> Option<CandidateResult> {
         evaluate_candidate(
             impg,
             target_id,
@@ -423,11 +423,11 @@ fn evaluate_candidate(
     impg: &impl ImpgIndex,
     target_id: u32,
     chrom: &str,
-    orig_start: i32,
-    orig_end: i32,
-    seq_len: i32,
-    left_flank: i32,
-    right_flank: i32,
+    orig_start: i64,
+    orig_end: i64,
+    seq_len: i64,
+    left_flank: i64,
+    right_flank: i64,
     config: &RefineConfig<'_>,
     sequence_index: Option<&UnifiedSequenceIndex>,
     max_entities: Option<usize>,
@@ -491,7 +491,7 @@ fn evaluate_candidate(
 fn query_overlaps(
     impg: &impl ImpgIndex,
     target_id: u32,
-    range: (i32, i32),
+    range: (i64, i64),
     config: &RefineConfig<'_>,
     sequence_index: Option<&UnifiedSequenceIndex>,
     buffer: &mut Vec<AdjustedInterval>,
@@ -654,10 +654,10 @@ fn compute_supporting_stats(
     mode: SupportMode,
     target_id: u32,
     overlaps: &[AdjustedInterval],
-    region_start: i32,
-    region_end: i32,
-    span_bp: i32,
-    merge_distance: i32,
+    region_start: i64,
+    region_end: i64,
+    span_bp: i64,
+    merge_distance: i64,
     max_entities: Option<usize>,
     blacklist: Option<&Blacklist>,
 ) -> SupportStats {
@@ -685,15 +685,15 @@ fn compute_support_sets(
     mode: SupportMode,
     target_id: u32,
     overlaps: &[AdjustedInterval],
-    region_start: i32,
-    region_end: i32,
-    span_bp: i32,
-    merge_distance: i32,
+    region_start: i64,
+    region_end: i64,
+    span_bp: i64,
+    merge_distance: i64,
     max_possible: Option<usize>,
     blacklist: Option<&Blacklist>,
 ) -> (FxHashSet<String>, Vec<SupportEntity>) {
     let mut aggregated = FxHashSet::default();
-    let mut sequence_ranges: FxHashMap<String, (i32, i32)> = FxHashMap::default();
+    let mut sequence_ranges: FxHashMap<String, (i64, i64)> = FxHashMap::default();
 
     if overlaps.len() <= 1 {
         return (aggregated, Vec::new());
@@ -727,17 +727,17 @@ fn compute_support_sets(
     let right_threshold = region_end - effective_span;
 
     for (sample_id, intervals) in per_sample {
-        let merged = merge_intervals(intervals, merge_distance);
+        let merged = merge_intervals(intervals, merge_distance as i64);
 
-        let mut query_range: Option<(i32, i32)> = None;
+        let mut query_range: Option<(i64, i64)> = None;
         for interval in &merged {
             if covers_boundaries(
                 interval.target_start,
                 interval.target_end,
-                region_start,
-                region_end,
-                left_threshold,
-                right_threshold,
+                region_start as i64,
+                region_end as i64,
+                left_threshold as i64,
+                right_threshold as i64,
             ) {
                 let q_start = interval.query_start.min(interval.query_end);
                 let q_end = interval.query_start.max(interval.query_end);
@@ -801,12 +801,12 @@ fn compute_support_sets(
 }
 
 fn covers_boundaries(
-    interval_start: i32,
-    interval_end: i32,
-    region_start: i32,
-    region_end: i32,
-    left_threshold: i32,
-    right_threshold: i32,
+    interval_start: i64,
+    interval_end: i64,
+    region_start: i64,
+    region_end: i64,
+    left_threshold: i64,
+    right_threshold: i64,
 ) -> bool {
     interval_start <= region_start
         && interval_end >= region_end
@@ -814,7 +814,7 @@ fn covers_boundaries(
         && interval_start <= right_threshold
 }
 
-fn merge_intervals(mut intervals: Vec<SampleInterval>, merge_distance: i32) -> Vec<SampleInterval> {
+fn merge_intervals(mut intervals: Vec<SampleInterval>, merge_distance: i64) -> Vec<SampleInterval> {
     if intervals.is_empty() {
         return intervals;
     }
@@ -849,11 +849,11 @@ fn merge_intervals(mut intervals: Vec<SampleInterval>, merge_distance: i32) -> V
     merged
 }
 
-fn should_merge(a: &SampleInterval, b: &SampleInterval, merge_distance: i32) -> bool {
+fn should_merge(a: &SampleInterval, b: &SampleInterval, merge_distance: i64) -> bool {
     if merge_distance < 0 {
         return false;
     }
-    let distance = merge_distance as u32;
+    let distance = merge_distance as u64;
     let query_adjacent = a
         .query_end
         .abs_diff(b.query_start)
@@ -867,7 +867,7 @@ fn should_merge(a: &SampleInterval, b: &SampleInterval, merge_distance: i32) -> 
     query_adjacent || target_adjacent
 }
 
-fn build_flanks(max_extension: i32, step: i32) -> Vec<i32> {
+fn build_flanks(max_extension: i64, step: i64) -> Vec<i64> {
     let mut flanks = Vec::new();
     let mut current = 0;
 
@@ -950,13 +950,13 @@ pub fn parse_blacklist_bed(path: &str) -> io::Result<Blacklist> {
         }
 
         let chrom = fields[0].to_string();
-        let start: i32 = fields[1].parse().map_err(|e| {
+        let start: i64 = fields[1].parse().map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Invalid start position on line {}: {}", line_num + 1, e),
             )
         })?;
-        let end: i32 = fields[2].parse().map_err(|e| {
+        let end: i64 = fields[2].parse().map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Invalid end position on line {}: {}", line_num + 1, e),

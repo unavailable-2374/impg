@@ -11,8 +11,8 @@ use gfasort::ygs::{unchop_only, ygs_sort, YgsParams};
 #[derive(Clone)]
 pub struct SequenceMetadata {
     pub name: String,
-    pub start: i32,
-    pub size: i32,
+    pub start: i64,
+    pub size: i64,
     pub strand: char,
     pub total_length: usize,
 }
@@ -28,8 +28,8 @@ impl SequenceMetadata {
             (self.start, self.start + self.size)
         } else {
             (
-                (self.total_length as i32) - self.start - self.size,
-                (self.total_length as i32) - self.start,
+                (self.total_length as i64) - self.start - self.size,
+                (self.total_length as i64) - self.start,
             )
         };
         format!("{}:{}-{}", self.name, fwd_start, fwd_end)
@@ -418,7 +418,7 @@ pub fn prepare_sequences(
 
             // MAF-style start: if reverse, origin is from the RC frame
             let maf_start = if strand == '-' {
-                (total_length as i32) - end
+                (total_length as i64) - end
             } else {
                 start
             };

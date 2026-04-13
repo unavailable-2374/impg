@@ -15,8 +15,8 @@ pub struct DepthConfig {
     pub transitive: bool,
     pub transitive_dfs: bool,
     pub max_depth: u16,
-    pub min_transitive_len: i32,
-    pub min_distance_between_ranges: i32,
+    pub min_transitive_len: i64,
+    pub min_distance_between_ranges: i64,
     pub merge_adjacent: bool,
     /// When true, use CIGAR-precise BFS for transitive depth (--use-BFS).
     /// When false (default), use raw-interval BFS with linear interpolation.
@@ -626,54 +626,18 @@ pub fn write_region_depth_output<W: Write>(
 
 /// Stores sequence lengths and sample-to-sequence mappings
 #[derive(Debug, Clone)]
-pub struct SequenceLengths {
+pub(crate) struct SequenceLengths {
     /// seq_name -> length
     pub lengths: FxHashMap<String, i64>,
     /// sample_name -> list of seq_names belonging to this sample
     pub sample_to_seqs: FxHashMap<String, Vec<String>>,
-    /// seq_name -> sample_name (reverse lookup)
-    pub seq_to_sample: FxHashMap<String, String>,
 }
 
 impl SequenceLengths {
-    /// Build from impg sequence index
-    pub fn from_impg(impg: &impl ImpgIndex, separator: &str) -> Self {
-        let mut lengths = FxHashMap::default();
-        let mut sample_to_seqs: FxHashMap<String, Vec<String>> = FxHashMap::default();
-        let mut seq_to_sample = FxHashMap::default();
-
-        for id in 0..impg.seq_index().len() as u32 {
-            if let (Some(name), Some(len)) = (
-                impg.seq_index().get_name(id),
-                impg.seq_index().get_len_from_id(id),
-            ) {
-                let sample = extract_sample(name, separator);
-                lengths.insert(name.to_string(), len as i64);
-                sample_to_seqs
-                    .entry(sample.clone())
-                    .or_default()
-                    .push(name.to_string());
-                seq_to_sample.insert(name.to_string(), sample);
-            }
-        }
-
-        // Sort sequences within each sample for deterministic ordering
-        for seqs in sample_to_seqs.values_mut() {
-            seqs.sort();
-        }
-
-        SequenceLengths {
-            lengths,
-            sample_to_seqs,
-            seq_to_sample,
-        }
-    }
-
     /// Build from FAI file list
     pub fn from_fai_list(fai_list_path: &str, separator: &str) -> io::Result<Self> {
         let mut lengths = FxHashMap::default();
         let mut sample_to_seqs: FxHashMap<String, Vec<String>> = FxHashMap::default();
-        let mut seq_to_sample = FxHashMap::default();
 
         let content = std::fs::read_to_string(fai_list_path).map_err(|e| {
             io::Error::new(
@@ -704,10 +668,9 @@ impl SequenceLengths {
                     let sample = extract_sample(&seq_name, separator);
                     lengths.insert(seq_name.clone(), seq_len);
                     sample_to_seqs
-                        .entry(sample.clone())
+                        .entry(sample)
                         .or_default()
-                        .push(seq_name.clone());
-                    seq_to_sample.insert(seq_name, sample);
+                        .push(seq_name);
                 }
             }
         }
@@ -720,28 +683,7 @@ impl SequenceLengths {
         Ok(SequenceLengths {
             lengths,
             sample_to_seqs,
-            seq_to_sample,
         })
-    }
-
-    /// Get all samples
-    pub fn get_samples(&self) -> Vec<String> {
-        let mut samples: Vec<_> = self.sample_to_seqs.keys().cloned().collect();
-        samples.sort();
-        samples
-    }
-
-    /// Get sequences for a sample
-    pub fn get_seqs_of_sample(&self, sample: &str) -> &[String] {
-        self.sample_to_seqs
-            .get(sample)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
-    }
-
-    /// Get length of a sequence
-    pub fn get_length(&self, seq_name: &str) -> Option<i64> {
-        self.lengths.get(seq_name).copied()
     }
 }
 
@@ -752,7 +694,7 @@ impl SequenceLengths {
 /// Sample index: maps sample names to compact IDs (u16) and vice versa
 /// Max 65535 samples, which is sufficient for most pangenome analyses
 #[derive(Debug, Clone)]
-pub struct SampleIndex {
+pub(crate) struct SampleIndex {
     name_to_id: FxHashMap<String, u16>,
     id_to_name: Vec<String>, // Use Vec for O(1) lookup
 }
@@ -763,25 +705,6 @@ impl SampleIndex {
         Self {
             name_to_id: FxHashMap::default(),
             id_to_name: Vec::new(),
-        }
-    }
-
-    /// Build from SequenceLengths
-    pub fn from_seq_lengths(seq_lengths: &SequenceLengths) -> Self {
-        let mut samples: Vec<_> = seq_lengths.sample_to_seqs.keys().cloned().collect();
-        samples.sort(); // Deterministic ordering
-
-        let mut name_to_id = FxHashMap::default();
-        let mut id_to_name = Vec::with_capacity(samples.len());
-
-        for (i, sample) in samples.into_iter().enumerate() {
-            name_to_id.insert(sample.clone(), i as u16);
-            id_to_name.push(sample);
-        }
-
-        Self {
-            name_to_id,
-            id_to_name,
         }
     }
 
@@ -797,19 +720,9 @@ impl SampleIndex {
         self.id_to_name.get(id as usize).map(|s| s.as_str())
     }
 
-    /// Get all sample names in ID order
-    pub fn names(&self) -> &[String] {
-        &self.id_to_name
-    }
-
     /// Get number of samples
     pub fn len(&self) -> usize {
         self.id_to_name.len()
-    }
-
-    /// Check if empty
-    pub fn is_empty(&self) -> bool {
-        self.id_to_name.is_empty()
     }
 }
 
@@ -822,11 +735,9 @@ impl Default for SampleIndex {
 /// Compact sequence lengths using numeric IDs
 /// Memory usage: O(num_sequences) instead of O(num_sequences × avg_name_length)
 #[derive(Debug, Clone)]
-pub struct CompactSequenceLengths {
+pub(crate) struct CompactSequenceLengths {
     /// Sequence lengths indexed by seq_id (from impg's SequenceIndex)
     lengths: Vec<i64>,
-    /// sample_id -> list of seq_ids belonging to this sample
-    sample_to_seqs: Vec<Vec<u32>>,
     /// seq_id -> sample_id (reverse lookup)
     seq_to_sample: Vec<u16>,
     /// Sample index for name<->ID conversion
@@ -861,7 +772,6 @@ impl CompactSequenceLengths {
         // Second pass: build mappings
         let num_seqs = impg.seq_index().len();
         let mut lengths = vec![0i64; num_seqs];
-        let mut sample_to_seqs: Vec<Vec<u32>> = vec![Vec::new(); sample_index.len()];
         let mut seq_to_sample = vec![0u16; num_seqs];
 
         for seq_id in 0..num_seqs as u32 {
@@ -872,20 +782,13 @@ impl CompactSequenceLengths {
                 let sample_name = extract_sample(name, separator);
                 if let Some(sample_id) = sample_index.get_id(&sample_name) {
                     lengths[seq_id as usize] = len as i64;
-                    sample_to_seqs[sample_id as usize].push(seq_id);
                     seq_to_sample[seq_id as usize] = sample_id;
                 }
             }
         }
 
-        // Sort sequences within each sample for deterministic ordering
-        for seqs in &mut sample_to_seqs {
-            seqs.sort();
-        }
-
         CompactSequenceLengths {
             lengths,
-            sample_to_seqs,
             seq_to_sample,
             sample_index,
         }
@@ -906,36 +809,17 @@ impl CompactSequenceLengths {
             .unwrap_or(0)
     }
 
-    /// Get sequences for a sample
-    #[inline]
-    pub fn get_seqs_of_sample(&self, sample_id: u16) -> &[u32] {
-        self.sample_to_seqs
-            .get(sample_id as usize)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
-    }
-
     /// Get sample index
     #[inline]
     pub fn sample_index(&self) -> &SampleIndex {
         &self.sample_index
-    }
-
-    /// Get number of samples
-    pub fn num_samples(&self) -> usize {
-        self.sample_index.len()
-    }
-
-    /// Get all sample IDs in order
-    pub fn sample_ids(&self) -> impl Iterator<Item = u16> {
-        0..self.sample_index.len() as u16
     }
 }
 
 /// Compact alignment info using numeric IDs
 /// Memory usage: ~60% less than SampleAlignmentInfo for large datasets
 #[derive(Debug, Clone)]
-pub struct CompactAlignmentInfo {
+pub(crate) struct CompactAlignmentInfo {
     /// Sample ID (from SampleIndex)
     pub sample_id: u16,
     /// Query sequence ID (from impg's SequenceIndex)
@@ -977,7 +861,7 @@ impl CompactAlignmentInfo {
 /// Memory efficient: uses 1 bit per sample instead of hash map entries
 /// Supports counting multiple overlaps per sample
 #[derive(Debug, Clone)]
-pub struct SampleBitmap {
+pub(crate) struct SampleBitmap {
     /// Bit set for sample presence (sample_id -> present)
     bits: BitVec,
     /// Count of active alignments per sample (for overlapping alignments from same sample)
@@ -1022,19 +906,6 @@ impl SampleBitmap {
         }
     }
 
-    /// Check if a sample is active
-    #[inline]
-    pub fn is_active(&self, sample_id: u16) -> bool {
-        let idx = sample_id as usize;
-        idx < self.bits.len() && self.bits[idx]
-    }
-
-    /// Get the count of active alignments for a sample
-    #[inline]
-    pub fn count(&self, sample_id: u16) -> u32 {
-        self.counts.get(sample_id as usize).copied().unwrap_or(0)
-    }
-
     /// Get the number of unique active samples (depth)
     #[inline]
     pub fn depth(&self) -> usize {
@@ -1044,13 +915,6 @@ impl SampleBitmap {
     /// Iterate over active sample IDs
     pub fn active_samples(&self) -> impl Iterator<Item = u16> + '_ {
         self.bits.iter_ones().map(|idx| idx as u16)
-    }
-
-    /// Clear all active samples
-    pub fn clear(&mut self) {
-        self.bits.fill(false);
-        self.counts.fill(0);
-        self.active_count = 0;
     }
 }
 
@@ -1062,7 +926,7 @@ impl Default for SampleBitmap {
 
 /// High-performance interval set with efficient intersection and subtraction
 #[derive(Debug, Clone, Default)]
-pub struct IntervalSet {
+pub(crate) struct IntervalSet {
     /// Sorted, non-overlapping intervals [(start, end), ...]
     intervals: Vec<(i64, i64)>,
     /// Total covered length (for quick empty check)
@@ -1149,43 +1013,9 @@ impl IntervalSet {
         self.total_length
     }
 
-    /// Get number of intervals
-    pub fn interval_count(&self) -> usize {
-        self.intervals.len()
-    }
-
     /// Get all intervals
     pub fn intervals(&self) -> &[(i64, i64)] {
         &self.intervals
-    }
-
-    /// Intersect with a query interval, return intersecting portions
-    pub fn intersect(&self, query_start: i64, query_end: i64) -> Vec<(i64, i64)> {
-        if query_start >= query_end || self.intervals.is_empty() {
-            return Vec::new();
-        }
-
-        let mut result = Vec::new();
-
-        // Binary search for the first interval that might overlap
-        let start_idx = self
-            .intervals
-            .partition_point(|&(_, end)| end <= query_start);
-
-        for &(iv_start, iv_end) in &self.intervals[start_idx..] {
-            if iv_start >= query_end {
-                break;
-            }
-
-            let intersect_start = iv_start.max(query_start);
-            let intersect_end = iv_end.min(query_end);
-
-            if intersect_start < intersect_end {
-                result.push((intersect_start, intersect_end));
-            }
-        }
-
-        result
     }
 
     /// Subtract a single interval from this set
@@ -1235,90 +1065,6 @@ impl IntervalSet {
         self.total_length -= removed_length;
     }
 
-    /// Batch subtract multiple intervals (more efficient than individual subtracts)
-    pub fn subtract_batch(&mut self, to_remove: &[(i64, i64)]) {
-        if to_remove.is_empty() || self.intervals.is_empty() {
-            return;
-        }
-
-        // Merge overlapping intervals to remove
-        let merged_remove = merge_intervals(to_remove);
-
-        let mut new_intervals = Vec::new();
-        let mut remove_idx = 0;
-        let mut removed_length: i64 = 0;
-
-        for &(iv_start, iv_end) in &self.intervals {
-            let mut current_start = iv_start;
-
-            while remove_idx < merged_remove.len() && current_start < iv_end {
-                let (rm_start, rm_end) = merged_remove[remove_idx];
-
-                if rm_end <= current_start {
-                    // Remove interval is before current position
-                    remove_idx += 1;
-                    continue;
-                }
-
-                if rm_start >= iv_end {
-                    // Remove interval is after current interval
-                    break;
-                }
-
-                // There's overlap
-                if rm_start > current_start {
-                    // Keep [current_start, rm_start)
-                    new_intervals.push((current_start, rm_start));
-                }
-
-                // Calculate removed portion
-                let overlap_start = current_start.max(rm_start);
-                let overlap_end = iv_end.min(rm_end);
-                if overlap_end > overlap_start {
-                    removed_length += overlap_end - overlap_start;
-                }
-
-                current_start = rm_end;
-
-                if rm_end <= iv_end {
-                    remove_idx += 1;
-                }
-            }
-
-            if current_start < iv_end {
-                new_intervals.push((current_start, iv_end));
-            }
-        }
-
-        self.intervals = new_intervals;
-        self.total_length -= removed_length;
-    }
-}
-
-/// Merge overlapping/adjacent intervals
-fn merge_intervals(intervals: &[(i64, i64)]) -> Vec<(i64, i64)> {
-    if intervals.is_empty() {
-        return Vec::new();
-    }
-
-    let mut sorted: Vec<_> = intervals.to_vec();
-    sorted.sort_by_key(|&(s, _)| s);
-
-    let mut merged = Vec::new();
-    let mut current = sorted[0];
-
-    for &(start, end) in &sorted[1..] {
-        if start <= current.1 {
-            // Overlapping or adjacent
-            current.1 = current.1.max(end);
-        } else {
-            merged.push(current);
-            current = (start, end);
-        }
-    }
-    merged.push(current);
-
-    merged
 }
 
 /// Map a target coordinate range to query coordinates using linear interpolation.
@@ -1328,6 +1074,7 @@ fn merge_intervals(intervals: &[(i64, i64)]) -> Vec<(i64, i64)> {
 /// because it reveals actual alignment structure differences. Linear interpolation
 /// smooths these over at the cost of some coordinate accuracy.
 #[allow(unused_variables)]
+#[inline]
 fn map_target_to_query_linear(
     cigar: &[CigarOp],
     aln_target_start: i64,
@@ -1748,11 +1495,11 @@ struct AnchorRegionResult {
 /// Stores query and target coordinates plus orientation.
 struct DepthBfsHit {
     query_id: u32,
-    query_start: i32,
-    query_end: i32,
+    query_start: i64,
+    query_end: i64,
     target_id: u32,
-    target_start: i32,
-    target_end: i32,
+    target_start: i64,
+    target_end: i64,
     is_reverse: bool,
 }
 
@@ -1767,11 +1514,11 @@ struct DepthBfsHit {
 fn depth_transitive_bfs(
     impg: &impl ImpgIndex,
     target_id: u32,
-    range_start: i32,
-    range_end: i32,
+    range_start: i64,
+    range_end: i64,
     max_depth: u16,
-    min_transitive_len: i32,
-    min_distance_between_ranges: i32,
+    min_transitive_len: i64,
+    min_distance_between_ranges: i64,
     _use_dfs: bool,
 ) -> Vec<DepthBfsHit> {
     use std::collections::VecDeque;
@@ -1782,14 +1529,14 @@ fn depth_transitive_bfs(
     let mut visited_ranges: FxHashMap<u32, SortedRanges> = FxHashMap::default();
 
     // Initialize visited for the starting target
-    let target_len = impg.seq_index().get_len_from_id(target_id).unwrap_or(0) as i32;
+    let target_len = impg.seq_index().get_len_from_id(target_id).unwrap_or(0) as i64;
     let target_sorted = visited_ranges
         .entry(target_id)
         .or_insert_with(|| SortedRanges::new(target_len, 0));
     let filtered_input_range = target_sorted.insert((range_start, range_end));
 
     // BFS queue: (seq_id, start, end, current_depth)
-    let mut queue: VecDeque<(u32, i32, i32, u16)> = VecDeque::new();
+    let mut queue: VecDeque<(u32, i64, i64, u16)> = VecDeque::new();
     for (s, e) in filtered_input_range {
         if (e - s).abs() >= min_transitive_len {
             queue.push_back((target_id, s, e, 0));
@@ -1806,7 +1553,7 @@ fn depth_transitive_bfs(
         let raw_alns = impg.query_raw_overlapping(current_target_id, current_start, current_end);
 
         // Collect next-depth ranges to sort and merge before adding to queue
-        let mut next_ranges: Vec<(u32, i32, i32)> = Vec::new();
+        let mut next_ranges: Vec<(u32, i64, i64)> = Vec::new();
 
         for aln in &raw_alns {
             // Skip self-referential (same sequence)
@@ -1835,15 +1582,15 @@ fn depth_transitive_bfs(
 
             let (clipped_query_start, clipped_query_end) = if aln.is_reverse {
                 let cqe = aln.query_end
-                    - ((clipped_target_start - aln_target_start) as f64 * ratio) as i32;
+                    - ((clipped_target_start - aln_target_start) as f64 * ratio) as i64;
                 let cqs =
-                    aln.query_end - ((clipped_target_end - aln_target_start) as f64 * ratio) as i32;
+                    aln.query_end - ((clipped_target_end - aln_target_start) as f64 * ratio) as i64;
                 (cqs.min(cqe), cqs.max(cqe))
             } else {
                 let cqs = aln.query_start
-                    + ((clipped_target_start - aln_target_start) as f64 * ratio) as i32;
+                    + ((clipped_target_start - aln_target_start) as f64 * ratio) as i64;
                 let cqe = aln.query_start
-                    + ((clipped_target_end - aln_target_start) as f64 * ratio) as i32;
+                    + ((clipped_target_end - aln_target_start) as f64 * ratio) as i64;
                 (cqs.min(cqe), cqs.max(cqe))
             };
 
@@ -1866,7 +1613,7 @@ fn depth_transitive_bfs(
             let explore_start = aln.query_start.min(aln.query_end);
             let explore_end = aln.query_start.max(aln.query_end);
 
-            let query_seq_len = impg.seq_index().get_len_from_id(aln.query_id).unwrap_or(0) as i32;
+            let query_seq_len = impg.seq_index().get_len_from_id(aln.query_id).unwrap_or(0) as i64;
             let ranges = visited_ranges
                 .entry(aln.query_id)
                 .or_insert_with(|| SortedRanges::new(query_seq_len, 0));
@@ -1956,8 +1703,8 @@ fn process_anchor_region_transitive_raw(
     let hits = depth_transitive_bfs(
         impg,
         anchor_seq_id,
-        region_start as i32,
-        region_end as i32,
+        region_start,
+        region_end,
         config.max_depth,
         config.min_transitive_len,
         config.min_distance_between_ranges,
@@ -2134,8 +1881,8 @@ fn process_anchor_region(
 
     let overlaps = impg.query(
         anchor_seq_id,
-        region_start as i32,
-        region_end as i32,
+        region_start,
+        region_end,
         false,
         None,
         None,
@@ -2365,8 +2112,8 @@ fn process_anchor_region_transitive_cigar(
     let overlaps = if config.transitive_dfs {
         impg.query_transitive_dfs(
             anchor_seq_id,
-            region_start as i32,
-            region_end as i32,
+            region_start,
+            region_end,
             None,
             config.max_depth,
             config.min_transitive_len,
@@ -2381,8 +2128,8 @@ fn process_anchor_region_transitive_cigar(
     } else {
         impg.query_transitive_bfs(
             anchor_seq_id,
-            region_start as i32,
-            region_end as i32,
+            region_start,
+            region_end,
             None,
             config.max_depth,
             config.min_transitive_len,
@@ -2511,7 +2258,7 @@ fn process_anchor_region_transitive_cigar(
     // coverage is marked as processed, preventing Phase 2 from re-processing these
     // regions and producing duplicate output (e.g., CHM13 appearing in Phase 2 rows).
     let raw_hop0 =
-        impg.query_raw_overlapping(anchor_seq_id, region_start as i32, region_end as i32);
+        impg.query_raw_overlapping(anchor_seq_id, region_start, region_end);
     for aln in &raw_hop0 {
         if min_seq_length > 0
             && !seq_included
@@ -3300,11 +3047,11 @@ pub fn compute_depth_global(
                     // Fast path: gaps smaller than min_transitive_len can't trigger
                     // transitive hops, so BFS setup (visited_ranges allocation for all
                     // sequences, sub-index loading) is wasted. Use raw intervals instead.
-                    if gap_len < config.min_transitive_len as i64 {
+                    if gap_len < config.min_transitive_len {
                         let mut raw_alns = impg.query_raw_overlapping(
                             seq_id,
-                            region_start as i32,
-                            region_end as i32,
+                            region_start,
+                            region_end,
                         );
                         if min_seq_length > 0 {
                             raw_alns.retain(|aln| {
@@ -3741,8 +3488,8 @@ pub fn query_region_depth(
     impg: &impl ImpgIndex,
     config: &DepthConfig,
     target_seq: &str,
-    target_start: i32,
-    target_end: i32,
+    target_start: i64,
+    target_end: i64,
     separator: &str,
     sample_filter: Option<&SampleFilter>,
     sequence_index: Option<&UnifiedSequenceIndex>,
@@ -3803,8 +3550,8 @@ pub fn query_region_depth(
             )
         };
 
-        let region_start = target_start as i64;
-        let region_end = target_end as i64;
+        let region_start = target_start;
+        let region_end = target_end;
 
         // Pass 1: Build a map of each sequence's anchor coverage from hop 0 results
         let mut seq_anchor_coverage: FxHashMap<u32, (i64, i64, i64, i64)> = FxHashMap::default();
@@ -3909,8 +3656,8 @@ pub fn query_region_depth(
             config.transitive_dfs,
         );
 
-        let region_start = target_start as i64;
-        let region_end = target_end as i64;
+        let region_start = target_start;
+        let region_end = target_end;
 
         // Pass 1: Build anchor coverage map from hop 0 results
         let mut seq_anchor_coverage: FxHashMap<u32, (i64, i64, i64, i64)> = FxHashMap::default();
@@ -4043,8 +3790,8 @@ pub fn query_region_depth(
         let mut raw_alns = impg.query_raw_overlapping(target_id, target_start, target_end);
         raw_alns.sort_unstable_by_key(|a| a.target_start);
 
-        let region_start = target_start as i64;
-        let region_end = target_end as i64;
+        let region_start = target_start;
+        let region_end = target_end;
 
         for aln in &raw_alns {
             let query_name = match impg.seq_index().get_name(aln.query_id) {
@@ -4171,7 +3918,7 @@ pub fn query_region_depth(
 }
 
 /// Parse target range string in format "seq_name:start-end"
-pub fn parse_target_range_depth(target_range: &str) -> io::Result<(String, i32, i32)> {
+pub fn parse_target_range_depth(target_range: &str) -> io::Result<(String, i64, i64)> {
     // Handle format: seq_name:start-end
     // Note: seq_name may contain colons (e.g., sample#hap#chr)
     let parts: Vec<&str> = target_range.rsplitn(2, ':').collect();
@@ -4199,14 +3946,14 @@ pub fn parse_target_range_depth(target_range: &str) -> io::Result<(String, i32, 
         ));
     }
 
-    let start: i32 = range_parts[0].parse().map_err(|_| {
+    let start: i64 = range_parts[0].parse().map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("Invalid start position: {}", range_parts[0]),
         )
     })?;
 
-    let end: i32 = range_parts[1].parse().map_err(|_| {
+    let end: i64 = range_parts[1].parse().map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("Invalid end position: {}", range_parts[1]),
@@ -4224,7 +3971,7 @@ pub fn parse_target_range_depth(target_range: &str) -> io::Result<(String, i32, 
 }
 
 /// Parse BED file for region queries
-pub fn parse_bed_file_depth(bed_path: &str) -> io::Result<Vec<(String, i32, i32)>> {
+pub fn parse_bed_file_depth(bed_path: &str) -> io::Result<Vec<(String, i64, i64)>> {
     let content = std::fs::read_to_string(bed_path)?;
     let mut regions = Vec::new();
 
@@ -4240,13 +3987,13 @@ pub fn parse_bed_file_depth(bed_path: &str) -> io::Result<Vec<(String, i32, i32)
         }
 
         let seq_name = parts[0].to_string();
-        let start: i32 = parts[1].parse().map_err(|_| {
+        let start: i64 = parts[1].parse().map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("Invalid start position in BED file: {}", parts[1]),
             )
         })?;
-        let end: i32 = parts[2].parse().map_err(|_| {
+        let end: i64 = parts[2].parse().map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("Invalid end position in BED file: {}", parts[2]),

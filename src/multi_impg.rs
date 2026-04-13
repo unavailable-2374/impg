@@ -529,8 +529,8 @@ impl MultiImpg {
     fn query_all_indices(
         &self,
         unified_target_id: u32,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         store_cigar: bool,
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
@@ -632,8 +632,8 @@ impl MultiImpg {
     fn make_self_interval(
         &self,
         target_id: u32,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         store_cigar: bool,
     ) -> AdjustedInterval {
         (
@@ -643,7 +643,7 @@ impl MultiImpg {
                 metadata: target_id,
             },
             if store_cigar {
-                vec![CigarOp::new(range_end - range_start, '=')]
+                vec![CigarOp::new((range_end - range_start) as i32, '=')]
             } else {
                 Vec::new()
             },
@@ -664,8 +664,8 @@ impl ImpgIndex for MultiImpg {
     fn query(
         &self,
         target_id: u32,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         store_cigar: bool,
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
@@ -685,8 +685,8 @@ impl ImpgIndex for MultiImpg {
     fn query_with_cache(
         &self,
         target_id: u32,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         store_cigar: bool,
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
@@ -708,8 +708,8 @@ impl ImpgIndex for MultiImpg {
     fn populate_cigar_cache(
         &self,
         _target_id: u32,
-        _range_start: i32,
-        _range_end: i32,
+        _range_start: i64,
+        _range_end: i64,
         _min_gap_compressed_identity: Option<f64>,
         _sequence_index: Option<&UnifiedSequenceIndex>,
         _cache: &mut FxHashMap<(u32, u64), Vec<CigarOp>>,
@@ -721,13 +721,13 @@ impl ImpgIndex for MultiImpg {
     fn query_transitive_dfs(
         &self,
         target_id: u32,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         masked_regions: Option<&FxHashMap<u32, SortedRanges>>,
         max_depth: u16,
-        min_transitive_len: i32,
-        min_distance_between_ranges: i32,
-        min_output_length: Option<i32>,
+        min_transitive_len: i64,
+        min_distance_between_ranges: i64,
+        min_output_length: Option<i64>,
         store_cigar: bool,
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
@@ -756,13 +756,13 @@ impl ImpgIndex for MultiImpg {
     fn query_transitive_bfs(
         &self,
         target_id: u32,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         masked_regions: Option<&FxHashMap<u32, SortedRanges>>,
         max_depth: u16,
-        min_transitive_len: i32,
-        min_distance_between_ranges: i32,
-        min_output_length: Option<i32>,
+        min_transitive_len: i64,
+        min_distance_between_ranges: i64,
+        min_output_length: Option<i64>,
         store_cigar: bool,
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
@@ -821,7 +821,7 @@ impl ImpgIndex for MultiImpg {
         &self.sequence_files
     }
 
-    fn query_reverse_for_depth(&self, query_id: u32) -> Vec<(i32, i32, u32)> {
+    fn query_reverse_for_depth(&self, query_id: u32) -> Vec<(i64, i64, u32)> {
         let mut results = Vec::new();
 
         // Iterate through all target_ids in the forest map
@@ -870,7 +870,7 @@ impl ImpgIndex for MultiImpg {
         &self,
         query_id: u32,
         query_to_targets: &FxHashMap<u32, Vec<u32>>,
-    ) -> Vec<(i32, i32, u32)> {
+    ) -> Vec<(i64, i64, u32)> {
         let mut results = Vec::new();
 
         if let Some(target_ids) = query_to_targets.get(&query_id) {
@@ -954,7 +954,7 @@ impl ImpgIndex for MultiImpg {
         results
     }
 
-    fn query_raw_overlapping(&self, unified_target_id: u32, start: i32, end: i32) -> Vec<RawAlignmentInterval> {
+    fn query_raw_overlapping(&self, unified_target_id: u32, start: i64, end: i64) -> Vec<RawAlignmentInterval> {
         let locations = match self.forest_map.get(&unified_target_id) {
             Some(locs) => locs,
             None => return Vec::new(),
@@ -997,13 +997,13 @@ impl MultiImpg {
     fn transitive_query_impl(
         &self,
         target_id: u32,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         masked_regions: Option<&FxHashMap<u32, SortedRanges>>,
         max_depth: u16,
-        min_transitive_len: i32,
-        min_distance_between_ranges: i32,
-        min_output_length: Option<i32>,
+        min_transitive_len: i64,
+        min_distance_between_ranges: i64,
+        min_output_length: Option<i64>,
         store_cigar: bool,
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
@@ -1019,7 +1019,7 @@ impl MultiImpg {
                 .into_par_iter()
                 .map(|id| {
                     let len = self.seq_index.get_len_from_id(id).unwrap_or(0);
-                    (id, SortedRanges::new(len as i32, 0))
+                    (id, SortedRanges::new(len as i64, 0))
                 })
                 .collect()
         };
@@ -1031,7 +1031,7 @@ impl MultiImpg {
             .insert((range_start, range_end));
 
         let mut results = Vec::new();
-        let mut stack: VecDeque<(u32, i32, i32, u16)> = VecDeque::new();
+        let mut stack: VecDeque<(u32, i64, i64, u16)> = VecDeque::new();
 
         // Add filtered input ranges
         for (filtered_start, filtered_end) in filtered_input_range {
@@ -1119,7 +1119,7 @@ impl MultiImpg {
                 // Only add non-overlapping portions to the stack for further exploration
                 let ranges = visited_ranges.entry(query_id).or_insert_with(|| {
                     let len = self.seq_index.get_len_from_id(query_id).unwrap_or(0);
-                    SortedRanges::new(len as i32, 0)
+                    SortedRanges::new(len as i64, 0)
                 });
 
                 let mut should_add = true;

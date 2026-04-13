@@ -46,7 +46,7 @@ thread_local! {
     static GAP_AFFINE2P_ALIGNER: RefCell<Option<AffineWavefronts>> = const { RefCell::new(None) };
     static ONEALN_HANDLE: RefCell<Option<(String, OneFile)>> = const { RefCell::new(None) };
     static TPA_HANDLE: RefCell<Option<(String, tpa::TpaReader)>> = const { RefCell::new(None) };
-    static TARGET_SEQ_CACHE: RefCell<Option<((u32, i32, i32, bool), Vec<u8>)>> = const { RefCell::new(None) };
+    static TARGET_SEQ_CACHE: RefCell<Option<((u32, i64, i64, bool), Vec<u8>)>> = const { RefCell::new(None) };
 }
 
 /// Execute a closure with a thread-local aligner matched to the given distance metric
@@ -164,10 +164,10 @@ fn invert_cigar_ops(ops: &[CigarOp], strand: Strand) -> Vec<CigarOp> {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct QueryMetadata {
     query_id: u32,
-    target_start: i32,
-    target_end: i32,
-    query_start: i32,
-    query_end: i32,
+    target_start: i64,
+    target_end: i64,
+    query_start: i64,
+    query_end: i64,
     alignment_file_index: u32,
     strand_and_data_offset: u64, // Track strand and cigar/tracepoints offset
     data_bytes: usize,
@@ -182,11 +182,11 @@ impl QueryMetadata {
         self.query_id
     }
 
-    pub fn query_start(&self) -> i32 {
+    pub fn query_start(&self) -> i64 {
         self.query_start
     }
 
-    pub fn query_end(&self) -> i32 {
+    pub fn query_end(&self) -> i64 {
         self.query_end
     }
 
@@ -239,20 +239,20 @@ enum FileType {
 
 #[derive(Serialize, Deserialize)]
 struct SerializableInterval {
-    first: i32,
-    last: i32,
+    first: i64,
+    last: i64,
     metadata: QueryMetadata,
 }
 
 #[derive(Default, Clone)]
 pub struct SortedRanges {
-    pub ranges: Vec<(i32, i32)>,
-    sequence_length: i32,
-    min_distance: i32,
+    pub ranges: Vec<(i64, i64)>,
+    sequence_length: i64,
+    min_distance: i64,
 }
 
 impl SortedRanges {
-    pub fn new(sequence_length: i32, min_distance: i32) -> Self {
+    pub fn new(sequence_length: i64, min_distance: i64) -> Self {
         Self {
             ranges: Vec::new(),
             sequence_length,
@@ -268,11 +268,11 @@ impl SortedRanges {
         self.ranges.is_empty()
     }
 
-    pub fn iter(&self) -> std::slice::Iter<'_, (i32, i32)> {
+    pub fn iter(&self) -> std::slice::Iter<'_, (i64, i64)> {
         self.ranges.iter()
     }
 
-    pub fn insert(&mut self, new_range: (i32, i32)) -> Vec<(i32, i32)> {
+    pub fn insert(&mut self, new_range: (i64, i64)) -> Vec<(i64, i64)> {
         let (mut start, mut end) = if new_range.0 <= new_range.1 {
             (new_range.0, new_range.1)
         } else {
@@ -381,9 +381,9 @@ struct SubsettingResult {
     /// Index of last overlapping tracepoint (inclusive)
     last_idx: usize,
     /// Query position at start of first overlapping segment (before refinement)
-    first_query_pos: i32,
+    first_query_pos: i64,
     /// Query position at end of last overlapping segment (before refinement)
-    last_query_pos: i32,
+    last_query_pos: i64,
     /// Number of overlapping segments
     num_overlapping_segments: usize,
     /// Total matches accumulated across overlapping segments
@@ -391,9 +391,9 @@ struct SubsettingResult {
     /// Total mismatches accumulated across overlapping segments
     total_mismatches: f64,
     /// Info about first overlapping segment: (query_pos, query_delta, seg_start, seg_end, abs_target_delta, trace_diffs)
-    first_segment_info: (i32, i32, i32, i32, i32, i32),
+    first_segment_info: (i64, i32, i64, i64, i32, i32),
     /// Info about last overlapping segment: (query_pos, query_delta, seg_start, seg_end, abs_target_delta, trace_diffs)
-    last_segment_info: (i32, i32, i32, i32, i32, i32),
+    last_segment_info: (i64, i32, i64, i64, i32, i32),
 }
 
 pub struct Impg {
@@ -473,8 +473,8 @@ impl Impg {
         sequence_index: &UnifiedSequenceIndex,
         target_name: &str,
         target_id: u32,
-        start: i32,
-        end: i32,
+        start: i64,
+        end: i64,
         is_reverse: bool,
     ) -> Vec<u8> {
         let key = (target_id, start, end, is_reverse);
@@ -652,8 +652,8 @@ impl Impg {
         &self,
         alignment: &OneAlnAlignment,
         metadata: &QueryMetadata,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         is_reversed_entry: bool,
     ) -> Option<SubsettingResult> {
         let is_reverse = metadata.strand() == Strand::Reverse;
@@ -705,10 +705,10 @@ impl Impg {
         // Track overlapping segments
         let mut first_idx: Option<usize> = None;
         let mut last_idx: usize = 0;
-        let mut first_project_pos: Option<i32> = None;
-        let mut last_project_pos: Option<i32> = None;
-        let mut first_segment_info: Option<(i32, i32, i32, i32, i32, i32)> = None;
-        let mut last_segment_info: Option<(i32, i32, i32, i32, i32, i32)> = None;
+        let mut first_project_pos: Option<i64> = None;
+        let mut last_project_pos: Option<i64> = None;
+        let mut first_segment_info: Option<(i64, i32, i64, i64, i32, i32)> = None;
+        let mut last_segment_info: Option<(i64, i32, i64, i64, i32, i32)> = None;
         let mut num_overlapping_segments = 0;
 
         // Statistics for identity calculation
@@ -751,8 +751,8 @@ impl Impg {
             };
 
             // Segment boundaries (forward coordinate space along scan axis)
-            let seg_start = scan_pos.min(scan_pos + scan_delta);
-            let seg_end = scan_pos.max(scan_pos + scan_delta);
+            let seg_start = scan_pos.min(scan_pos + scan_delta as i64);
+            let seg_end = scan_pos.max(scan_pos + scan_delta as i64);
 
             // Check overlap with requested range
             if seg_start < range_end && seg_end > range_start {
@@ -790,7 +790,7 @@ impl Impg {
                     first_segment_info = Some(seg_info);
                 }
                 last_idx = idx;
-                last_project_pos = Some(project_pos + project_delta);
+                last_project_pos = Some(project_pos + project_delta as i64);
                 last_segment_info = Some(seg_info);
 
                 // Accumulate identity statistics
@@ -800,8 +800,8 @@ impl Impg {
             }
 
             // Advance to next segment
-            scan_pos += scan_delta;
-            project_pos += project_delta;
+            scan_pos += scan_delta as i64;
+            project_pos += project_delta as i64;
 
             // Early exit when past requested range
             if (scan_dir == -1 && scan_pos <= range_start)
@@ -839,7 +839,7 @@ impl Impg {
 
         // if there are no differences, we can shortcut to a perfect match CIGAR
         if alignment.differences == 0 {
-            let match_len = query_end - query_start;
+            let match_len = (query_end - query_start) as i32;
             return vec![CigarOp::new(match_len, '=')];
         }
 
@@ -1108,8 +1108,8 @@ impl Impg {
         &self,
         metadata: &QueryMetadata,
         target_id: u32,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         sequence_index: Option<&UnifiedSequenceIndex>,
         min_gap_compressed_identity: Option<f64>,
     ) -> Option<(Interval<u32>, Vec<CigarOp>, Interval<u32>)> {
@@ -1323,8 +1323,8 @@ impl Impg {
         &self,
         metadata: &QueryMetadata,
         target_id: u32,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         min_gap_compressed_identity: Option<f64>,
     ) -> Option<(Interval<u32>, Vec<CigarOp>, Interval<u32>)> {
         // Pre-filter: coitrees uses closed-interval overlap, but coordinates are half-open.
@@ -1370,14 +1370,16 @@ impl Impg {
         let pre_refinement_target = (range_start, range_end);
 
         // Refine query coordinates using indel-aware heuristic
-        let refine_boundary = |query_pos: i32,
+        // query_pos and segment_target_start are i64 (genomic coords),
+        // query_delta/abs_target_delta/trace_diffs are i32 (tracepoint arithmetic)
+        let refine_boundary = |query_pos: i64,
                                query_delta: i32,
-                               segment_target_start: i32,
-                               overlap_pos: i32,
+                               segment_target_start: i64,
+                               overlap_pos: i64,
                                abs_target_delta: i32,
                                trace_diffs: i32,
                                boundary_name: &str|
-         -> i32 {
+         -> i64 {
             let aligned_len = query_delta.abs().min(abs_target_delta);
             let segment_identity = if aligned_len > 0 {
                 ((aligned_len - trace_diffs) as f64 / aligned_len as f64).max(0.0)
@@ -1408,7 +1410,7 @@ impl Impg {
                 (overlap_pos - segment_target_start) as f64 / abs_target_delta as f64;
             let indel_ratio = query_delta as f64 / abs_target_delta as f64;
             let query_advance = target_fraction * abs_target_delta as f64 * indel_ratio;
-            let refined_pos = query_pos + query_advance.round() as i32;
+            let refined_pos = query_pos + query_advance.round() as i64;
 
             debug!(
                 "{} segment refinement: identity={:.3}, indel_ratio={:.3}, trace_diffs={}, target_frac={:.3}",
@@ -1593,10 +1595,10 @@ impl Impg {
                         // ENTRY 1: Original direction (query → target)
                         let forward_metadata = QueryMetadata {
                             query_id: record.query_id,
-                            target_start: record.target_start as i32,
-                            target_end: record.target_end as i32,
-                            query_start: record.query_start as i32,
-                            query_end: record.query_end as i32,
+                            target_start: record.target_start as i64,
+                            target_end: record.target_end as i64,
+                            query_start: record.query_start as i64,
+                            query_end: record.query_end as i64,
                             alignment_file_index: file_index as u32,
                             strand_and_data_offset: record.strand_and_data_offset,
                             data_bytes: record.data_bytes,
@@ -1604,8 +1606,8 @@ impl Impg {
                         entries.push((
                             record.target_id,
                             Interval {
-                                first: record.target_start as i32,
-                                last: record.target_end as i32,
+                                first: record.target_start as i64,
+                                last: record.target_end as i64,
                                 metadata: forward_metadata,
                             },
                         ));
@@ -1615,10 +1617,10 @@ impl Impg {
                         if bidirectional && record.query_id != record.target_id {
                             let mut reversed_metadata = QueryMetadata {
                                 query_id: record.target_id,              // SWAPPED
-                                target_start: record.query_start as i32, // SWAPPED
-                                target_end: record.query_end as i32,     // SWAPPED
-                                query_start: record.target_start as i32, // SWAPPED
-                                query_end: record.target_end as i32,     // SWAPPED
+                                target_start: record.query_start as i64, // SWAPPED
+                                target_end: record.query_end as i64,     // SWAPPED
+                                query_start: record.target_start as i64, // SWAPPED
+                                query_end: record.target_end as i64,     // SWAPPED
                                 alignment_file_index: file_index as u32,
                                 strand_and_data_offset: record.strand_and_data_offset,
                                 data_bytes: record.data_bytes,
@@ -1628,8 +1630,8 @@ impl Impg {
                             entries.push((
                                 record.query_id, // NOW indexed by original query_id
                                 Interval {
-                                    first: record.query_start as i32,
-                                    last: record.query_end as i32,
+                                    first: record.query_start as i64,
+                                    last: record.query_end as i64,
                                     metadata: reversed_metadata,
                                 },
                             ));
@@ -1950,8 +1952,8 @@ impl Impg {
     pub fn query(
         &self,
         target_id: u32,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         store_cigar: bool,
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
@@ -1966,7 +1968,7 @@ impl Impg {
                 metadata: target_id,
             },
             if store_cigar {
-                vec![CigarOp::new(range_end - range_start, '=')]
+                vec![CigarOp::new((range_end - range_start) as i32, '=')]
             } else {
                 Vec::new()
             },
@@ -2032,7 +2034,7 @@ impl Impg {
     pub fn query_reverse_for_depth(
         &self,
         query_id: u32,
-    ) -> Vec<(i32, i32, u32)> {
+    ) -> Vec<(i64, i64, u32)> {
         let mut results = Vec::new();
 
         // Iterate through all target_ids in the forest map
@@ -2098,7 +2100,7 @@ impl Impg {
         &self,
         query_id: u32,
         query_to_targets: &FxHashMap<u32, Vec<u32>>,
-    ) -> Vec<(i32, i32, u32)> {
+    ) -> Vec<(i64, i64, u32)> {
         let mut results = Vec::new();
 
         // Only query trees that we know have alignments with this query_id
@@ -2122,8 +2124,8 @@ impl Impg {
     pub fn populate_cigar_cache(
         &self,
         target_id: u32,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         _min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
         cache: &mut FxHashMap<(u32, u64), Vec<CigarOp>>,
@@ -2142,8 +2144,8 @@ impl Impg {
     pub fn query_with_cache(
         &self,
         target_id: u32,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         store_cigar: bool,
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
@@ -2157,7 +2159,7 @@ impl Impg {
                 metadata: target_id,
             },
             if store_cigar {
-                vec![CigarOp::new(range_end - range_start, '=')]
+                vec![CigarOp::new((range_end - range_start) as i32, '=')]
             } else {
                 Vec::new()
             },
@@ -2229,13 +2231,13 @@ impl Impg {
     pub fn query_transitive_dfs(
         &self,
         target_id: u32,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         masked_regions: Option<&FxHashMap<u32, SortedRanges>>,
         max_depth: u16,
-        min_transitive_len: i32,
-        min_distance_between_ranges: i32,
-        min_output_length: Option<i32>,
+        min_transitive_len: i64,
+        min_distance_between_ranges: i64,
+        min_output_length: Option<i64>,
         store_cigar: bool,
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
@@ -2250,7 +2252,7 @@ impl Impg {
                 .into_par_iter() // Use parallel iterator
                 .map(|id| {
                     let len = self.seq_index.get_len_from_id(id).unwrap();
-                    (id, SortedRanges::new(len as i32, 0))
+                    (id, SortedRanges::new(len as i64, 0))
                 })
                 .collect()
         };
@@ -2273,7 +2275,7 @@ impl Impg {
                     metadata: target_id,
                 },
                 if store_cigar {
-                    vec![CigarOp::new(filtered_end - filtered_start, '=')]
+                    vec![CigarOp::new((filtered_end - filtered_start) as i32, '=')]
                 } else {
                     Vec::new()
                 },
@@ -2314,7 +2316,7 @@ impl Impg {
 
             // Get or load the tree - if None, no overlaps exist for this target
             if let Some(tree) = self.get_or_load_tree(current_target_id) {
-                let mut intervals: Vec<(QueryMetadata, (i32, i32))> = Vec::new();
+                let mut intervals: Vec<(QueryMetadata, (i64, i64))> = Vec::new();
                 tree.query(current_target_start, current_target_end, |interval| {
                     let overlap_start = current_target_start.max(interval.first);
                     let overlap_end = current_target_end.min(interval.last);
@@ -2487,13 +2489,13 @@ impl Impg {
     pub fn query_transitive_bfs(
         &self,
         target_id: u32,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         masked_regions: Option<&FxHashMap<u32, SortedRanges>>,
         max_depth: u16,
-        min_transitive_len: i32,
-        min_distance_between_ranges: i32,
-        min_output_length: Option<i32>,
+        min_transitive_len: i64,
+        min_distance_between_ranges: i64,
+        min_output_length: Option<i64>,
         store_cigar: bool,
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
@@ -2508,7 +2510,7 @@ impl Impg {
                 .into_par_iter() // Use parallel iterator
                 .map(|id| {
                     let len = self.seq_index.get_len_from_id(id).unwrap();
-                    (id, SortedRanges::new(len as i32, 0))
+                    (id, SortedRanges::new(len as i64, 0))
                 })
                 .collect()
         };
@@ -2530,7 +2532,7 @@ impl Impg {
                     metadata: target_id,
                 },
                 if store_cigar {
-                    vec![CigarOp::new(filtered_end - filtered_start, '=')]
+                    vec![CigarOp::new((filtered_end - filtered_start) as i32, '=')]
                 } else {
                     Vec::new()
                 },
@@ -2561,7 +2563,7 @@ impl Impg {
             // );
 
             // Process current depth ranges in parallel
-            let query_results: Vec<Vec<(u32, i32, i32, Vec<CigarOp>, i32, i32, u32)>> =
+            let query_results: Vec<Vec<(u32, i64, i64, Vec<CigarOp>, i64, i64, u32)>> =
                 current_ranges
                     .par_iter()
                     .map(
@@ -2786,8 +2788,8 @@ impl ImpgIndex for Impg {
     fn query(
         &self,
         target_id: u32,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         store_cigar: bool,
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
@@ -2809,8 +2811,8 @@ impl ImpgIndex for Impg {
     fn query_with_cache(
         &self,
         target_id: u32,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         store_cigar: bool,
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
@@ -2831,8 +2833,8 @@ impl ImpgIndex for Impg {
     fn populate_cigar_cache(
         &self,
         target_id: u32,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
         cache: &mut FxHashMap<(u32, u64), Vec<CigarOp>>,
@@ -2851,13 +2853,13 @@ impl ImpgIndex for Impg {
     fn query_transitive_dfs(
         &self,
         target_id: u32,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         masked_regions: Option<&FxHashMap<u32, SortedRanges>>,
         max_depth: u16,
-        min_transitive_len: i32,
-        min_distance_between_ranges: i32,
-        min_output_length: Option<i32>,
+        min_transitive_len: i64,
+        min_distance_between_ranges: i64,
+        min_output_length: Option<i64>,
         store_cigar: bool,
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
@@ -2885,13 +2887,13 @@ impl ImpgIndex for Impg {
     fn query_transitive_bfs(
         &self,
         target_id: u32,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         masked_regions: Option<&FxHashMap<u32, SortedRanges>>,
         max_depth: u16,
-        min_transitive_len: i32,
-        min_distance_between_ranges: i32,
-        min_output_length: Option<i32>,
+        min_transitive_len: i64,
+        min_distance_between_ranges: i64,
+        min_output_length: Option<i64>,
         store_cigar: bool,
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
@@ -2936,7 +2938,7 @@ impl ImpgIndex for Impg {
         &self.sequence_files
     }
 
-    fn query_reverse_for_depth(&self, query_id: u32) -> Vec<(i32, i32, u32)> {
+    fn query_reverse_for_depth(&self, query_id: u32) -> Vec<(i64, i64, u32)> {
         Impg::query_reverse_for_depth(self, query_id)
     }
 
@@ -2948,7 +2950,7 @@ impl ImpgIndex for Impg {
         &self,
         query_id: u32,
         query_to_targets: &FxHashMap<u32, Vec<u32>>,
-    ) -> Vec<(i32, i32, u32)> {
+    ) -> Vec<(i64, i64, u32)> {
         Impg::query_reverse_for_depth_with_map(self, query_id, query_to_targets)
     }
 
@@ -2988,7 +2990,7 @@ impl ImpgIndex for Impg {
         }
     }
 
-    fn query_raw_overlapping(&self, target_id: u32, start: i32, end: i32) -> Vec<RawAlignmentInterval> {
+    fn query_raw_overlapping(&self, target_id: u32, start: i64, end: i64) -> Vec<RawAlignmentInterval> {
         if let Some(tree) = self.get_or_load_tree(target_id) {
             let mut results = Vec::new();
             tree.query(start, end, |interval| {
@@ -3009,10 +3011,10 @@ impl ImpgIndex for Impg {
 }
 
 fn project_target_range_through_alignment(
-    requested_target_range: (i32, i32),
-    record: (i32, i32, i32, i32, Strand),
+    requested_target_range: (i64, i64),
+    record: (i64, i64, i64, i64, Strand),
     cigar_ops: &[CigarOp],
-) -> Option<(i32, i32, Vec<CigarOp>, i32, i32)> {
+) -> Option<(i64, i64, Vec<CigarOp>, i64, i64)> {
     let (target_start, target_end, query_start, query_end, strand) = record;
     debug!(
         "Projecting target range {}-{} through alignment with target {}-{}, query {}-{}, strand {:?}",
@@ -3025,25 +3027,25 @@ fn project_target_range_through_alignment(
         strand
     );
 
-    let dir = if strand == Strand::Forward { 1 } else { -1 };
-    let mut query_pos = if strand == Strand::Forward {
+    let dir: i64 = if strand == Strand::Forward { 1 } else { -1 };
+    let mut query_pos: i64 = if strand == Strand::Forward {
         query_start
     } else {
         query_end
     };
-    let mut target_pos = target_start;
+    let mut target_pos: i64 = target_start;
 
     // Track CIGAR slice bounds
     let mut first_op_idx = 0;
     let mut last_op_idx = 0;
     let mut found_overlap = false;
 
-    let mut projected_query_start = -1;
-    let mut projected_query_end = -1;
-    let mut projected_target_start = -1;
-    let mut projected_target_end = -1;
-    let mut first_op_offset = 0;
-    let mut last_op_remaining = 0;
+    let mut projected_query_start: i64 = -1;
+    let mut projected_query_end: i64 = -1;
+    let mut projected_target_start: i64 = -1;
+    let mut projected_target_end: i64 = -1;
+    let mut first_op_offset: i64 = 0;
+    let mut last_op_remaining: i64 = 0;
 
     // Calculate the last valid target position
     let last_target_pos = min(target_end, requested_target_range.1);
@@ -3054,7 +3056,7 @@ fn project_target_range_through_alignment(
             break;
         }
 
-        match (cigar_op.target_delta(), cigar_op.query_delta(strand)) {
+        match (cigar_op.target_delta() as i64, cigar_op.query_delta(strand) as i64) {
             (0, query_delta) => {
                 // Insertion in query (deletions in target)
                 if target_pos >= requested_target_range.0 {
@@ -3129,11 +3131,11 @@ fn project_target_range_through_alignment(
         let mut projected_cigar_ops = cigar_ops[first_op_idx..last_op_idx].to_vec();
         // Adjust first operation length
         if first_op_offset > 0 {
-            projected_cigar_ops[0].adjust_len(-first_op_offset);
+            projected_cigar_ops[0].adjust_len(-(first_op_offset as i32));
         }
         // Adjust last operation length
         if last_op_remaining < 0 {
-            projected_cigar_ops[last_op_idx - first_op_idx - 1].adjust_len(last_op_remaining);
+            projected_cigar_ops[last_op_idx - first_op_idx - 1].adjust_len(last_op_remaining as i32);
         }
 
         Some((

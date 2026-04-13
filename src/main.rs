@@ -1577,7 +1577,7 @@ fn run() -> io::Result<()> {
             if parsed_partition_size.is_none() {
                 validate_region_size(
                     0,
-                    window_size as i32,
+                    window_size as i64,
                     size_check_format,
                     merge_distance,
                     gfa_maf_fasta.force_large_region,
@@ -1628,14 +1628,14 @@ fn run() -> io::Result<()> {
                 window_size,
                 starting_sequences_file.as_deref(),
                 &selection_mode,
-                merge_distance,
+                merge_distance.into(),
                 min_identity,
-                min_missing_size,
-                min_boundary_distance,
+                min_missing_size.into(),
+                min_boundary_distance.into(),
                 transitive_opts.transitive_dfs,
                 transitive_opts.max_depth,
-                transitive_opts.effective_min_transitive_len(),
-                transitive_opts.min_distance_between_ranges,
+                transitive_opts.effective_min_transitive_len().into(),
+                transitive_opts.min_distance_between_ranges.into(),
                 &output_format,
                 output_folder.as_deref(),
                 sequence_index.as_ref(),
@@ -1766,9 +1766,9 @@ fn run() -> io::Result<()> {
                             io::ErrorKind::InvalidData,
                             format!("Could not get length for sequence '{seq_name}'"),
                         )
-                    })? as i32;
+                    })? as i64;
                     let name = format!("{}:{}-{}", seq_name, 0, seq_len);
-                    (seq_name.to_string(), (0, seq_len), name)
+                    (seq_name.to_string(), (0i64, seq_len), name)
                 };
                 // Validate sequence exists and range is within bounds
                 validate_sequence_range(
@@ -1781,7 +1781,7 @@ fn run() -> io::Result<()> {
                     target_range.0,
                     target_range.1,
                     &name,
-                    query.transitive_opts.effective_min_transitive_len(),
+                    query.transitive_opts.effective_min_transitive_len().into(),
                 )?;
                 // Skip region size validation when --partition-size is set (each sub-window is within limits)
                 if parsed_partition_size.is_none() {
@@ -1803,7 +1803,7 @@ fn run() -> io::Result<()> {
                         *start,
                         *end,
                         name,
-                        query.transitive_opts.effective_min_transitive_len(),
+                        query.transitive_opts.effective_min_transitive_len().into(),
                     )?;
                     // Skip region size validation when --partition-size is set
                     if parsed_partition_size.is_none() {
@@ -1867,7 +1867,7 @@ fn run() -> io::Result<()> {
                     target_range,
                     resolved_output_format == "paf" || resolved_output_format == "bedpe", // Store CIGAR for PAF/BEDPE output
                     query.min_identity,
-                    query.min_output_length,
+                    query.min_output_length.map(|x| x as i64),
                     query.transitive,
                     query.transitive_opts.transitive_dfs,
                     &query.transitive_opts,
@@ -1885,7 +1885,7 @@ fn run() -> io::Result<()> {
                             &mut results,
                             &mut find_output_stream(&output_prefix, "bed")?,
                             &name,
-                            query.effective_merge_distance(),
+                            query.effective_merge_distance().into(),
                             query.merge_strands_for_output("bed"),
                             query.original_sequence_coordinates,
                         )?;
@@ -1898,7 +1898,7 @@ fn run() -> io::Result<()> {
                             &mut results,
                             &mut find_output_stream(&output_prefix, "bed")?,
                             &name,
-                            query.effective_merge_distance(),
+                            query.effective_merge_distance().into(),
                             query.original_sequence_coordinates,
                         )?;
                     }
@@ -1910,7 +1910,7 @@ fn run() -> io::Result<()> {
                             &mut results,
                             &mut find_output_stream(&output_prefix, "paf")?,
                             &name,
-                            query.effective_merge_distance(),
+                            query.effective_merge_distance().into(),
                             query.original_sequence_coordinates,
                             sequence_index.as_ref(),
                         )?;
@@ -1954,7 +1954,7 @@ fn run() -> io::Result<()> {
                             &mut find_output_stream(&output_prefix, "maf")?,
                             sequence_index.as_ref().unwrap(),
                             &name,
-                            query.effective_merge_distance(),
+                            query.effective_merge_distance().into(),
                             query.merge_strands_for_output("maf"),
                             scoring_params.unwrap(),
                         )?;
@@ -1966,7 +1966,7 @@ fn run() -> io::Result<()> {
                             &mut find_output_stream(&output_prefix, "fa")?,
                             sequence_index.as_ref().unwrap(),
                             &name,
-                            query.effective_merge_distance(),
+                            query.effective_merge_distance().into(),
                             query.merge_strands_for_output("fasta"),
                             reverse_complement,
                         )?;
@@ -1978,7 +1978,7 @@ fn run() -> io::Result<()> {
                             &mut find_output_stream(&output_prefix, "fa")?,
                             sequence_index.as_ref().unwrap(),
                             &name,
-                            query.effective_merge_distance(),
+                            query.effective_merge_distance().into(),
                             query.merge_strands_for_output("fasta"),
                             reverse_complement,
                         )?;
@@ -1989,7 +1989,7 @@ fn run() -> io::Result<()> {
                             &mut results,
                             &mut find_output_stream(&output_prefix, "paf")?,
                             &name,
-                            query.effective_merge_distance(),
+                            query.effective_merge_distance().into(),
                             query.original_sequence_coordinates,
                             sequence_index.as_ref(),
                         )?;
@@ -2000,7 +2000,7 @@ fn run() -> io::Result<()> {
                             &mut results,
                             sequence_index.as_ref().unwrap(),
                             name.clone(),
-                            query.effective_merge_distance(),
+                            query.effective_merge_distance().into(),
                             query.merge_strands_for_output("fasta-aln"),
                             scoring_params.unwrap(),
                         )?;
@@ -2055,7 +2055,7 @@ fn run() -> io::Result<()> {
                     target_range.0,
                     target_range.1,
                     &name,
-                    refine.query.transitive_opts.effective_min_transitive_len(),
+                    refine.query.transitive_opts.effective_min_transitive_len().into(),
                 )?;
                 vec![(target_name, target_range, name)]
             } else if let Some(target_bed) = &refine.query.target_bed {
@@ -2067,7 +2067,7 @@ fn run() -> io::Result<()> {
                         start,
                         end,
                         &name,
-                        refine.query.transitive_opts.effective_min_transitive_len(),
+                        refine.query.transitive_opts.effective_min_transitive_len().into(),
                     )?;
                     validated.push((seq_name, (start, end), name));
                 }
@@ -2087,23 +2087,24 @@ fn run() -> io::Result<()> {
             };
 
             let config = refine::RefineConfig {
-                span_bp: refine.span_bp,
+                span_bp: refine.span_bp.into(),
                 max_extension: refine.max_extension,
-                extension_step: refine.extension_step,
+                extension_step: refine.extension_step.into(),
                 support_mode: refine
                     .pansn_mode
                     .map(Into::into)
                     .unwrap_or(refine::SupportMode::Sequence),
-                merge_distance: refine.query.effective_merge_distance(),
+                merge_distance: refine.query.effective_merge_distance().into(),
                 min_identity: refine.query.min_identity,
                 use_transitive_bfs: refine.query.transitive,
                 use_transitive_dfs: refine.query.transitive_opts.transitive_dfs,
                 max_transitive_depth: refine.query.transitive_opts.max_depth,
-                min_transitive_len: refine.query.transitive_opts.effective_min_transitive_len(),
+                min_transitive_len: refine.query.transitive_opts.effective_min_transitive_len().into(),
                 min_distance_between_ranges: refine
                     .query
                     .transitive_opts
-                    .min_distance_between_ranges,
+                    .min_distance_between_ranges
+                    .into(),
                 subset_filter: subset_filter.as_ref(),
                 blacklist: blacklist.as_ref(),
                 approximate_mode: refine.query.approximate,
@@ -2299,9 +2300,9 @@ fn run() -> io::Result<()> {
                                 io::ErrorKind::InvalidData,
                                 format!("Could not get length for sequence '{seq_name}'"),
                             )
-                        })? as i32;
+                        })? as i64;
                         let name = format!("{}:{}-{}", seq_name, 0, seq_len);
-                        (seq_name.to_string(), (0, seq_len), name)
+                        (seq_name.to_string(), (0i64, seq_len), name)
                     };
                     validate_sequence_range(
                         &target_name,
@@ -2354,7 +2355,7 @@ fn run() -> io::Result<()> {
                     target_range,
                     false, // Don't need CIGAR for similarity
                     query.min_identity,
-                    query.min_output_length,
+                    query.min_output_length.map(|x| x as i64),
                     query.transitive,
                     query.transitive_opts.transitive_dfs,
                     &query.transitive_opts,
@@ -2368,7 +2369,7 @@ fn run() -> io::Result<()> {
                 // Merge intervals if needed
                 merge_query_adjusted_intervals(
                     &mut results,
-                    query.effective_merge_distance(),
+                    query.effective_merge_distance().into(),
                     query.merge_strands_for_output("similarity"),
                 );
 
@@ -2715,8 +2716,8 @@ fn run() -> io::Result<()> {
                 transitive,
                 transitive_dfs: transitive_opts.transitive_dfs,
                 max_depth: transitive_opts.max_depth,
-                min_transitive_len: transitive_opts.effective_min_transitive_len(),
-                min_distance_between_ranges: transitive_opts.min_distance_between_ranges,
+                min_transitive_len: transitive_opts.effective_min_transitive_len() as i64,
+                min_distance_between_ranges: transitive_opts.min_distance_between_ranges as i64,
                 merge_adjacent,
                 use_cigar_bfs: use_bfs,
             };
@@ -2726,7 +2727,7 @@ fn run() -> io::Result<()> {
                 info!("Running depth in region query mode");
 
                 // Parse regions
-                let regions: Vec<(String, i32, i32)> = if let Some(ref range) = target_range {
+                let regions: Vec<(String, i64, i64)> = if let Some(ref range) = target_range {
                     vec![depth::parse_target_range_depth(range)?]
                 } else if let Some(ref bed_path) = target_bed {
                     depth::parse_bed_file_depth(bed_path)?
@@ -2893,10 +2894,10 @@ fn validate_approximate_mode_min_length(
 
 /// Validate that a range meets the minimum length requirement
 fn validate_range_min_length(
-    start: i32,
-    end: i32,
+    start: i64,
+    end: i64,
     range_name: &str,
-    min_transitive_len: i32,
+    min_transitive_len: i64,
 ) -> io::Result<()> {
     let length = end - start;
     if length < min_transitive_len {
@@ -2964,8 +2965,8 @@ fn validate_output_format(format: &str, valid_formats: &[&str]) -> io::Result<()
 /// Validates that a sequence name exists in the index and the range is within bounds
 fn validate_sequence_range(
     seq_name: &str,
-    start: i32,
-    end: i32,
+    start: i64,
+    end: i64,
     seq_index: &SequenceIndex,
 ) -> io::Result<()> {
     // Check if sequence exists in index
@@ -2982,7 +2983,7 @@ fn validate_sequence_range(
             io::ErrorKind::InvalidData,
             format!("Could not get length for sequence '{seq_name}'"),
         )
-    })? as i32;
+    })? as i64;
 
     // Validate range bounds
     if start < 0 {
@@ -3020,8 +3021,8 @@ fn validate_sequence_range(
 
 /// Validate region size
 fn validate_region_size(
-    start: i32,
-    end: i32,
+    start: i64,
+    end: i64,
     output_format: &str,
     merge_distance: i32,
     force_large_region: bool,
@@ -3741,10 +3742,10 @@ fn get_combined_index_filename(alignment_files: &[String], custom_index: Option<
 fn perform_query(
     impg: &impl ImpgIndex,
     target_name: &str,
-    target_range: (i32, i32),
+    target_range: (i64, i64),
     store_cigar: bool,
     min_identity: Option<f64>,
-    min_output_length: Option<i32>,
+    min_output_length: Option<i64>,
     transitive: bool,
     transitive_dfs: bool,
     transitive_opts: &TransitiveOpts,
@@ -3765,7 +3766,7 @@ fn perform_query(
             format!("Target sequence '{target_name}' length not found in index"),
         )
     })?;
-    if target_end > target_length as i32 {
+    if target_end > target_length as i64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
@@ -3782,8 +3783,8 @@ fn perform_query(
                 target_end,
                 None,
                 transitive_opts.max_depth,
-                transitive_opts.effective_min_transitive_len(),
-                transitive_opts.min_distance_between_ranges,
+                transitive_opts.effective_min_transitive_len().into(),
+                transitive_opts.min_distance_between_ranges.into(),
                 min_output_length,
                 store_cigar,
                 min_identity,
@@ -3798,8 +3799,8 @@ fn perform_query(
                 target_end,
                 None,
                 transitive_opts.max_depth,
-                transitive_opts.effective_min_transitive_len(),
-                transitive_opts.min_distance_between_ranges,
+                transitive_opts.effective_min_transitive_len().into(),
+                transitive_opts.min_distance_between_ranges.into(),
                 min_output_length,
                 store_cigar,
                 min_identity,
@@ -3887,7 +3888,7 @@ fn output_results_bed(
     results: &mut Vec<AdjustedInterval>,
     out: &mut dyn Write,
     name: &str,
-    merge_distance: i32,
+    merge_distance: i64,
     merge_strands: bool,
     original_coordinates: bool,
 ) -> io::Result<()> {
@@ -3925,7 +3926,7 @@ fn output_results_bedpe(
     results: &mut Vec<AdjustedInterval>,
     out: &mut dyn Write,
     name: &str,
-    merge_distance: i32,
+    merge_distance: i64,
     original_coordinates: bool,
 ) -> io::Result<()> {
     merge_adjusted_intervals(results, merge_distance);
@@ -4012,7 +4013,7 @@ fn output_results_paf(
     results: &mut Vec<AdjustedInterval>,
     out: &mut dyn Write,
     name: &str,
-    merge_distance: i32,
+    merge_distance: i64,
     original_coordinates: bool,
     sequence_index: Option<&UnifiedSequenceIndex>,
 ) -> io::Result<()> {
@@ -4127,7 +4128,7 @@ fn output_results_gfa(
     out: &mut dyn Write,
     sequence_index: &UnifiedSequenceIndex,
     _name: &str,
-    merge_distance: i32,
+    merge_distance: i64,
     merge_strands: bool,
     scoring_params: Option<(u8, u8, u8, u8, u8, u8)>,
     engine_opts: &EngineOpts,
@@ -4232,7 +4233,7 @@ fn output_results_fasta(
     out: &mut dyn Write,
     sequence_index: &UnifiedSequenceIndex,
     _name: &str,
-    merge_distance: i32,
+    merge_distance: i64,
     merge_strands: bool,
     reverse_complement: bool,
 ) -> io::Result<()> {
@@ -4298,7 +4299,7 @@ fn output_results_maf(
     out: &mut dyn Write,
     sequence_index: &UnifiedSequenceIndex,
     _name: &str,
-    merge_distance: i32,
+    merge_distance: i64,
     merge_strands: bool,
     scoring_params: (u8, u8, u8, u8, u8, u8),
 ) -> io::Result<()> {
@@ -4326,7 +4327,7 @@ fn output_results_fasta_aln(
     results: &mut Vec<AdjustedInterval>,
     sequence_index: &UnifiedSequenceIndex,
     _name: String,
-    merge_distance: i32,
+    merge_distance: i64,
     merge_strands: bool,
     scoring_params: (u8, u8, u8, u8, u8, u8),
 ) -> io::Result<()> {
@@ -4351,7 +4352,7 @@ fn output_results_fasta_aln(
 // Merge adjusted intervals by ignoring the target intervals (optimized for simple genomic interval merging in BED and GFA formats)
 fn merge_query_adjusted_intervals(
     results: &mut Vec<AdjustedInterval>,
-    merge_distance: i32,
+    merge_distance: i64,
     merge_strands: bool,
 ) {
     if results.len() > 1 && (merge_distance >= 0 || merge_strands) {
@@ -4438,7 +4439,7 @@ fn merge_query_adjusted_intervals(
 }
 
 // Merge adjusted intervals by considering both query and target intervals and the corresponding CIGAR operations
-fn merge_adjusted_intervals(results: &mut Vec<AdjustedInterval>, merge_distance: i32) {
+fn merge_adjusted_intervals(results: &mut Vec<AdjustedInterval>, merge_distance: i64) {
     if results.len() > 1 && merge_distance >= 0 {
         // Sort by query ID, query position, target ID, target position
         results.par_sort_by_key(|(query_interval, _, target_interval)| {
@@ -4676,10 +4677,10 @@ fn merge_adjusted_intervals(results: &mut Vec<AdjustedInterval>, merge_distance:
                         let mut gap_cigar = Vec::new();
 
                         if query_gap > 0 {
-                            gap_cigar.push(CigarOp::new(query_gap, 'I'));
+                            gap_cigar.push(CigarOp::new(query_gap as i32, 'I'));
                         }
                         if target_gap > 0 {
-                            gap_cigar.push(CigarOp::new(target_gap, 'D'));
+                            gap_cigar.push(CigarOp::new(target_gap as i32, 'D'));
                         }
 
                         // Merge intervals and CIGAR
@@ -4749,7 +4750,7 @@ fn merge_consecutive_cigar_ops(cigar: &mut Vec<CigarOp>) {
 fn check_cigar_overlap_match(
     current_cigar: &[CigarOp],
     next_cigar: &[CigarOp],
-    query_overlap_len: i32,
+    query_overlap_len: i64,
     query_forward: bool,
 ) -> bool {
     // Extract the suffix of current CIGAR that corresponds to the overlap
@@ -4763,7 +4764,7 @@ fn check_cigar_overlap_match(
 }
 
 // Extract the last part of CIGAR that covers query_len bases
-fn extract_cigar_suffix(cigar: &[CigarOp], query_len: i32, forward: bool) -> Vec<CigarOp> {
+fn extract_cigar_suffix(cigar: &[CigarOp], query_len: i64, forward: bool) -> Vec<CigarOp> {
     let mut result = Vec::new();
     let mut remaining_query = query_len;
 
@@ -4779,7 +4780,7 @@ fn extract_cigar_suffix(cigar: &[CigarOp], query_len: i32, forward: bool) -> Vec
             } else {
                 Strand::Reverse
             })
-            .abs();
+            .abs() as i64;
 
         if query_delta <= remaining_query {
             // Include entire operation
@@ -4801,7 +4802,7 @@ fn extract_cigar_suffix(cigar: &[CigarOp], query_len: i32, forward: bool) -> Vec
 }
 
 // Extract the first part of CIGAR that covers query_len bases
-fn extract_cigar_prefix(cigar: &[CigarOp], query_len: i32, forward: bool) -> Vec<CigarOp> {
+fn extract_cigar_prefix(cigar: &[CigarOp], query_len: i64, forward: bool) -> Vec<CigarOp> {
     let mut result = Vec::new();
     let mut remaining_query = query_len;
 
@@ -4816,7 +4817,7 @@ fn extract_cigar_prefix(cigar: &[CigarOp], query_len: i32, forward: bool) -> Vec
             } else {
                 Strand::Reverse
             })
-            .abs();
+            .abs() as i64;
 
         if query_delta <= remaining_query {
             // Include entire operation
@@ -4836,16 +4837,16 @@ fn extract_cigar_prefix(cigar: &[CigarOp], query_len: i32, forward: bool) -> Vec
 }
 
 // Trim the prefix of CIGAR by removing operations that cover the first query_len/target_len bases
-fn trim_cigar_prefix(cigar: &[CigarOp], query_len: i32, target_len: i32) -> Vec<CigarOp> {
+fn trim_cigar_prefix(cigar: &[CigarOp], query_len: i64, target_len: i64) -> Vec<CigarOp> {
     let mut result = Vec::new();
-    let mut query_consumed = 0;
-    let mut target_consumed = 0;
+    let mut query_consumed: i64 = 0;
+    let mut target_consumed: i64 = 0;
     let mut start_idx = 0;
 
     // Find where to start after trimming
     for (idx, op) in cigar.iter().enumerate() {
-        let q_delta = op.query_delta(Strand::Forward).abs();
-        let t_delta = op.target_delta();
+        let q_delta = op.query_delta(Strand::Forward).abs() as i64;
+        let t_delta = op.target_delta() as i64;
 
         if query_consumed + q_delta > query_len || target_consumed + t_delta > target_len {
             // This operation partially overlaps - need to trim it

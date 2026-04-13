@@ -1298,7 +1298,7 @@ fn create_gap_node<W: Write>(
 
     // Get gap sequence either from sequence index or create string of N's
     let gap_sequence = if let Some(index) = sequence_index {
-        match index.fetch_sequence(path_key, gap_start as i32, gap_end as i32) {
+        match index.fetch_sequence(path_key, gap_start as i64, gap_end as i64) {
             Ok(seq) => String::from_utf8(seq).unwrap_or_else(|e| {
                 error!("Failed to convert sequence to UTF-8: {e}");
                 "N".repeat(gap_size)

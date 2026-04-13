@@ -18,11 +18,11 @@ use std::sync::Arc;
 /// Contains only the coordinate metadata stored in the interval tree nodes.
 #[derive(Debug, Clone)]
 pub struct RawAlignmentInterval {
-    pub target_start: i32,
-    pub target_end: i32,
+    pub target_start: i64,
+    pub target_end: i64,
     pub query_id: u32,
-    pub query_start: i32,
-    pub query_end: i32,
+    pub query_start: i64,
+    pub query_end: i64,
     pub is_reverse: bool,
 }
 
@@ -38,8 +38,8 @@ pub trait ImpgIndex: Send + Sync {
     fn query(
         &self,
         target_id: u32,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         store_cigar: bool,
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
@@ -50,8 +50,8 @@ pub trait ImpgIndex: Send + Sync {
     fn query_with_cache(
         &self,
         target_id: u32,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         store_cigar: bool,
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
@@ -62,8 +62,8 @@ pub trait ImpgIndex: Send + Sync {
     fn populate_cigar_cache(
         &self,
         target_id: u32,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
         cache: &mut FxHashMap<(u32, u64), Vec<CigarOp>>,
@@ -73,13 +73,13 @@ pub trait ImpgIndex: Send + Sync {
     fn query_transitive_dfs(
         &self,
         target_id: u32,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         masked_regions: Option<&FxHashMap<u32, SortedRanges>>,
         max_depth: u16,
-        min_transitive_len: i32,
-        min_distance_between_ranges: i32,
-        min_output_length: Option<i32>,
+        min_transitive_len: i64,
+        min_distance_between_ranges: i64,
+        min_output_length: Option<i64>,
         store_cigar: bool,
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
@@ -91,13 +91,13 @@ pub trait ImpgIndex: Send + Sync {
     fn query_transitive_bfs(
         &self,
         target_id: u32,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         masked_regions: Option<&FxHashMap<u32, SortedRanges>>,
         max_depth: u16,
-        min_transitive_len: i32,
-        min_distance_between_ranges: i32,
-        min_output_length: Option<i32>,
+        min_transitive_len: i64,
+        min_distance_between_ranges: i64,
+        min_output_length: Option<i64>,
         store_cigar: bool,
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
@@ -124,7 +124,7 @@ pub trait ImpgIndex: Send + Sync {
 
     /// Query alignments where the specified sequence is the QUERY (reverse direction).
     /// Returns: Vec of (query_start, query_end, target_id) tuples
-    fn query_reverse_for_depth(&self, query_id: u32) -> Vec<(i32, i32, u32)>;
+    fn query_reverse_for_depth(&self, query_id: u32) -> Vec<(i64, i64, u32)>;
 
     /// Build a lightweight reverse index: query_id -> [target_ids that have alignments with this query]
     fn build_query_to_targets_map(&self) -> FxHashMap<u32, Vec<u32>>;
@@ -134,7 +134,7 @@ pub trait ImpgIndex: Send + Sync {
         &self,
         query_id: u32,
         query_to_targets: &FxHashMap<u32, Vec<u32>>,
-    ) -> Vec<(i32, i32, u32)>;
+    ) -> Vec<(i64, i64, u32)>;
 
     /// Clear tree cache to free memory.
     fn clear_tree_cache(&self);
@@ -162,7 +162,7 @@ pub trait ImpgIndex: Send + Sync {
     /// Query only alignment intervals that overlap a specific range [start, end) on a target sequence.
     /// Returns raw coordinates without CIGAR projection, using coitrees range query for O(n+k) performance.
     /// Much more efficient than query_raw_intervals() when only a subset of intervals is needed (e.g., BFS).
-    fn query_raw_overlapping(&self, target_id: u32, start: i32, end: i32) -> Vec<RawAlignmentInterval>;
+    fn query_raw_overlapping(&self, target_id: u32, start: i64, end: i64) -> Vec<RawAlignmentInterval>;
 }
 
 /// Enum wrapper that can hold either a single `Impg` or a `MultiImpg`.
@@ -206,8 +206,8 @@ impl ImpgIndex for ImpgWrapper {
     fn query(
         &self,
         target_id: u32,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         store_cigar: bool,
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
@@ -238,8 +238,8 @@ impl ImpgIndex for ImpgWrapper {
     fn query_with_cache(
         &self,
         target_id: u32,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         store_cigar: bool,
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
@@ -270,8 +270,8 @@ impl ImpgIndex for ImpgWrapper {
     fn populate_cigar_cache(
         &self,
         target_id: u32,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
         cache: &mut FxHashMap<(u32, u64), Vec<CigarOp>>,
@@ -299,13 +299,13 @@ impl ImpgIndex for ImpgWrapper {
     fn query_transitive_dfs(
         &self,
         target_id: u32,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         masked_regions: Option<&FxHashMap<u32, SortedRanges>>,
         max_depth: u16,
-        min_transitive_len: i32,
-        min_distance_between_ranges: i32,
-        min_output_length: Option<i32>,
+        min_transitive_len: i64,
+        min_distance_between_ranges: i64,
+        min_output_length: Option<i64>,
         store_cigar: bool,
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
@@ -349,13 +349,13 @@ impl ImpgIndex for ImpgWrapper {
     fn query_transitive_bfs(
         &self,
         target_id: u32,
-        range_start: i32,
-        range_end: i32,
+        range_start: i64,
+        range_end: i64,
         masked_regions: Option<&FxHashMap<u32, SortedRanges>>,
         max_depth: u16,
-        min_transitive_len: i32,
-        min_distance_between_ranges: i32,
-        min_output_length: Option<i32>,
+        min_transitive_len: i64,
+        min_distance_between_ranges: i64,
+        min_output_length: Option<i64>,
         store_cigar: bool,
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
@@ -431,7 +431,7 @@ impl ImpgIndex for ImpgWrapper {
         }
     }
 
-    fn query_reverse_for_depth(&self, query_id: u32) -> Vec<(i32, i32, u32)> {
+    fn query_reverse_for_depth(&self, query_id: u32) -> Vec<(i64, i64, u32)> {
         match self {
             ImpgWrapper::Single(impg) => impg.query_reverse_for_depth(query_id),
             ImpgWrapper::Multi(multi) => multi.query_reverse_for_depth(query_id),
@@ -449,7 +449,7 @@ impl ImpgIndex for ImpgWrapper {
         &self,
         query_id: u32,
         query_to_targets: &FxHashMap<u32, Vec<u32>>,
-    ) -> Vec<(i32, i32, u32)> {
+    ) -> Vec<(i64, i64, u32)> {
         match self {
             ImpgWrapper::Single(impg) => impg.query_reverse_for_depth_with_map(query_id, query_to_targets),
             ImpgWrapper::Multi(multi) => multi.query_reverse_for_depth_with_map(query_id, query_to_targets),
@@ -491,7 +491,7 @@ impl ImpgIndex for ImpgWrapper {
         }
     }
 
-    fn query_raw_overlapping(&self, target_id: u32, start: i32, end: i32) -> Vec<RawAlignmentInterval> {
+    fn query_raw_overlapping(&self, target_id: u32, start: i64, end: i64) -> Vec<RawAlignmentInterval> {
         match self {
             ImpgWrapper::Single(impg) => impg.query_raw_overlapping(target_id, start, end),
             ImpgWrapper::Multi(multi) => multi.query_raw_overlapping(target_id, start, end),

@@ -6,7 +6,7 @@ use crate::faidx::FastaIndex;
 
 // Trait for sequence fetching from different sources
 pub trait SequenceIndex {
-    fn fetch_sequence(&self, seq_name: &str, start: i32, end: i32) -> io::Result<Vec<u8>>;
+    fn fetch_sequence(&self, seq_name: &str, start: i64, end: i64) -> io::Result<Vec<u8>>;
     fn get_sequence_length(&self, seq_name: &str) -> io::Result<usize>;
 }
 
@@ -75,10 +75,10 @@ impl UnifiedSequenceIndex {
 }
 
 impl SequenceIndex for UnifiedSequenceIndex {
-    fn fetch_sequence(&self, seq_name: &str, start: i32, end: i32) -> io::Result<Vec<u8>> {
+    fn fetch_sequence(&self, seq_name: &str, start: i64, end: i64) -> io::Result<Vec<u8>> {
         match self {
-            UnifiedSequenceIndex::Fasta(index) => index.fetch_sequence(seq_name, start, end),
-            UnifiedSequenceIndex::Agc(index) => index.fetch_sequence(seq_name, start, end),
+            UnifiedSequenceIndex::Fasta(index) => index.fetch_sequence(seq_name, start as i32, end as i32),
+            UnifiedSequenceIndex::Agc(index) => index.fetch_sequence(seq_name, start as i32, end as i32),
         }
     }
 
@@ -92,8 +92,8 @@ impl SequenceIndex for UnifiedSequenceIndex {
 
 // Implement for FastaIndex
 impl SequenceIndex for FastaIndex {
-    fn fetch_sequence(&self, seq_name: &str, start: i32, end: i32) -> io::Result<Vec<u8>> {
-        FastaIndex::fetch_sequence(self, seq_name, start, end)
+    fn fetch_sequence(&self, seq_name: &str, start: i64, end: i64) -> io::Result<Vec<u8>> {
+        FastaIndex::fetch_sequence(self, seq_name, start as i32, end as i32)
     }
 
     fn get_sequence_length(&self, seq_name: &str) -> io::Result<usize> {
@@ -103,8 +103,8 @@ impl SequenceIndex for FastaIndex {
 
 // Implement for AgcIndex
 impl SequenceIndex for AgcIndex {
-    fn fetch_sequence(&self, seq_name: &str, start: i32, end: i32) -> io::Result<Vec<u8>> {
-        AgcIndex::fetch_sequence(self, seq_name, start, end)
+    fn fetch_sequence(&self, seq_name: &str, start: i64, end: i64) -> io::Result<Vec<u8>> {
+        AgcIndex::fetch_sequence(self, seq_name, start as i32, end as i32)
     }
 
     fn get_sequence_length(&self, seq_name: &str) -> io::Result<usize> {
