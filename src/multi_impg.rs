@@ -12,8 +12,9 @@ use crate::sequence_index::UnifiedSequenceIndex;
 use crate::subset_filter::SubsetFilter;
 use coitrees::{BasicCOITree, Interval, IntervalTree};
 use log::{debug, info, warn};
+use parking_lot::Mutex as PlMutex;
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs::{self, File};
@@ -492,6 +493,35 @@ impl MultiImpg {
         Ok(impg)
     }
 
+    /// Load a sub-index WITHOUT storing it in `self.sub_indices`.
+    ///
+    /// Used by the file-parallel pre-scan (`compute_sample_degrees`) to bound peak memory:
+    /// at most `num_threads` sub-indices are alive simultaneously, versus O(num_files)
+    /// if they were cached. The returned `Arc<Impg>` should be dropped as soon as
+    /// per-file work is done.
+    fn load_sub_index_transient(&self, index_idx: usize) -> std::io::Result<Arc<Impg>> {
+        let path = &self.index_paths[index_idx];
+        let alignment_files = vec![self.alignment_files[index_idx].clone()];
+        let seq_files = if self.sequence_files.is_empty() {
+            None
+        } else {
+            Some(self.sequence_files.as_slice())
+        };
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+        let impg = Impg::load_from_file(
+            reader,
+            &alignment_files,
+            path.to_string_lossy().to_string(),
+            seq_files,
+        )?;
+        // Always disable tree caching on transient sub-indices so that trees
+        // walked during the pre-scan are released as soon as the caller drops
+        // the Arc returned by get_or_load_tree.
+        impg.set_tree_cache_enabled(false);
+        Ok(Arc::new(impg))
+    }
+
     /// Translate an AdjustedInterval from local IDs to unified IDs.
     fn translate_to_unified(
         &self,
@@ -952,6 +982,115 @@ impl ImpgIndex for MultiImpg {
             }
         }
         results
+    }
+
+    /// File-parallel pre-scan of unique-sample degrees.
+    ///
+    /// Overrides the default trait implementation (which iterates targets in parallel
+    /// and loads every sub-index that touches each target). That default scales as
+    /// O(num_files) retained sub-indices and OOMs with hundreds of thousands of
+    /// per-file indices. This override iterates files in parallel: each worker loads
+    /// ONE sub-index via `load_sub_index_transient`, walks its trees, accumulates
+    /// degree contributions into a shared per-target aggregator, then drops the
+    /// sub-index. Peak retained sub-indices = rayon worker count.
+    ///
+    /// Correctness vs. default:
+    /// - Both count "unique OTHER samples with direct alignments to this target".
+    /// - The aggregator merges contributions from every file that contains a tree for
+    ///   the same unified target (which is exactly what `query_raw_intervals` does
+    ///   under the hood via the unified forest_map).
+    /// - Excluded sequences (`seq_included[id] == false`) are skipped on both sides.
+    fn compute_sample_degrees(
+        &self,
+        seq_included: &[bool],
+        seq_to_sample: &[u16],
+    ) -> Vec<u16> {
+        let num_unified = self.seq_index.len();
+        // One mutex-guarded set per unified target. Contention is low because a
+        // given target is only touched by files that contain a tree for it, and
+        // per-file work first builds a thread-local set before taking the lock.
+        let aggregator: Vec<PlMutex<FxHashSet<u16>>> = (0..num_unified)
+            .map(|_| PlMutex::new(FxHashSet::default()))
+            .collect();
+
+        (0..self.index_paths.len())
+            .into_par_iter()
+            .for_each(|index_idx| {
+                let impg = match self.load_sub_index_transient(index_idx) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        warn!(
+                            "Degree pre-scan: failed to load sub-index {:?}: {}",
+                            self.index_paths[index_idx], e
+                        );
+                        return;
+                    }
+                };
+                let l2u = &self.local_to_unified[index_idx];
+
+                // Iterate every local target in this file.
+                let local_target_ids: Vec<u32> =
+                    impg.forest_map.entries.keys().copied().collect();
+                for local_target_id in local_target_ids {
+                    let unified_target_id = match l2u.get(local_target_id as usize) {
+                        Some(&id) if id != u32::MAX => id,
+                        _ => continue,
+                    };
+                    if !seq_included
+                        .get(unified_target_id as usize)
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    let self_sample = seq_to_sample
+                        .get(unified_target_id as usize)
+                        .copied()
+                        .unwrap_or(0);
+
+                    let tree = match impg.get_or_load_tree(local_target_id) {
+                        Some(t) => t,
+                        None => continue,
+                    };
+
+                    // Dedup locally first — keeps the mutex critical section small.
+                    let mut local_samples: FxHashSet<u16> = FxHashSet::default();
+                    for interval in tree.iter() {
+                        let m = &interval.metadata;
+                        let unified_query_id = match l2u.get(m.query_id() as usize) {
+                            Some(&id) if id != u32::MAX => id,
+                            _ => continue,
+                        };
+                        if !seq_included
+                            .get(unified_query_id as usize)
+                            .copied()
+                            .unwrap_or(false)
+                        {
+                            continue;
+                        }
+                        let query_sample = seq_to_sample
+                            .get(unified_query_id as usize)
+                            .copied()
+                            .unwrap_or(0);
+                        if query_sample != self_sample {
+                            local_samples.insert(query_sample);
+                        }
+                    }
+
+                    if !local_samples.is_empty() {
+                        let mut guard = aggregator[unified_target_id as usize].lock();
+                        guard.extend(local_samples);
+                    }
+                    // Tree Arc dropped here; with tree caching disabled on this
+                    // transient Impg, the underlying COITree is freed immediately.
+                }
+                // Impg Arc dropped here — entire sub-index is freed.
+            });
+
+        aggregator
+            .into_iter()
+            .map(|m| m.into_inner().len().min(u16::MAX as usize) as u16)
+            .collect()
     }
 
     fn query_raw_overlapping(&self, unified_target_id: u32, start: i64, end: i64) -> Vec<RawAlignmentInterval> {

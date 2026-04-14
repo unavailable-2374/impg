@@ -814,6 +814,13 @@ impl CompactSequenceLengths {
     pub fn sample_index(&self) -> &SampleIndex {
         &self.sample_index
     }
+
+    /// Borrow the full seq_id -> sample_id slice.
+    /// Used by the pre-scan file-parallel degree computation in `MultiImpg`.
+    #[inline]
+    pub fn seq_to_sample_slice(&self) -> &[u16] {
+        &self.seq_to_sample
+    }
 }
 
 /// Compact alignment info using numeric IDs
@@ -1442,34 +1449,12 @@ fn compute_alignment_degrees(
     compact_lengths: &CompactSequenceLengths,
     seq_included: &[bool],
 ) -> Vec<u16> {
-    (0..seq_included.len() as u32)
-        .into_par_iter()
-        .map(|seq_id| {
-            if !seq_included.get(seq_id as usize).copied().unwrap_or(false) {
-                return 0u16;
-            }
-            let raw_alns = impg.query_raw_intervals(seq_id);
-            if raw_alns.is_empty() {
-                return 0;
-            }
-            let self_sample = compact_lengths.get_sample_id(seq_id);
-            let mut samples = FxHashSet::default();
-            for aln in &raw_alns {
-                if !seq_included
-                    .get(aln.query_id as usize)
-                    .copied()
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
-                let sample_id = compact_lengths.get_sample_id(aln.query_id);
-                if sample_id != self_sample {
-                    samples.insert(sample_id);
-                }
-            }
-            samples.len().min(u16::MAX as usize) as u16
-        })
-        .collect()
+    // Dispatches to the `ImpgIndex::compute_sample_degrees` trait method.
+    // - Single `Impg`: uses the default parallel-by-target impl (fine: one file, one cache).
+    // - `MultiImpg`: uses a file-parallel override that loads each sub-index transiently
+    //   and drops it immediately, bounding peak retained sub-indices to the rayon worker
+    //   count. This is required to avoid OOM on per-file indexing with 100k+ files.
+    impg.compute_sample_degrees(seq_included, compact_lengths.seq_to_sample_slice())
 }
 
 /// Build sequence processing order: sorted by degree descending, then length descending.
@@ -2589,12 +2574,16 @@ pub fn compute_depth_global(
     // Used for automatic hub detection (when --ref is not specified) and
     // for sorting sequences by connectivity (hubs first) in all modes.
     //
-    // Disable tree caching during pre-scan: with per-file indexing, 64 threads
-    // simultaneously loading all sub-indices and caching every interval tree
-    // causes 200+ GB RSS. Trees are only needed transiently here.
-    impg.set_tree_cache_enabled(false);
+    // For MultiImpg, `compute_sample_degrees` internally iterates files in parallel
+    // and uses transient sub-index loads (NOT the shared `sub_indices` cache), so
+    // retained memory is bounded to `num_threads` sub-indices regardless of the
+    // total number of per-file indices. The old tree-cache toggle is no longer
+    // needed for the pre-scan — leave the main-phase cache setting untouched.
     info!("Pre-scanning alignment degrees...");
     let degrees = compute_alignment_degrees(impg, &compact_lengths, &seq_included);
+    // Belt-and-suspenders: clear any stale entries left from earlier phases of
+    // this invocation (should be empty here, since load_sub_index_transient
+    // never populates the shared cache).
     impg.clear_sub_index_cache();
     let max_degree = degrees.iter().copied().max().unwrap_or(0);
     let included_count = seq_included.iter().filter(|&&v| v).count();

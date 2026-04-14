@@ -11,7 +11,8 @@ use crate::seqidx::SequenceIndex;
 use crate::sequence_index::UnifiedSequenceIndex;
 use crate::subset_filter::SubsetFilter;
 use coitrees::BasicCOITree;
-use rustc_hash::FxHashMap;
+use rayon::prelude::*;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
 
 /// Raw alignment interval without CIGAR projection, for fast depth computation.
@@ -163,6 +164,58 @@ pub trait ImpgIndex: Send + Sync {
     /// Returns raw coordinates without CIGAR projection, using coitrees range query for O(n+k) performance.
     /// Much more efficient than query_raw_intervals() when only a subset of intervals is needed (e.g., BFS).
     fn query_raw_overlapping(&self, target_id: u32, start: i64, end: i64) -> Vec<RawAlignmentInterval>;
+
+    /// Pre-scan: for each unified target in `seq_included`, count unique OTHER samples
+    /// directly aligned to it. Used by the depth command to auto-detect hub sequences.
+    ///
+    /// Parameters:
+    /// - `seq_included`: length `num_unified`, true if the sequence participates in this run.
+    /// - `seq_to_sample`: unified_seq_id -> sample_id mapping, length `num_unified`.
+    ///
+    /// Returns a `Vec<u16>` of length `num_unified` giving the degree (unique OTHER samples) per
+    /// sequence; entries for excluded sequences are 0.
+    ///
+    /// The default implementation iterates targets in parallel via `query_raw_intervals`. This
+    /// is fine for single-file `Impg` but explodes memory for `MultiImpg` with hundreds of
+    /// thousands of per-file sub-indices, which is why `MultiImpg` overrides it with a
+    /// file-parallel strategy that bounds retained sub-indices to `num_threads`.
+    fn compute_sample_degrees(
+        &self,
+        seq_included: &[bool],
+        seq_to_sample: &[u16],
+    ) -> Vec<u16> {
+        (0..seq_included.len() as u32)
+            .into_par_iter()
+            .map(|seq_id| {
+                if !seq_included.get(seq_id as usize).copied().unwrap_or(false) {
+                    return 0u16;
+                }
+                let raw_alns = self.query_raw_intervals(seq_id);
+                if raw_alns.is_empty() {
+                    return 0;
+                }
+                let self_sample = seq_to_sample.get(seq_id as usize).copied().unwrap_or(0);
+                let mut samples: FxHashSet<u16> = FxHashSet::default();
+                for aln in &raw_alns {
+                    if !seq_included
+                        .get(aln.query_id as usize)
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    let sample_id = seq_to_sample
+                        .get(aln.query_id as usize)
+                        .copied()
+                        .unwrap_or(0);
+                    if sample_id != self_sample {
+                        samples.insert(sample_id);
+                    }
+                }
+                samples.len().min(u16::MAX as usize) as u16
+            })
+            .collect()
+    }
 }
 
 /// Enum wrapper that can hold either a single `Impg` or a `MultiImpg`.
@@ -495,6 +548,19 @@ impl ImpgIndex for ImpgWrapper {
         match self {
             ImpgWrapper::Single(impg) => impg.query_raw_overlapping(target_id, start, end),
             ImpgWrapper::Multi(multi) => multi.query_raw_overlapping(target_id, start, end),
+        }
+    }
+
+    fn compute_sample_degrees(
+        &self,
+        seq_included: &[bool],
+        seq_to_sample: &[u16],
+    ) -> Vec<u16> {
+        match self {
+            // Single Impg: default trait impl (parallel-by-target) is already optimal.
+            ImpgWrapper::Single(impg) => impg.compute_sample_degrees(seq_included, seq_to_sample),
+            // MultiImpg: file-parallel override to bound peak memory.
+            ImpgWrapper::Multi(multi) => multi.compute_sample_degrees(seq_included, seq_to_sample),
         }
     }
 }
