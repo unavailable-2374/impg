@@ -1301,8 +1301,9 @@ enum Args {
         /// Ref-anchored mode: prioritize this sample's sequences as anchors.
         /// Guarantees all regions covered by this sample use its coordinate system.
         /// All sequences are still output unless --ref-only is also specified.
+        /// Only meaningful for global depth; region queries (-r / -b) ignore it.
         #[arg(help_heading = "Mode selection")]
-        #[clap(long = "ref", value_parser)]
+        #[clap(long = "ref", value_parser, conflicts_with_all = &["target_range", "target_bed"])]
         ref_sample: Option<String>,
 
         /// Ref-only mode: only output depth for the --ref sample's sequences.
@@ -2810,6 +2811,12 @@ fn run() -> io::Result<()> {
             }
             if min_seq_length > 0 {
                 info!("Minimum sequence length filter: {} bp", min_seq_length);
+            }
+            if sample_filter.is_some() {
+                warn!(
+                    "--samples / --samples-file is ignored in global depth mode \
+                     (only honored with -r / -b region queries). Continuing without sample filter."
+                );
             }
             depth::compute_depth_global(
                 &impg,

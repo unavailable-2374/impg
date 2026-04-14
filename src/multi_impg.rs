@@ -643,7 +643,7 @@ impl MultiImpg {
                 metadata: target_id,
             },
             if store_cigar {
-                vec![CigarOp::new((range_end - range_start) as i32, '=')]
+                CigarOp::new_run(range_end - range_start, '=')
             } else {
                 Vec::new()
             },

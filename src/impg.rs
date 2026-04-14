@@ -75,6 +75,9 @@ pub struct CigarOp {
     val: u32,
 }
 
+/// Maximum length that fits in a single CigarOp (29-bit length field).
+pub const CIGAR_OP_MAX_LEN: i64 = (1i64 << 29) - 1;
+
 impl CigarOp {
     pub fn new(len: i32, op: char) -> Self {
         let val = match op {
@@ -85,9 +88,33 @@ impl CigarOp {
             'M' => 4,
             _ => panic!("Invalid CIGAR operation: {op}"),
         };
+        assert!(
+            len >= 0 && (len as i64) <= CIGAR_OP_MAX_LEN,
+            "CigarOp length {} out of range (max {})",
+            len,
+            CIGAR_OP_MAX_LEN
+        );
         Self {
             val: (val << 29) | (len as u32),
         }
+    }
+
+    /// Build a run of same-op CigarOps whose total length is `len`, splitting
+    /// into chunks of at most `CIGAR_OP_MAX_LEN` so that alignments longer than
+    /// the 29-bit field do not truncate.
+    pub fn new_run(len: i64, op: char) -> Vec<Self> {
+        assert!(len >= 0, "CigarOp run length must be non-negative");
+        if len == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(((len + CIGAR_OP_MAX_LEN - 1) / CIGAR_OP_MAX_LEN) as usize);
+        let mut remaining = len;
+        while remaining > 0 {
+            let take = remaining.min(CIGAR_OP_MAX_LEN);
+            out.push(Self::new(take as i32, op));
+            remaining -= take;
+        }
+        out
     }
 
     pub fn op(&self) -> char {
@@ -839,8 +866,7 @@ impl Impg {
 
         // if there are no differences, we can shortcut to a perfect match CIGAR
         if alignment.differences == 0 {
-            let match_len = (query_end - query_start) as i32;
-            return vec![CigarOp::new(match_len, '=')];
+            return CigarOp::new_run(query_end - query_start, '=');
         }
 
         // Fetch query sequence (not cached)
@@ -1968,7 +1994,7 @@ impl Impg {
                 metadata: target_id,
             },
             if store_cigar {
-                vec![CigarOp::new((range_end - range_start) as i32, '=')]
+                CigarOp::new_run(range_end - range_start, '=')
             } else {
                 Vec::new()
             },
@@ -2159,7 +2185,7 @@ impl Impg {
                 metadata: target_id,
             },
             if store_cigar {
-                vec![CigarOp::new((range_end - range_start) as i32, '=')]
+                CigarOp::new_run(range_end - range_start, '=')
             } else {
                 Vec::new()
             },
@@ -2275,7 +2301,7 @@ impl Impg {
                     metadata: target_id,
                 },
                 if store_cigar {
-                    vec![CigarOp::new((filtered_end - filtered_start) as i32, '=')]
+                    CigarOp::new_run(filtered_end - filtered_start, '=')
                 } else {
                     Vec::new()
                 },
@@ -2532,7 +2558,7 @@ impl Impg {
                     metadata: target_id,
                 },
                 if store_cigar {
-                    vec![CigarOp::new((filtered_end - filtered_start) as i32, '=')]
+                    CigarOp::new_run(filtered_end - filtered_start, '=')
                 } else {
                     Vec::new()
                 },

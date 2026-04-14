@@ -1120,6 +1120,42 @@ pub fn extract_sample(seq_name: &str, separator: &str) -> String {
         seq_name.to_string()
     }
 }
+
+/// (inter_start, inter_end, anchor_start, anchor_end) for one hop-0 segment.
+type HopZeroSeg = (i64, i64, i64, i64);
+
+/// Project `[t_start, t_end)` on an intermediate sequence back onto the
+/// anchor using the containing hop-0 segment. Falls back to `[region_start,
+/// region_end)` when no segment contains the range (gap between hop-0
+/// hits, or strand-specific coverage that does not match).
+#[inline]
+fn project_hop0_coords(
+    segments: Option<&Vec<HopZeroSeg>>,
+    t_start: i64,
+    t_end: i64,
+    region_start: i64,
+    region_end: i64,
+) -> (i64, i64) {
+    if let Some(segs) = segments {
+        for &(seq_start, seq_end, anc_start, anc_end) in segs {
+            if seq_start <= t_start && t_end <= seq_end {
+                let seq_len = seq_end - seq_start;
+                let anc_len = anc_end - anc_start;
+                if seq_len > 0 && anc_len > 0 {
+                    let frac_s = (t_start - seq_start) as f64 / seq_len as f64;
+                    let frac_e = (t_end - seq_start) as f64 / seq_len as f64;
+                    let proj_s = anc_start + (frac_s * anc_len as f64).round() as i64;
+                    let proj_e = anc_start + (frac_e * anc_len as f64).round() as i64;
+                    return (
+                        proj_s.min(proj_e).max(region_start),
+                        proj_s.max(proj_e).min(region_end),
+                    );
+                }
+            }
+        }
+    }
+    (region_start, region_end)
+}
 // ============================================================================
 // Compact depth computation using ID-based data structures
 // ============================================================================
@@ -1149,16 +1185,16 @@ impl PartialOrd for CompactDepthEvent {
     }
 }
 
-/// Check if an alignment is a same-sample transitive alignment (intra-genome duplication).
+/// Check if an alignment is a same-sample alignment (intra-genome duplication).
 /// Returns true if the alignment should be filtered out.
 #[inline]
 fn is_self_alignment(
     query_sample_id: u16,
     anchor_sample_id: u16,
-    query_id: u32,
-    target_seq_id: u32,
+    _query_id: u32,
+    _target_seq_id: u32,
 ) -> bool {
-    query_sample_id == anchor_sample_id && query_id != target_seq_id
+    query_sample_id == anchor_sample_id
 }
 
 // ============================================================================
@@ -1244,8 +1280,8 @@ fn split_intervals_by_window(
                     let q_len = qe - qs;
                     let frac_start = (pos - interval.start) as f64 / interval_len as f64;
                     let frac_end = (chunk_end - interval.start) as f64 / interval_len as f64;
-                    let new_qs = qs + (frac_start * q_len as f64) as i64;
-                    let new_qe = qs + (frac_end * q_len as f64) as i64;
+                    let new_qs = qs + (frac_start * q_len as f64).round() as i64;
+                    let new_qe = qs + (frac_end * q_len as f64).round() as i64;
                     (sid, qid, new_qs, new_qe)
                 })
                 .collect();
@@ -1365,9 +1401,6 @@ impl ConcurrentProcessedTracker {
         let lock = self.processed[seq_id as usize].lock();
         if lock.is_empty() {
             return vec![(start, end)];
-        }
-        if lock.total_length() >= (end - start) {
-            return Vec::new();
         }
         // Subtract processed intervals from [start, end)
         let mut unprocessed = IntervalSet::new_single(start, end);
@@ -1582,15 +1615,15 @@ fn depth_transitive_bfs(
 
             let (clipped_query_start, clipped_query_end) = if aln.is_reverse {
                 let cqe = aln.query_end
-                    - ((clipped_target_start - aln_target_start) as f64 * ratio) as i64;
-                let cqs =
-                    aln.query_end - ((clipped_target_end - aln_target_start) as f64 * ratio) as i64;
+                    - ((clipped_target_start - aln_target_start) as f64 * ratio).round() as i64;
+                let cqs = aln.query_end
+                    - ((clipped_target_end - aln_target_start) as f64 * ratio).round() as i64;
                 (cqs.min(cqe), cqs.max(cqe))
             } else {
                 let cqs = aln.query_start
-                    + ((clipped_target_start - aln_target_start) as f64 * ratio) as i64;
+                    + ((clipped_target_start - aln_target_start) as f64 * ratio).round() as i64;
                 let cqe = aln.query_start
-                    + ((clipped_target_end - aln_target_start) as f64 * ratio) as i64;
+                    + ((clipped_target_end - aln_target_start) as f64 * ratio).round() as i64;
                 (cqs.min(cqe), cqs.max(cqe))
             };
 
@@ -1725,20 +1758,17 @@ fn process_anchor_region_transitive_raw(
     ));
 
     // Pass 1: Build anchor coverage map from hop 0 results (target on anchor)
-    let mut seq_anchor_coverage: FxHashMap<u32, (i64, i64, i64, i64)> = FxHashMap::default();
+    let mut seq_anchor_coverage: FxHashMap<u32, Vec<HopZeroSeg>> = FxHashMap::default();
     for hit in &hits {
         if hit.target_id == anchor_seq_id {
             let q_start = hit.query_start.min(hit.query_end) as i64;
             let q_end = hit.query_start.max(hit.query_end) as i64;
             let t_start = hit.target_start.min(hit.target_end) as i64;
             let t_end = hit.target_start.max(hit.target_end) as i64;
-            let entry = seq_anchor_coverage
+            seq_anchor_coverage
                 .entry(hit.query_id)
-                .or_insert((q_start, q_end, t_start, t_end));
-            entry.0 = entry.0.min(q_start);
-            entry.1 = entry.1.max(q_end);
-            entry.2 = entry.2.min(t_start);
-            entry.3 = entry.3.max(t_end);
+                .or_default()
+                .push((q_start, q_end, t_start, t_end));
         }
     }
 
@@ -1774,26 +1804,13 @@ fn process_anchor_region_transitive_raw(
         } else {
             let t_start = hit.target_start.min(hit.target_end) as i64;
             let t_end = hit.target_start.max(hit.target_end) as i64;
-            if let Some(&(seq_start, seq_end, anc_start, anc_end)) =
-                seq_anchor_coverage.get(&hit.target_id)
-            {
-                let seq_len = seq_end - seq_start;
-                let anc_len = anc_end - anc_start;
-                if seq_len > 0 && anc_len > 0 {
-                    let frac_s = (t_start - seq_start) as f64 / seq_len as f64;
-                    let frac_e = (t_end - seq_start) as f64 / seq_len as f64;
-                    let proj_s = anc_start + (frac_s * anc_len as f64) as i64;
-                    let proj_e = anc_start + (frac_e * anc_len as f64) as i64;
-                    (
-                        proj_s.min(proj_e).max(region_start),
-                        proj_s.max(proj_e).min(region_end),
-                    )
-                } else {
-                    (region_start, region_end)
-                }
-            } else {
-                (region_start, region_end)
-            }
+            project_hop0_coords(
+                seq_anchor_coverage.get(&hit.target_id),
+                t_start,
+                t_end,
+                region_start,
+                region_end,
+            )
         };
 
         if a_start >= a_end {
@@ -1948,12 +1965,16 @@ fn process_anchor_region(
         };
 
         let (cq_start, cq_end) = if is_reverse {
-            let cqe = query_end - ((clipped_target_start - target_start) as f64 * ratio) as i64;
-            let cqs = query_end - ((clipped_target_end - target_start) as f64 * ratio) as i64;
+            let cqe =
+                query_end - ((clipped_target_start - target_start) as f64 * ratio).round() as i64;
+            let cqs =
+                query_end - ((clipped_target_end - target_start) as f64 * ratio).round() as i64;
             (cqs.min(cqe), cqs.max(cqe))
         } else {
-            let cqs = query_start + ((clipped_target_start - target_start) as f64 * ratio) as i64;
-            let cqe = query_start + ((clipped_target_end - target_start) as f64 * ratio) as i64;
+            let cqs =
+                query_start + ((clipped_target_start - target_start) as f64 * ratio).round() as i64;
+            let cqe =
+                query_start + ((clipped_target_end - target_start) as f64 * ratio).round() as i64;
             (cqs.min(cqe), cqs.max(cqe))
         };
 
@@ -2050,12 +2071,16 @@ fn process_anchor_region_raw(
         };
 
         let (clipped_query_start, clipped_query_end) = if aln.is_reverse {
-            let cqe = query_end - ((clipped_target_start - target_start) as f64 * ratio) as i64;
-            let cqs = query_end - ((clipped_target_end - target_start) as f64 * ratio) as i64;
+            let cqe =
+                query_end - ((clipped_target_start - target_start) as f64 * ratio).round() as i64;
+            let cqs =
+                query_end - ((clipped_target_end - target_start) as f64 * ratio).round() as i64;
             (cqs, cqe)
         } else {
-            let cqs = query_start + ((clipped_target_start - target_start) as f64 * ratio) as i64;
-            let cqe = query_start + ((clipped_target_end - target_start) as f64 * ratio) as i64;
+            let cqs =
+                query_start + ((clipped_target_start - target_start) as f64 * ratio).round() as i64;
+            let cqe =
+                query_start + ((clipped_target_end - target_start) as f64 * ratio).round() as i64;
             (cqs, cqe)
         };
 
@@ -2157,7 +2182,7 @@ fn process_anchor_region_transitive_cigar(
     ));
 
     // Pass 1: Build anchor coverage map from hop 0 results (target on anchor)
-    let mut seq_anchor_coverage: FxHashMap<u32, (i64, i64, i64, i64)> = FxHashMap::default();
+    let mut seq_anchor_coverage: FxHashMap<u32, Vec<HopZeroSeg>> = FxHashMap::default();
     for overlap in &overlaps {
         let query_interval = &overlap.0;
         let target_interval = &overlap.2;
@@ -2167,13 +2192,10 @@ fn process_anchor_region_transitive_cigar(
             let q_end = query_interval.first.max(query_interval.last) as i64;
             let t_start = target_interval.first.min(target_interval.last) as i64;
             let t_end = target_interval.first.max(target_interval.last) as i64;
-            let entry = seq_anchor_coverage
+            seq_anchor_coverage
                 .entry(query_id)
-                .or_insert((q_start, q_end, t_start, t_end));
-            entry.0 = entry.0.min(q_start);
-            entry.1 = entry.1.max(q_end);
-            entry.2 = entry.2.min(t_start);
-            entry.3 = entry.3.max(t_end);
+                .or_default()
+                .push((q_start, q_end, t_start, t_end));
         }
     }
 
@@ -2215,26 +2237,13 @@ fn process_anchor_region_transitive_cigar(
         } else {
             let t_start = target_interval.first.min(target_interval.last) as i64;
             let t_end = target_interval.first.max(target_interval.last) as i64;
-            if let Some(&(seq_start, seq_end, anc_start, anc_end)) =
-                seq_anchor_coverage.get(&target_interval.metadata)
-            {
-                let seq_len = seq_end - seq_start;
-                let anc_len = anc_end - anc_start;
-                if seq_len > 0 && anc_len > 0 {
-                    let frac_s = (t_start - seq_start) as f64 / seq_len as f64;
-                    let frac_e = (t_end - seq_start) as f64 / seq_len as f64;
-                    let proj_s = anc_start + (frac_s * anc_len as f64) as i64;
-                    let proj_e = anc_start + (frac_e * anc_len as f64) as i64;
-                    (
-                        proj_s.min(proj_e).max(region_start),
-                        proj_s.max(proj_e).min(region_end),
-                    )
-                } else {
-                    (region_start, region_end)
-                }
-            } else {
-                (region_start, region_end)
-            }
+            project_hop0_coords(
+                seq_anchor_coverage.get(&target_interval.metadata),
+                t_start,
+                t_end,
+                region_start,
+                region_end,
+            )
         };
 
         if a_start >= a_end {
@@ -3554,7 +3563,7 @@ pub fn query_region_depth(
         let region_end = target_end;
 
         // Pass 1: Build a map of each sequence's anchor coverage from hop 0 results
-        let mut seq_anchor_coverage: FxHashMap<u32, (i64, i64, i64, i64)> = FxHashMap::default();
+        let mut seq_anchor_coverage: FxHashMap<u32, Vec<HopZeroSeg>> = FxHashMap::default();
         for overlap in &overlaps {
             let query_interval = &overlap.0;
             let target_interval = &overlap.2;
@@ -3564,13 +3573,10 @@ pub fn query_region_depth(
                 let q_end = query_interval.first.max(query_interval.last) as i64;
                 let t_start = target_interval.first.min(target_interval.last) as i64;
                 let t_end = target_interval.first.max(target_interval.last) as i64;
-                let entry = seq_anchor_coverage
+                seq_anchor_coverage
                     .entry(query_id)
-                    .or_insert((q_start, q_end, t_start, t_end));
-                entry.0 = entry.0.min(q_start);
-                entry.1 = entry.1.max(q_end);
-                entry.2 = entry.2.min(t_start);
-                entry.3 = entry.3.max(t_end);
+                    .or_default()
+                    .push((q_start, q_end, t_start, t_end));
             }
         }
 
@@ -3607,26 +3613,13 @@ pub fn query_region_depth(
             } else {
                 let t_start = target_interval.first.min(target_interval.last) as i64;
                 let t_end = target_interval.first.max(target_interval.last) as i64;
-                if let Some(&(seq_start, seq_end, anc_start, anc_end)) =
-                    seq_anchor_coverage.get(&target_interval.metadata)
-                {
-                    let seq_len = seq_end - seq_start;
-                    let anc_len = anc_end - anc_start;
-                    if seq_len > 0 && anc_len > 0 {
-                        let frac_s = (t_start - seq_start) as f64 / seq_len as f64;
-                        let frac_e = (t_end - seq_start) as f64 / seq_len as f64;
-                        let proj_s = anc_start + (frac_s * anc_len as f64) as i64;
-                        let proj_e = anc_start + (frac_e * anc_len as f64) as i64;
-                        (
-                            proj_s.min(proj_e).max(region_start),
-                            proj_s.max(proj_e).min(region_end),
-                        )
-                    } else {
-                        (region_start, region_end)
-                    }
-                } else {
-                    (region_start, region_end)
-                }
+                project_hop0_coords(
+                    seq_anchor_coverage.get(&target_interval.metadata),
+                    t_start,
+                    t_end,
+                    region_start,
+                    region_end,
+                )
             };
 
             if a_start >= a_end {
@@ -3660,20 +3653,17 @@ pub fn query_region_depth(
         let region_end = target_end;
 
         // Pass 1: Build anchor coverage map from hop 0 results
-        let mut seq_anchor_coverage: FxHashMap<u32, (i64, i64, i64, i64)> = FxHashMap::default();
+        let mut seq_anchor_coverage: FxHashMap<u32, Vec<HopZeroSeg>> = FxHashMap::default();
         for hit in &hits {
             if hit.target_id == target_id {
                 let q_start = hit.query_start.min(hit.query_end) as i64;
                 let q_end = hit.query_start.max(hit.query_end) as i64;
                 let t_start = hit.target_start.min(hit.target_end) as i64;
                 let t_end = hit.target_start.max(hit.target_end) as i64;
-                let entry = seq_anchor_coverage
+                seq_anchor_coverage
                     .entry(hit.query_id)
-                    .or_insert((q_start, q_end, t_start, t_end));
-                entry.0 = entry.0.min(q_start);
-                entry.1 = entry.1.max(q_end);
-                entry.2 = entry.2.min(t_start);
-                entry.3 = entry.3.max(t_end);
+                    .or_default()
+                    .push((q_start, q_end, t_start, t_end));
             }
         }
 
@@ -3705,26 +3695,13 @@ pub fn query_region_depth(
             } else {
                 let t_start = hit.target_start.min(hit.target_end) as i64;
                 let t_end = hit.target_start.max(hit.target_end) as i64;
-                if let Some(&(seq_start, seq_end, anc_start, anc_end)) =
-                    seq_anchor_coverage.get(&hit.target_id)
-                {
-                    let seq_len = seq_end - seq_start;
-                    let anc_len = anc_end - anc_start;
-                    if seq_len > 0 && anc_len > 0 {
-                        let frac_s = (t_start - seq_start) as f64 / seq_len as f64;
-                        let frac_e = (t_end - seq_start) as f64 / seq_len as f64;
-                        let proj_s = anc_start + (frac_s * anc_len as f64) as i64;
-                        let proj_e = anc_start + (frac_e * anc_len as f64) as i64;
-                        (
-                            proj_s.min(proj_e).max(region_start),
-                            proj_s.max(proj_e).min(region_end),
-                        )
-                    } else {
-                        (region_start, region_end)
-                    }
-                } else {
-                    (region_start, region_end)
-                }
+                project_hop0_coords(
+                    seq_anchor_coverage.get(&hit.target_id),
+                    t_start,
+                    t_end,
+                    region_start,
+                    region_end,
+                )
             };
 
             if a_start >= a_end {
@@ -3826,15 +3803,15 @@ pub fn query_region_depth(
 
             let (clipped_query_start, clipped_query_end) = if aln.is_reverse {
                 let cqe = aln_query_end
-                    - ((clipped_target_start - aln_target_start) as f64 * ratio) as i64;
-                let cqs =
-                    aln_query_end - ((clipped_target_end - aln_target_start) as f64 * ratio) as i64;
+                    - ((clipped_target_start - aln_target_start) as f64 * ratio).round() as i64;
+                let cqs = aln_query_end
+                    - ((clipped_target_end - aln_target_start) as f64 * ratio).round() as i64;
                 (cqs, cqe)
             } else {
                 let cqs = aln_query_start
-                    + ((clipped_target_start - aln_target_start) as f64 * ratio) as i64;
+                    + ((clipped_target_start - aln_target_start) as f64 * ratio).round() as i64;
                 let cqe = aln_query_start
-                    + ((clipped_target_end - aln_target_start) as f64 * ratio) as i64;
+                    + ((clipped_target_end - aln_target_start) as f64 * ratio).round() as i64;
                 (cqs, cqe)
             };
 
@@ -4004,4 +3981,98 @@ pub fn parse_bed_file_depth(bed_path: &str) -> io::Result<Vec<(String, i64, i64)
     }
 
     Ok(regions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_unprocessed_subinterval_semantics() {
+        let tracker = ConcurrentProcessedTracker::new(1);
+        tracker.mark_processed(0, 0, 5_000_000);
+        tracker.mark_processed(0, 6_000_000, 8_000_000);
+
+        let unprocessed = tracker.get_unprocessed(0, 4_000_000, 5_500_000);
+        assert_eq!(unprocessed, vec![(5_000_000, 5_500_000)]);
+
+        let fully_covered = tracker.get_unprocessed(0, 0, 5_000_000);
+        assert!(fully_covered.is_empty());
+
+        let fully_open = tracker.get_unprocessed(0, 8_000_000, 10_000_000);
+        assert_eq!(fully_open, vec![(8_000_000, 10_000_000)]);
+    }
+
+    #[test]
+    fn test_is_self_alignment_same_sample_different_contigs() {
+        assert!(is_self_alignment(1, 1, 10, 10));
+        assert!(is_self_alignment(1, 1, 10, 20));
+        assert!(!is_self_alignment(1, 2, 10, 20));
+        assert!(!is_self_alignment(1, 2, 10, 10));
+    }
+
+    #[test]
+    fn test_cigar_op_new_run_splits_long_runs() {
+        use crate::impg::{CigarOp, CIGAR_OP_MAX_LEN};
+
+        assert!(CigarOp::new_run(0, '=').is_empty());
+
+        let single = CigarOp::new_run(1_000_000, '=');
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].len() as i64, 1_000_000);
+
+        let at_max = CigarOp::new_run(CIGAR_OP_MAX_LEN, '=');
+        assert_eq!(at_max.len(), 1);
+        assert_eq!(at_max[0].len() as i64, CIGAR_OP_MAX_LEN);
+
+        let over = CigarOp::new_run(CIGAR_OP_MAX_LEN + 1, '=');
+        assert_eq!(over.len(), 2);
+        assert_eq!(
+            over.iter().map(|op| op.len() as i64).sum::<i64>(),
+            CIGAR_OP_MAX_LEN + 1
+        );
+
+        let six_hundred_mb: i64 = 600_000_000;
+        let run = CigarOp::new_run(six_hundred_mb, '=');
+        assert_eq!(
+            run.iter().map(|op| op.len() as i64).sum::<i64>(),
+            six_hundred_mb
+        );
+        for op in &run {
+            assert!((op.len() as i64) <= CIGAR_OP_MAX_LEN);
+        }
+    }
+
+    #[test]
+    fn test_project_hop0_coords_strand_aware_gap_fallback() {
+        let region_start = 0;
+        let region_end = 10_000;
+
+        let segments: Vec<HopZeroSeg> = vec![(100, 200, 50, 150), (800, 900, 60, 140)];
+
+        // In the gap between hop-0 segments: fallback.
+        assert_eq!(
+            project_hop0_coords(Some(&segments), 500, 600, region_start, region_end),
+            (region_start, region_end)
+        );
+
+        // Inside first segment: linear projection into [50,150).
+        assert_eq!(
+            project_hop0_coords(Some(&segments), 120, 180, region_start, region_end),
+            (70, 130)
+        );
+
+        // Inside second segment: linear projection into [60,140). anc_len=80.
+        // 60 + round(0.2*80)=76, 60 + round(0.8*80)=124.
+        assert_eq!(
+            project_hop0_coords(Some(&segments), 820, 880, region_start, region_end),
+            (76, 124)
+        );
+
+        // No segments at all: fallback.
+        assert_eq!(
+            project_hop0_coords(None, 500, 600, region_start, region_end),
+            (region_start, region_end)
+        );
+    }
 }
