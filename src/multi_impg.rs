@@ -1126,9 +1126,152 @@ impl ImpgIndex for MultiImpg {
         }
         results
     }
+
+    /// Transient variant: loads each needed sub-index via `load_sub_index_transient`
+    /// (which disables tree caching on the returned `Impg`) and drops it as soon as
+    /// the relevant trees have been walked. The shared `self.sub_indices` vec is
+    /// NEVER written to. Peak retained memory per call is bounded by one sub-index
+    /// plus one COITree, regardless of how many alignment files contain the target.
+    ///
+    /// This is required by the depth command's non-transitive Phase 1/2 hot paths
+    /// when running with ≫ 10⁴ per-file indices: the cached `query_raw_intervals`
+    /// path would otherwise monotonically grow `sub_indices` across hub sequences
+    /// until the process commit limit is hit.
+    fn query_raw_intervals_transient(&self, unified_target_id: u32) -> Vec<RawAlignmentInterval> {
+        let locations = match self.forest_map.get(&unified_target_id) {
+            Some(locs) => locs,
+            None => return Vec::new(),
+        };
+
+        // Group by sub-index file so we load each file at most once per call even
+        // if the unified forest map were to report multiple local target ids per
+        // file (V2 bidirectional currently reports one, but we dedupe defensively).
+        let mut by_index: FxHashMap<usize, Vec<u32>> = FxHashMap::default();
+        for loc in locations {
+            by_index
+                .entry(loc.index_idx)
+                .or_default()
+                .push(loc.local_target_id);
+        }
+
+        let mut results = Vec::new();
+        for (index_idx, local_target_ids) in by_index {
+            let impg = match self.load_sub_index_transient(index_idx) {
+                Ok(i) => i,
+                Err(e) => {
+                    warn!(
+                        "query_raw_intervals_transient: failed to load sub-index {:?}: {}",
+                        self.index_paths[index_idx], e
+                    );
+                    continue;
+                }
+            };
+            let l2u = &self.local_to_unified[index_idx];
+            for local_target_id in local_target_ids {
+                if let Some(tree) = impg.get_or_load_tree(local_target_id) {
+                    for interval in tree.iter() {
+                        let m = &interval.metadata;
+                        let unified_query_id = match l2u.get(m.query_id() as usize) {
+                            Some(&id) if id != u32::MAX => id,
+                            _ => continue,
+                        };
+                        results.push(RawAlignmentInterval {
+                            target_start: interval.first,
+                            target_end: interval.last,
+                            query_id: unified_query_id,
+                            query_start: m.query_start(),
+                            query_end: m.query_end(),
+                            is_reverse: m.is_reverse_strand(),
+                        });
+                    }
+                    // Tree Arc dropped here — tree caching is disabled on the
+                    // transient Impg, so the underlying COITree is freed immediately.
+                }
+            }
+            // Impg Arc dropped here — the entire sub-index is released.
+        }
+        results
+    }
+
+    /// Transient variant of `query_raw_overlapping`. Same memory-bounding
+    /// rationale as `query_raw_intervals_transient`, using a coitree range query
+    /// instead of iterating every interval.
+    fn query_raw_overlapping_transient(
+        &self,
+        unified_target_id: u32,
+        start: i64,
+        end: i64,
+    ) -> Vec<RawAlignmentInterval> {
+        let locations = match self.forest_map.get(&unified_target_id) {
+            Some(locs) => locs,
+            None => return Vec::new(),
+        };
+
+        let mut by_index: FxHashMap<usize, Vec<u32>> = FxHashMap::default();
+        for loc in locations {
+            by_index
+                .entry(loc.index_idx)
+                .or_default()
+                .push(loc.local_target_id);
+        }
+
+        let mut results = Vec::new();
+        for (index_idx, local_target_ids) in by_index {
+            let impg = match self.load_sub_index_transient(index_idx) {
+                Ok(i) => i,
+                Err(e) => {
+                    warn!(
+                        "query_raw_overlapping_transient: failed to load sub-index {:?}: {}",
+                        self.index_paths[index_idx], e
+                    );
+                    continue;
+                }
+            };
+            let l2u = &self.local_to_unified[index_idx];
+            for local_target_id in local_target_ids {
+                if let Some(tree) = impg.get_or_load_tree(local_target_id) {
+                    tree.query(start, end, |interval| {
+                        let m = &interval.metadata;
+                        if let Some(&unified_query_id) = l2u.get(m.query_id() as usize) {
+                            if unified_query_id != u32::MAX {
+                                results.push(RawAlignmentInterval {
+                                    target_start: interval.first,
+                                    target_end: interval.last,
+                                    query_id: unified_query_id,
+                                    query_start: m.query_start(),
+                                    query_end: m.query_end(),
+                                    is_reverse: m.is_reverse_strand(),
+                                });
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        results
+    }
 }
 
 impl MultiImpg {
+    /// Number of sub-indices currently resident in the shared `sub_indices`
+    /// cache. Used by regression tests to assert that the transient query
+    /// variants do not populate the cache, and by occasional diagnostics to
+    /// report working-set size during long-running depth runs.
+    ///
+    /// **Do not call from hot paths.** This scans the entire `sub_indices`
+    /// vec under a read lock and is O(num_alignment_files). At per-file scale
+    /// (≥10⁴ files) the scan itself becomes non-trivial; one call per Phase 1
+    /// iteration across 64 rayon workers would serialize everyone on the
+    /// read lock and contend with the slow-path `get_sub_index` writers.
+    pub fn loaded_sub_index_count(&self) -> usize {
+        self.sub_indices
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|s| s.is_some())
+            .count()
+    }
+
     /// Internal implementation of transitive queries.
     ///
     /// Matches the behavior of `Impg::query_transitive_dfs` and `Impg::query_transitive_bfs`,

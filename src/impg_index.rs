@@ -165,6 +165,40 @@ pub trait ImpgIndex: Send + Sync {
     /// Much more efficient than query_raw_intervals() when only a subset of intervals is needed (e.g., BFS).
     fn query_raw_overlapping(&self, target_id: u32, start: i64, end: i64) -> Vec<RawAlignmentInterval>;
 
+    /// Transient variant of `query_raw_intervals` that MUST NOT populate any
+    /// long-lived sub-index or tree cache. `MultiImpg` overrides this to load
+    /// each sub-index via `load_sub_index_transient` and drop it immediately
+    /// after walking its trees, so peak retained memory per call stays at one
+    /// sub-index + one tree regardless of `forest_map` breadth. The default
+    /// implementation delegates to `query_raw_intervals` (single `Impg` has
+    /// bounded per-file state and does not need the transient path).
+    ///
+    /// Required for the depth command's non-transitive Phase 1/2 hot paths
+    /// when running with `--index-mode per-file` and ≫ 10⁴ alignment files.
+    ///
+    /// Output order is **not** guaranteed to match `query_raw_intervals`: the
+    /// `MultiImpg` override groups locations by sub-index file and iterates the
+    /// group map, which for `FxHashMap` is non-deterministic. Callers that need
+    /// a deterministic order must sort the result themselves (the depth command
+    /// already does so via `sort_unstable_by_key`).
+    fn query_raw_intervals_transient(&self, target_id: u32) -> Vec<RawAlignmentInterval> {
+        self.query_raw_intervals(target_id)
+    }
+
+    /// Transient variant of `query_raw_overlapping`. Same rationale as
+    /// `query_raw_intervals_transient`: `MultiImpg` overrides it to avoid
+    /// writing the sub-index/tree caches. Default delegates to the cached path.
+    ///
+    /// Output order is not guaranteed (see `query_raw_intervals_transient`).
+    fn query_raw_overlapping_transient(
+        &self,
+        target_id: u32,
+        start: i64,
+        end: i64,
+    ) -> Vec<RawAlignmentInterval> {
+        self.query_raw_overlapping(target_id, start, end)
+    }
+
     /// Pre-scan: for each unified target in `seq_included`, count unique OTHER samples
     /// directly aligned to it. Used by the depth command to auto-detect hub sequences.
     ///
@@ -548,6 +582,27 @@ impl ImpgIndex for ImpgWrapper {
         match self {
             ImpgWrapper::Single(impg) => impg.query_raw_overlapping(target_id, start, end),
             ImpgWrapper::Multi(multi) => multi.query_raw_overlapping(target_id, start, end),
+        }
+    }
+
+    fn query_raw_intervals_transient(&self, target_id: u32) -> Vec<RawAlignmentInterval> {
+        match self {
+            // Single Impg: no per-file sub-index cache, trait default (== cached path) is fine.
+            ImpgWrapper::Single(impg) => impg.query_raw_intervals_transient(target_id),
+            // MultiImpg: override that skips writing the sub-index/tree caches.
+            ImpgWrapper::Multi(multi) => multi.query_raw_intervals_transient(target_id),
+        }
+    }
+
+    fn query_raw_overlapping_transient(
+        &self,
+        target_id: u32,
+        start: i64,
+        end: i64,
+    ) -> Vec<RawAlignmentInterval> {
+        match self {
+            ImpgWrapper::Single(impg) => impg.query_raw_overlapping_transient(target_id, start, end),
+            ImpgWrapper::Multi(multi) => multi.query_raw_overlapping_transient(target_id, start, end),
         }
     }
 

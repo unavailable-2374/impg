@@ -2928,7 +2928,14 @@ pub fn compute_depth_global(
 
                     let sample_id = compact_lengths.get_sample_id(seq_id);
 
-                    let mut raw_alns = impg.query_raw_intervals(seq_id);
+                    // Transient load: MUST NOT populate MultiImpg::sub_indices. With
+                    // per-file indexing at ≥10⁴ files, every call to the cached
+                    // `query_raw_intervals` would pin one Arc<Impg> (and its cached
+                    // trees) per file visited, growing without bound across 59k+ hub
+                    // iterations until the process commit limit is hit. The transient
+                    // variant loads each sub-index through `load_sub_index_transient`
+                    // and drops it after walking its trees.
+                    let mut raw_alns = impg.query_raw_intervals_transient(seq_id);
                     if min_seq_length > 0 {
                         raw_alns.retain(|aln| {
                             seq_included
@@ -3020,9 +3027,13 @@ pub fn compute_depth_global(
 
             let sample_id = compact_lengths.get_sample_id(seq_id);
 
-            // Non-transitive: load raw intervals once per sequence (not per gap)
+            // Non-transitive: load raw intervals once per sequence (not per gap).
+            // Uses the transient variant for the same reason Phase 1 does — avoid
+            // pinning sub-indices across Phase 2 sequences, which would otherwise
+            // monotonically grow to `num_alignment_files × sub_index_size` and OOM
+            // at per-file scale ≥10⁴.
             let raw_alns_cached = if !is_transitive {
-                let mut raw_alns = impg.query_raw_intervals(seq_id);
+                let mut raw_alns = impg.query_raw_intervals_transient(seq_id);
                 if min_seq_length > 0 {
                     raw_alns.retain(|aln| {
                         seq_included
@@ -3045,8 +3056,12 @@ pub fn compute_depth_global(
                     // Fast path: gaps smaller than min_transitive_len can't trigger
                     // transitive hops, so BFS setup (visited_ranges allocation for all
                     // sequences, sub-index loading) is wasted. Use raw intervals instead.
+                    //
+                    // Transient variant: this fast path is reached for very many small
+                    // gaps in Phase 2, so we must avoid populating `sub_indices` here
+                    // for the same memory-bound reason as Phase 1.
                     if gap_len < config.min_transitive_len {
-                        let mut raw_alns = impg.query_raw_overlapping(
+                        let mut raw_alns = impg.query_raw_overlapping_transient(
                             seq_id,
                             region_start,
                             region_end,
@@ -3133,18 +3148,26 @@ pub fn compute_depth_global(
                 }
             }
 
-            // Phase 2: do NOT clear sub-index cache after each sequence.
-            // Unlike Phase 1 (which processes large hub regions and can accumulate many trees),
-            // Phase 2 sequences are mostly small/partially-processed. Keeping sub-indices loaded
-            // across sequences avoids repeated disk deserialization — the total memory is bounded
-            // by num_alignment_files × sub_index_size regardless of how many sequences we process.
+            // Phase 2 non-transitive path uses the transient query variants above
+            // (`query_raw_intervals_transient` / `query_raw_overlapping_transient`),
+            // which do not write MultiImpg::sub_indices or Impg::trees. No
+            // per-sequence clear is needed because nothing is cached in the first
+            // place. The transitive path below still relies on cached sub-indices
+            // (and will continue to) — see the post-loop clear for that case.
+            //
+            // History note: a prior design held sub-indices cached across Phase 2
+            // sequences on the rationale that peak memory was "bounded by
+            // num_alignment_files × sub_index_size". That bound is ~hundreds of GB
+            // at per-file indexing with ≥10⁴ files and is not acceptable on real
+            // hardware; hence the switch to the transient variants here.
             let count = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
             pb_depth.set_position(count as u64);
 
             Ok(())
         })?;
 
-    // Clear sub-index cache once after all Phase 2 processing
+    // Clear sub-index cache once after Phase 2 transitive processing.
+    // Non-transitive already uses transient queries and has nothing to clear.
     if is_transitive {
         impg.clear_sub_index_cache();
     }
