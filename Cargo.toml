@@ -11,10 +11,20 @@ name = "gfaffix"
 path = "vendor/gfaffix/src/main.rs"
 
 [dependencies]
-# Memory allocator: jemalloc handles multi-threaded alloc/free patterns far better than glibc malloc.
-# Without it, 128 threads doing rapid large alloc/free cycles (tree deserialization in BFS)
-# cause glibc ptmalloc arena fragmentation where RSS grows continuously.
-tikv-jemallocator = "0.6"
+# Memory allocator: jemalloc is the default because it generally handles
+# multi-threaded alloc/free patterns better than glibc ptmalloc in long-running
+# BFS-like workloads, where per-thread arena behavior reduces global allocator
+# lock contention.
+#
+# Tradeoff: jemalloc's per-arena chunked mmap model produces many more distinct
+# VMAs than glibc's sbrk-backed main arena. On hosts with a low
+# `vm.max_map_count` (Linux default 65530) and `impg depth` running against
+# ≥ 10⁴ per-file indices with 64+ threads, jemalloc can exhaust
+# `max_map_count` before the process is anywhere near its physical-memory
+# limit, causing small allocations to start failing. In that situation,
+# opt out with `--no-default-features --features system-alloc` — see the
+# commentary above `#[global_allocator]` in src/main.rs for the full rationale.
+tikv-jemallocator = { version = "0.6", optional = true }
 
 # Lightweight mutex implementation (1 byte vs std::sync::Mutex's 40+ bytes)
 # Used for ConcurrentProcessedTracker in depth command to reduce memory overhead
@@ -73,7 +83,13 @@ gfasort = { git = "https://github.com/pangenome/gfasort", rev = "b5fdb1d" }
 [dev-dependencies]
 
 [features]
-default = []
+default = ["jemalloc"]
+# Use the jemalloc global allocator (recommended for most workloads).
+jemalloc = ["dep:tikv-jemallocator"]
+# Use the system (glibc) allocator. Required on hosts with low
+# `vm.max_map_count` when running `impg depth` with ≥ 10⁴ per-file indices;
+# see src/main.rs for the full rationale.
+system-alloc = []
 
 # It can be removed once the ragc PR is merged and we switch both impg and sweepga to the same upstream rev
 [patch."https://github.com/ekg/ragc"]

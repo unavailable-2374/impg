@@ -1,5 +1,40 @@
+// Global allocator.
+//
+// Default: tikv-jemalloc. Handles multi-threaded alloc/free patterns far better
+// than glibc malloc and avoids ptmalloc arena fragmentation under heavy BFS.
+//
+// Opt-out: build with `--no-default-features --features system-alloc` to switch
+// to `std::alloc::System` (glibc). Needed on machines with a low
+// `vm.max_map_count` (default 65530 on Linux) when running `impg depth` with
+// per-file indexing at ≫ 10⁴ alignment files: jemalloc's per-arena mmap model
+// creates enough distinct VMAs under 64-thread Phase 1 fan-out to exhaust
+// `max_map_count`, whereas glibc keeps small allocations inside a single sbrk
+// heap segment and uses mmap only for blocks ≥ 128 KB, keeping the VMA count
+// well below the kernel limit.
+#[cfg(feature = "jemalloc")]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(feature = "system-alloc")]
+#[global_allocator]
+static GLOBAL: std::alloc::System = std::alloc::System;
+
+#[cfg(all(feature = "jemalloc", feature = "system-alloc"))]
+compile_error!(
+    "features `jemalloc` and `system-alloc` are mutually exclusive; \
+     build with one of `--features jemalloc` (default) or \
+     `--no-default-features --features system-alloc`"
+);
+
+// Guard against silent fallback when neither allocator feature is enabled.
+// Without this, `cargo build --no-default-features` would strip both
+// allocator statics and Rust would quietly use the implicit `System`
+// allocator — hiding which allocator is actually in use at runtime.
+#[cfg(not(any(feature = "jemalloc", feature = "system-alloc")))]
+compile_error!(
+    "no global allocator feature is enabled; pick exactly one of \
+     `--features jemalloc` (default) or `--no-default-features --features system-alloc`"
+);
 
 use clap::Parser;
 use coitrees::{Interval, IntervalTree};
