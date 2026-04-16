@@ -1256,6 +1256,269 @@ impl SparseDepthInterval {
     }
 }
 
+// ============================================================================
+// Streaming depth output pipeline
+// ============================================================================
+
+/// Streaming depth output pipeline.
+///
+/// Processes intervals one at a time through:
+///   sweep_line → window_split → merge → format/stats → buffered_write
+///
+/// This eliminates the O(K × N_samples) peak memory from collecting all
+/// SparseDepthIntervals into a Vec, reducing it to O(N_samples) per interval.
+struct StreamingDepthEmitter<'a> {
+    // ---- Output buffer with periodic flushing ----
+    buf: Vec<u8>,
+    writer: &'a Option<Mutex<BufWriter<Box<dyn Write + Send>>>>,
+
+    // ---- Formatting context ----
+    seq_name: &'a str,
+    anchor_sample_id: u16,
+    num_samples: usize,
+    seq_index: &'a crate::seqidx::SequenceIndex,
+    row_counter: &'a AtomicUsize,
+    intervals_counter: &'a AtomicUsize,
+    should_output: bool,
+
+    // ---- Stats accumulators (thread-local, merged into global at end) ----
+    stats_mode: bool,
+    local_stats: Option<DepthStats>,
+    local_combined: Option<DepthStatsWithSamples>,
+    sample_index: &'a SampleIndex,
+
+    // ---- Online merging state ----
+    merge_tolerance: f64,
+    merge_pending: Option<SparseDepthInterval>,
+    merge_min_depth: usize,
+    merge_max_depth: usize,
+
+    // ---- Windowing ----
+    window_size: Option<i64>,
+}
+
+impl<'a> StreamingDepthEmitter<'a> {
+    /// Process one interval from the sweep line through the full pipeline.
+    fn emit(&mut self, interval: SparseDepthInterval) {
+        if let Some(ws) = self.window_size {
+            self.split_and_forward(interval, ws);
+        } else {
+            self.forward_to_merge(interval);
+        }
+    }
+
+    /// Split an interval at window boundaries and forward each piece.
+    fn split_and_forward(&mut self, interval: SparseDepthInterval, window_size: i64) {
+        let mut pos = interval.start;
+        let interval_len = interval.end - interval.start;
+        while pos < interval.end {
+            let next_boundary = ((pos / window_size) + 1) * window_size;
+            let chunk_end = interval.end.min(next_boundary);
+            if pos >= chunk_end {
+                break;
+            }
+
+            let samples: Vec<SamplePosition> = interval
+                .samples
+                .iter()
+                .map(|&(sid, qid, qs, qe)| {
+                    if interval_len <= 0 {
+                        return (sid, qid, qs, qe);
+                    }
+                    let q_len = qe - qs;
+                    let frac_start = (pos - interval.start) as f64 / interval_len as f64;
+                    let frac_end = (chunk_end - interval.start) as f64 / interval_len as f64;
+                    let new_qs = qs + (frac_start * q_len as f64).round() as i64;
+                    let new_qe = qs + (frac_end * q_len as f64).round() as i64;
+                    (sid, qid, new_qs, new_qe)
+                })
+                .collect();
+
+            let chunk_frac = if interval_len > 0 {
+                (chunk_end - pos) as f64 / interval_len as f64
+            } else {
+                1.0
+            };
+            let chunk_pangenome_bases =
+                (interval.pangenome_bases as f64 * chunk_frac).round() as i64;
+
+            self.forward_to_merge(SparseDepthInterval {
+                start: pos,
+                end: chunk_end,
+                samples,
+                pangenome_bases: chunk_pangenome_bases,
+            });
+            pos = chunk_end;
+        }
+    }
+
+    /// Online merge stage: merge adjacent intervals with similar depth.
+    fn forward_to_merge(&mut self, interval: SparseDepthInterval) {
+        if self.merge_tolerance <= 0.0 {
+            self.emit_final(interval);
+            return;
+        }
+
+        if let Some(ref mut current) = self.merge_pending {
+            let new_depth = interval.depth();
+            let new_min = self.merge_min_depth.min(new_depth);
+            let new_max = self.merge_max_depth.max(new_depth);
+            let within_tolerance = if new_max == 0 {
+                true
+            } else {
+                (new_max - new_min) as f64 / new_max as f64 <= self.merge_tolerance
+            };
+
+            if interval.start == current.end && within_tolerance {
+                // Merge: extend end, union samples, update depth range
+                current.end = interval.end;
+                current.pangenome_bases += interval.pangenome_bases;
+                self.merge_min_depth = new_min;
+                self.merge_max_depth = new_max;
+
+                let mut sample_map: FxHashMap<u16, (u32, i64, i64)> = FxHashMap::default();
+                for (sid, qid, qs, qe) in current.samples.drain(..) {
+                    sample_map.insert(sid, (qid, qs, qe));
+                }
+                for (sid, qid, qs, qe) in interval.samples {
+                    sample_map
+                        .entry(sid)
+                        .and_modify(|e| {
+                            e.1 = e.1.min(qs);
+                            e.2 = e.2.max(qe);
+                        })
+                        .or_insert((qid, qs, qe));
+                }
+                current.samples = sample_map
+                    .into_iter()
+                    .map(|(sid, (qid, qs, qe))| (sid, qid, qs, qe))
+                    .collect();
+                current.samples.sort_by_key(|s| s.0);
+            } else {
+                // Emit pending, start new pending
+                let prev = self.merge_pending.take().unwrap();
+                self.emit_final(prev);
+                self.merge_min_depth = new_depth;
+                self.merge_max_depth = new_depth;
+                self.merge_pending = Some(interval);
+            }
+        } else {
+            let depth = interval.depth();
+            self.merge_min_depth = depth;
+            self.merge_max_depth = depth;
+            self.merge_pending = Some(interval);
+        }
+    }
+
+    /// Terminal stage: format the interval (TSV or stats) and buffer the output.
+    fn emit_final(&mut self, interval: SparseDepthInterval) {
+        if !self.should_output {
+            return;
+        }
+
+        if self.stats_mode {
+            let depth = interval.depth();
+            if let Some(ref mut ls) = self.local_stats {
+                ls.add_interval(
+                    self.seq_name,
+                    interval.start,
+                    interval.end,
+                    depth,
+                    interval.pangenome_bases,
+                );
+            }
+            if let Some(ref mut lc) = self.local_combined {
+                let sample_names: Vec<String> = interval
+                    .samples
+                    .iter()
+                    .filter_map(|&(sid, _, _, _)| {
+                        self.sample_index.get_name(sid).map(|s| s.to_string())
+                    })
+                    .collect();
+                lc.add_interval(
+                    self.seq_name,
+                    interval.start,
+                    interval.end,
+                    depth,
+                    sample_names,
+                    interval.pangenome_bases,
+                );
+            }
+        } else {
+            let rid = self.row_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            let _ = write!(
+                self.buf,
+                "{}\t{}\t{}",
+                rid,
+                interval.end - interval.start,
+                interval.depth()
+            );
+            for sid in 0..self.num_samples as u16 {
+                if sid == self.anchor_sample_id {
+                    let _ = write!(
+                        self.buf,
+                        "\t{}:{}-{}",
+                        self.seq_name, interval.start, interval.end
+                    );
+                } else if let Some((query_id, start, end)) = interval.get_sample(sid) {
+                    let query_name = self.seq_index.get_name(query_id).unwrap_or("?");
+                    let _ = write!(self.buf, "\t{}:{}-{}", query_name, start, end);
+                } else {
+                    let _ = write!(self.buf, "\tNA");
+                }
+            }
+            let _ = writeln!(self.buf);
+            self.intervals_counter.fetch_add(1, Ordering::Relaxed);
+
+            // Periodic flush to bound per-thread buffer memory
+            if self.buf.len() >= STREAMING_FLUSH_THRESHOLD {
+                if let Some(ref w) = self.writer {
+                    let _ = w.lock().write_all(&self.buf);
+                }
+                self.buf.clear();
+            }
+        }
+        // interval is DROPPED here — Vec<SamplePosition> freed immediately
+    }
+
+    /// Flush any pending merge state (between gaps within the same sequence).
+    fn flush_pending_merge(&mut self) {
+        if let Some(interval) = self.merge_pending.take() {
+            self.emit_final(interval);
+        }
+    }
+
+    /// Flush everything: pending merge, remaining buffer, return stats for merging.
+    fn flush(&mut self) -> io::Result<()> {
+        self.flush_pending_merge();
+        if !self.buf.is_empty() {
+            if let Some(ref w) = self.writer {
+                w.lock().write_all(&self.buf)?;
+            }
+            self.buf.clear();
+        }
+        Ok(())
+    }
+
+    /// Merge thread-local stats into global accumulators.
+    fn merge_stats_into(
+        self,
+        stats_accumulator: &Option<Mutex<DepthStats>>,
+        stats_combined_acc: &Option<Mutex<DepthStatsWithSamples>>,
+    ) {
+        if let Some(ls) = self.local_stats {
+            if let Some(ref acc) = stats_accumulator {
+                acc.lock().merge(&ls);
+            }
+        }
+        if let Some(lc) = self.local_combined {
+            if let Some(ref acc) = stats_combined_acc {
+                acc.lock().merge(lc);
+            }
+        }
+    }
+}
+
 /// Split intervals at fixed window boundaries.
 /// Each interval crossing a window edge is cut into pieces,
 /// with sample query coordinates proportionally adjusted.
@@ -2450,10 +2713,224 @@ fn sweep_line_depth(
     seq_intervals
 }
 
+/// Streaming variant of [`sweep_line_depth`]. Calls `emit` for each depth interval
+/// instead of collecting into a Vec. Peak memory is O(N_samples) per interval
+/// rather than O(K × N_samples) for the full result set.
+fn sweep_line_depth_streaming(
+    alignments: &[CompactAlignmentInfo],
+    num_samples: usize,
+    region_start: i64,
+    region_end: i64,
+    emit: &mut impl FnMut(SparseDepthInterval),
+) {
+    // Build sweep-line events
+    let mut events: Vec<CompactDepthEvent> = Vec::with_capacity(alignments.len() * 2);
+    for (idx, aln) in alignments.iter().enumerate() {
+        events.push(CompactDepthEvent {
+            position: aln.target_start,
+            is_start: true,
+            sample_id: aln.sample_id,
+            alignment_idx: idx,
+        });
+        events.push(CompactDepthEvent {
+            position: aln.target_end,
+            is_start: false,
+            sample_id: aln.sample_id,
+            alignment_idx: idx,
+        });
+    }
+    events.sort();
+
+    let mut active_bitmap = SampleBitmap::new(num_samples);
+    let mut active_alns: Vec<Vec<usize>> = vec![Vec::new(); num_samples];
+    let mut prev_pos: Option<i64> = None;
+
+    for event in events {
+        if let Some(prev) = prev_pos {
+            if event.position > prev && active_bitmap.depth() > 0 {
+                let clipped_start = prev.max(region_start);
+                let clipped_end = event.position.min(region_end);
+
+                if clipped_start < clipped_end {
+                    let mut samples: Vec<SamplePosition> = Vec::new();
+                    let mut pangenome_bases: i64 = 0;
+
+                    for sample_id in active_bitmap.active_samples() {
+                        let alns = &active_alns[sample_id as usize];
+                        let mut query_intervals_by_contig: FxHashMap<u32, Vec<(i64, i64)>> =
+                            FxHashMap::default();
+                        let mut best_idx: Option<usize> = None;
+                        let mut best_overlap: i64 = -1;
+
+                        for &idx in alns {
+                            let aln = &alignments[idx];
+                            let overlap_start = clipped_start.max(aln.target_start);
+                            let overlap_end = clipped_end.min(aln.target_end);
+                            let overlap = overlap_end - overlap_start;
+                            if overlap <= 0 {
+                                continue;
+                            }
+
+                            let (q_start, q_end) = map_target_to_query_linear(
+                                &[],
+                                aln.target_start,
+                                aln.target_end,
+                                aln.query_start,
+                                aln.query_end,
+                                clipped_start,
+                                clipped_end,
+                                aln.is_reverse,
+                            );
+                            query_intervals_by_contig
+                                .entry(aln.query_id)
+                                .or_default()
+                                .push((q_start, q_end));
+                            if overlap > best_overlap {
+                                best_overlap = overlap;
+                                best_idx = Some(idx);
+                            }
+                        }
+
+                        if let Some(idx) = best_idx {
+                            let aln = &alignments[idx];
+                            let (q_start, q_end) = map_target_to_query_linear(
+                                &[],
+                                aln.target_start,
+                                aln.target_end,
+                                aln.query_start,
+                                aln.query_end,
+                                clipped_start,
+                                clipped_end,
+                                aln.is_reverse,
+                            );
+                            samples.push((sample_id, aln.query_id, q_start, q_end));
+                        }
+
+                        for (_, intervals) in query_intervals_by_contig.iter_mut() {
+                            pangenome_bases += interval_union_length(intervals);
+                        }
+                    }
+
+                    if !samples.is_empty() {
+                        samples.sort_by_key(|s| s.0);
+                        emit(SparseDepthInterval {
+                            start: clipped_start,
+                            end: clipped_end,
+                            samples,
+                            pangenome_bases,
+                        });
+                    }
+                }
+            }
+        }
+
+        if event.is_start {
+            active_bitmap.add(event.sample_id);
+            active_alns[event.sample_id as usize].push(event.alignment_idx);
+        } else {
+            active_bitmap.remove(event.sample_id);
+            active_alns[event.sample_id as usize].retain(|&idx| idx != event.alignment_idx);
+        }
+        prev_pos = Some(event.position);
+    }
+}
+
+/// Streaming variant of [`process_anchor_region_raw`]. Returns only discovered_regions,
+/// streaming depth intervals through `emit` for immediate processing.
+fn process_anchor_region_raw_streaming(
+    raw_intervals: &[RawAlignmentInterval],
+    compact_lengths: &CompactSequenceLengths,
+    num_samples: usize,
+    anchor_seq_id: u32,
+    anchor_sample_id: u16,
+    region_start: i64,
+    region_end: i64,
+    emit: &mut impl FnMut(SparseDepthInterval),
+) -> Vec<(u32, i64, i64)> {
+    let mut discovered_regions: Vec<(u32, i64, i64)> = Vec::new();
+    discovered_regions.push((anchor_seq_id, region_start, region_end));
+
+    let mut alignments: Vec<CompactAlignmentInfo> = Vec::new();
+    alignments.push(CompactAlignmentInfo::new(
+        anchor_sample_id,
+        anchor_seq_id,
+        region_start,
+        region_end,
+        region_start,
+        region_end,
+        false,
+    ));
+
+    let end_idx = raw_intervals.partition_point(|aln| (aln.target_start as i64) < region_end);
+    for aln in &raw_intervals[..end_idx] {
+        let target_start = aln.target_start as i64;
+        let target_end = aln.target_end as i64;
+        if target_end <= region_start {
+            continue;
+        }
+
+        let query_sample_id = compact_lengths.get_sample_id(aln.query_id);
+        if is_self_alignment(
+            query_sample_id,
+            anchor_sample_id,
+            aln.query_id,
+            anchor_seq_id,
+        ) {
+            continue;
+        }
+
+        let query_start = aln.query_start as i64;
+        let query_end = aln.query_end as i64;
+        let clipped_target_start = target_start.max(region_start);
+        let clipped_target_end = target_end.min(region_end);
+        let target_len = target_end - target_start;
+        let query_len = query_end - query_start;
+        let ratio = if target_len > 0 {
+            query_len as f64 / target_len as f64
+        } else {
+            1.0
+        };
+
+        let (clipped_query_start, clipped_query_end) = if aln.is_reverse {
+            let cqe =
+                query_end - ((clipped_target_start - target_start) as f64 * ratio).round() as i64;
+            let cqs =
+                query_end - ((clipped_target_end - target_start) as f64 * ratio).round() as i64;
+            (cqs, cqe)
+        } else {
+            let cqs = query_start
+                + ((clipped_target_start - target_start) as f64 * ratio).round() as i64;
+            let cqe = query_start
+                + ((clipped_target_end - target_start) as f64 * ratio).round() as i64;
+            (cqs, cqe)
+        };
+
+        alignments.push(CompactAlignmentInfo::new(
+            query_sample_id,
+            aln.query_id,
+            clipped_query_start.min(clipped_query_end),
+            clipped_query_start.max(clipped_query_end),
+            clipped_target_start,
+            clipped_target_end,
+            aln.is_reverse,
+        ));
+        discovered_regions.push((aln.query_id, query_start, query_end));
+    }
+
+    sweep_line_depth_streaming(&alignments, num_samples, region_start, region_end, emit);
+
+    discovered_regions
+}
+
 /// Maximum region size for a single transitive BFS query (5 MB).
 /// Prevents BFS from visiting the entire pangenome when starting from a large chromosome.
 /// Non-transitive queries don't need this limit (they're O(log n) per lookup).
 const TRANSITIVE_CHUNK_SIZE: i64 = 5_000_000;
+
+/// Flush threshold for streaming depth output buffers (4 MB).
+/// Each thread accumulates TSV text up to this limit before acquiring the
+/// writer lock, balancing memory usage against lock contention.
+const STREAMING_FLUSH_THRESHOLD: usize = 4 * 1024 * 1024;
 
 /// Reference-free global depth computation.
 ///
@@ -2947,7 +3424,51 @@ pub fn compute_depth_global(
                     }
                     raw_alns.sort_unstable_by_key(|aln| aln.target_start);
 
-                    let result = process_anchor_region_raw(
+                    // Streaming path: process sweep-line intervals one at a time,
+                    // format and flush incrementally instead of collecting all
+                    // intervals into a Vec. Reduces peak memory from
+                    // O(K × N_samples) to O(N_samples) per interval.
+                    let seq_name = impg.seq_index().get_name(seq_id).unwrap_or("?");
+                    let should_output = if ref_only {
+                        ref_sample_id == Some(sample_id)
+                    } else {
+                        true
+                    };
+
+                    let mut emitter = StreamingDepthEmitter {
+                        buf: Vec::new(),
+                        writer: &writer,
+                        seq_name,
+                        anchor_sample_id: sample_id,
+                        num_samples,
+                        seq_index: impg.seq_index(),
+                        row_counter: &row_counter,
+                        intervals_counter: &intervals_counter,
+                        should_output,
+                        stats_mode,
+                        local_stats: if stats_accumulator.is_some() {
+                            Some(DepthStats::new())
+                        } else {
+                            None
+                        },
+                        local_combined: if stats_combined_acc.is_some() {
+                            Some(DepthStatsWithSamples::new())
+                        } else {
+                            None
+                        },
+                        sample_index: &sample_index,
+                        merge_tolerance,
+                        merge_pending: None,
+                        merge_min_depth: 0,
+                        merge_max_depth: 0,
+                        window_size: if user_window_size.is_some() {
+                            Some(window_size)
+                        } else {
+                            None
+                        },
+                    };
+
+                    let discovered = process_anchor_region_raw_streaming(
                         &raw_alns,
                         &compact_lengths,
                         num_samples,
@@ -2955,16 +3476,11 @@ pub fn compute_depth_global(
                         sample_id,
                         0,
                         seq_len,
+                        &mut |interval| emitter.emit(interval),
                     );
-                    tracker.mark_processed_batch(&result.discovered_regions);
-
-                    let mut buf: Vec<u8> = Vec::new();
-                    write_results(vec![result], &mut buf)?;
-                    if !buf.is_empty() {
-                        if let Some(ref w) = writer {
-                            w.lock().write_all(&buf)?;
-                        }
-                    }
+                    emitter.flush()?;
+                    tracker.mark_processed_batch(&discovered);
+                    emitter.merge_stats_into(&stats_accumulator, &stats_combined_acc);
 
                     let count = phase1_count.fetch_add(1, Ordering::Relaxed) + 1;
                     pb_phase1.set_position(count as u64);
@@ -3049,18 +3565,55 @@ pub fn compute_depth_global(
                 None
             };
 
+            // Streaming emitter for this sequence — shared across all gaps.
+            // Created once to avoid repeated allocation of stats accumulators.
+            let seq_name = impg.seq_index().get_name(seq_id).unwrap_or("?");
+            let should_output = if ref_only {
+                ref_sample_id == Some(sample_id)
+            } else {
+                true
+            };
+
+            let mut emitter = StreamingDepthEmitter {
+                buf: Vec::new(),
+                writer: &writer,
+                seq_name,
+                anchor_sample_id: sample_id,
+                num_samples,
+                seq_index: impg.seq_index(),
+                row_counter: &row_counter,
+                intervals_counter: &intervals_counter,
+                should_output,
+                stats_mode,
+                local_stats: if stats_accumulator.is_some() {
+                    Some(DepthStats::new())
+                } else {
+                    None
+                },
+                local_combined: if stats_combined_acc.is_some() {
+                    Some(DepthStatsWithSamples::new())
+                } else {
+                    None
+                },
+                sample_index: &sample_index,
+                merge_tolerance,
+                merge_pending: None,
+                merge_min_depth: 0,
+                merge_max_depth: 0,
+                window_size: if user_window_size.is_some() {
+                    Some(window_size)
+                } else {
+                    None
+                },
+            };
+
             for (region_start, region_end) in unprocessed {
-                let region_results = if is_transitive {
+                if is_transitive {
                     let gap_len = region_end - region_start;
 
-                    // Fast path: gaps smaller than min_transitive_len can't trigger
-                    // transitive hops, so BFS setup (visited_ranges allocation for all
-                    // sequences, sub-index loading) is wasted. Use raw intervals instead.
-                    //
-                    // Transient variant: this fast path is reached for very many small
-                    // gaps in Phase 2, so we must avoid populating `sub_indices` here
-                    // for the same memory-bound reason as Phase 1.
-                    if gap_len < config.min_transitive_len {
+                    // Transitive path: still uses the buffered write_results path.
+                    // Streaming optimization for transitive mode is a separate effort.
+                    let region_results = if gap_len < config.min_transitive_len {
                         let mut raw_alns = impg.query_raw_overlapping_transient(
                             seq_id,
                             region_start,
@@ -3123,9 +3676,19 @@ pub fn compute_depth_global(
                         );
                         tracker.mark_processed_batch(&result.discovered_regions);
                         vec![result]
+                    };
+
+                    // Format output into thread-local buffer, then write atomically
+                    let mut buf: Vec<u8> = Vec::new();
+                    write_results(region_results, &mut buf)?;
+                    if !buf.is_empty() {
+                        if let Some(ref w) = writer {
+                            w.lock().write_all(&buf)?;
+                        }
                     }
                 } else {
-                    let result = process_anchor_region_raw(
+                    // Non-transitive streaming path: emit intervals one at a time
+                    let discovered = process_anchor_region_raw_streaming(
                         raw_alns_cached.as_ref().unwrap(),
                         &compact_lengths,
                         num_samples,
@@ -3133,20 +3696,17 @@ pub fn compute_depth_global(
                         sample_id,
                         region_start,
                         region_end,
+                        &mut |interval| emitter.emit(interval),
                     );
-                    tracker.mark_processed_batch(&result.discovered_regions);
-                    vec![result]
-                };
-
-                // Format output into thread-local buffer, then write atomically
-                let mut buf: Vec<u8> = Vec::new();
-                write_results(region_results, &mut buf)?;
-                if !buf.is_empty() {
-                    if let Some(ref w) = writer {
-                        w.lock().write_all(&buf)?;
-                    }
+                    // Flush merge state between gaps (each gap is independent)
+                    emitter.flush_pending_merge();
+                    tracker.mark_processed_batch(&discovered);
                 }
             }
+
+            // Flush remaining output buffer and merge stats
+            emitter.flush()?;
+            emitter.merge_stats_into(&stats_accumulator, &stats_combined_acc);
 
             // Phase 2 non-transitive path uses the transient query variants above
             // (`query_raw_intervals_transient` / `query_raw_overlapping_transient`),
