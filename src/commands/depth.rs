@@ -1469,9 +1469,13 @@ fn merge_short_intervals(
             if let Some(left) = result.last_mut() {
                 left.end = interval.end;
                 left.pangenome_bases += interval.pangenome_bases;
-                // Union samples from absorbed interval
+                // Union samples: extend existing positions, add new samples
                 for sp in interval.samples {
-                    if !left.samples.iter().any(|s| s.0 == sp.0) {
+                    if let Some(existing) = left.samples.iter_mut().find(|s| s.0 == sp.0) {
+                        // Extend the position range to cover the absorbed interval's coords
+                        existing.2 = existing.2.min(sp.2);
+                        existing.3 = existing.3.max(sp.3);
+                    } else {
                         left.samples.push(sp);
                     }
                 }
@@ -1497,7 +1501,10 @@ fn merge_short_intervals(
             result[b].start = new_start;
             result[b].pangenome_bases += extra_pb;
             for sp in absorbed_samples {
-                if !result[b].samples.iter().any(|s| s.0 == sp.0) {
+                if let Some(existing) = result[b].samples.iter_mut().find(|s| s.0 == sp.0) {
+                    existing.2 = existing.2.min(sp.2);
+                    existing.3 = existing.3.max(sp.3);
+                } else {
                     result[b].samples.push(sp);
                 }
             }
