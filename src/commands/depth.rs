@@ -758,6 +758,13 @@ impl CompactSequenceLengths {
         // Build sample index
         let mut sorted_samples: Vec<_> = sample_names.into_iter().collect();
         sorted_samples.sort();
+        if sorted_samples.len() > u16::MAX as usize {
+            panic!(
+                "Too many samples ({}) — the depth command supports at most {} distinct samples",
+                sorted_samples.len(),
+                u16::MAX
+            );
+        }
         let mut name_to_id = FxHashMap::default();
         let mut id_to_name = Vec::with_capacity(sorted_samples.len());
         for (i, sample) in sorted_samples.into_iter().enumerate() {
@@ -1453,21 +1460,11 @@ impl<'a> StreamingDepthEmitter<'a> {
                 interval.end - interval.start,
                 interval.depth()
             );
-            for sid in 0..self.num_samples as u16 {
-                if sid == self.anchor_sample_id {
-                    let _ = write!(
-                        self.buf,
-                        "\t{}:{}-{}",
-                        self.seq_name, interval.start, interval.end
-                    );
-                } else if let Some((query_id, start, end)) = interval.get_sample(sid) {
-                    let query_name = self.seq_index.get_name(query_id).unwrap_or("?");
-                    let _ = write!(self.buf, "\t{}:{}-{}", query_name, start, end);
-                } else {
-                    let _ = write!(self.buf, "\tNA");
-                }
-            }
-            let _ = writeln!(self.buf);
+            let _ = writeln!(
+                self.buf,
+                "\t{}:{}-{}",
+                self.seq_name, interval.start, interval.end
+            );
             self.intervals_counter.fetch_add(1, Ordering::Relaxed);
 
             // Periodic flush to bound per-thread buffer memory
@@ -3092,14 +3089,8 @@ pub fn compute_depth_global(
         };
         let mut w = BufWriter::new(inner_writer);
 
-        // Write header: #id length depth Sample1 Sample2 ...
-        write!(w, "#id\tlength\tdepth")?;
-        for sample_id in 0..num_samples as u16 {
-            if let Some(name) = sample_index.get_name(sample_id) {
-                write!(w, "\t{}", name)?;
-            }
-        }
-        writeln!(w)?;
+        // Write header: #id length depth position
+        writeln!(w, "#id\tlength\tdepth\tposition")?;
         Some(Mutex::new(w))
     } else {
         None
@@ -3267,17 +3258,7 @@ pub fn compute_depth_global(
                         interval.depth()
                     )?;
 
-                    for sid in 0..num_samples as u16 {
-                        if sid == anchor_sample_id {
-                            write!(buf, "\t{}:{}-{}", seq_name, interval.start, interval.end)?;
-                        } else if let Some((query_id, start, end)) = interval.get_sample(sid) {
-                            let query_name = impg.seq_index().get_name(query_id).unwrap_or("?");
-                            write!(buf, "\t{}:{}-{}", query_name, start, end)?;
-                        } else {
-                            write!(buf, "\tNA")?;
-                        }
-                    }
-                    writeln!(buf)?;
+                    writeln!(buf, "\t{}:{}-{}", seq_name, interval.start, interval.end)?;
 
                     intervals_counter.fetch_add(1, Ordering::Relaxed);
                 }
@@ -3365,8 +3346,6 @@ pub fn compute_depth_global(
                         }
                     }
 
-                    impg.clear_sub_index_cache();
-
                     let count = phase1_count.fetch_add(1, Ordering::Relaxed) + 1;
                     pb_phase1.set_position(count as u64);
 
@@ -3374,6 +3353,10 @@ pub fn compute_depth_global(
                 },
             )?;
 
+            // Clear sub-index cache once after all Phase 1 chunks complete, not per-chunk.
+            // Clearing inside the parallel loop races with other workers that may still hold
+            // the same sub-index Arc, causing redundant reloads and higher peak memory.
+            impg.clear_sub_index_cache();
             pb_phase1.finish_and_clear();
         } else {
             // Non-transitive mode: sequence-level parallelism.
@@ -4399,38 +4382,61 @@ pub fn query_region_depth(
         }
     }
 
-    // Reverse direction: where target_seq is QUERY
-    let reverse_alignments = impg.query_reverse_for_depth(target_id);
-    for (ref_start, ref_end, other_id) in reverse_alignments {
-        // Check if overlaps with query region
-        if ref_end <= target_start || ref_start >= target_end {
-            continue;
-        }
-
-        if let Some(other_name) = impg.seq_index().get_name(other_id) {
-            let sample = extract_sample(other_name, separator);
-
-            // Skip self
-            if sample == target_sample {
+    // Reverse direction: where target_seq is QUERY.
+    // Only needed for V1 (unidirectional) indices — V2 bidirectional indices already
+    // include reverse-direction entries in every tree, so query_raw_overlapping /
+    // query_transitive_bfs above has already captured them.
+    if !impg.is_bidirectional() {
+        let reverse_alignments = impg.query_reverse_for_depth(target_id);
+        for (ref_start, ref_end, other_t_start, other_t_end, other_id) in reverse_alignments {
+            // Check if our sequence's interval overlaps with query region
+            if ref_end <= target_start || ref_start >= target_end {
                 continue;
             }
 
-            // Apply sample filter
-            if let Some(filter) = sample_filter {
-                if !filter.includes(&sample) {
+            if let Some(other_name) = impg.seq_index().get_name(other_id) {
+                let sample = extract_sample(other_name, separator);
+
+                // Skip self
+                if sample == target_sample {
                     continue;
                 }
-            }
 
-            alignments.push(AlignmentInfoMulti {
-                sample,
-                query_name: other_name.to_string(),
-                query_start: ref_start as i64,
-                query_end: ref_end as i64,
-                target_start: ref_start as i64,
-                target_end: ref_end as i64,
-                is_reverse: false,
-            });
+                // Apply sample filter
+                if let Some(filter) = sample_filter {
+                    if !filter.includes(&sample) {
+                        continue;
+                    }
+                }
+
+                // Clip our-sequence coordinates to the queried region
+                let clipped_ref_start = ref_start.max(target_start);
+                let clipped_ref_end = ref_end.min(target_end);
+
+                // Proportionally clip the other sequence's coordinates
+                let our_len = ref_end - ref_start;
+                let other_len = other_t_end - other_t_start;
+                let (clipped_other_start, clipped_other_end) = if our_len > 0 {
+                    let ratio = other_len as f64 / our_len as f64;
+                    let cs = other_t_start
+                        + ((clipped_ref_start - ref_start) as f64 * ratio).round() as i64;
+                    let ce = other_t_start
+                        + ((clipped_ref_end - ref_start) as f64 * ratio).round() as i64;
+                    (cs.min(ce), cs.max(ce))
+                } else {
+                    (other_t_start, other_t_end)
+                };
+
+                alignments.push(AlignmentInfoMulti {
+                    sample,
+                    query_name: other_name.to_string(),
+                    query_start: clipped_other_start,
+                    query_end: clipped_other_end,
+                    target_start: clipped_ref_start,
+                    target_end: clipped_ref_end,
+                    is_reverse: false,
+                });
+            }
         }
     }
 
