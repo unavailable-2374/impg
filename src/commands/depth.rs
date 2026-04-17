@@ -1004,6 +1004,39 @@ fn map_target_to_query_linear(
     }
 }
 
+/// Map query sub-range [q_start, q_end] back to target coordinates using linear interpolation.
+/// Inverse of the target→query mapping used in sweep construction.
+#[inline]
+fn inverse_map_query_to_target(
+    aln_target_start: i64,
+    aln_target_end: i64,
+    aln_query_start: i64,
+    aln_query_end: i64,
+    q_start: i64,
+    q_end: i64,
+    is_reverse: bool,
+) -> (i64, i64) {
+    let target_len = aln_target_end - aln_target_start;
+    let query_len = aln_query_end - aln_query_start;
+    if query_len == 0 {
+        return (aln_target_start, aln_target_end);
+    }
+    let ratio = target_len as f64 / query_len as f64;
+    if is_reverse {
+        let end_off = aln_query_end - q_start;
+        let start_off = aln_query_end - q_end;
+        let t_start = aln_target_start + (start_off as f64 * ratio).round() as i64;
+        let t_end = aln_target_start + (end_off as f64 * ratio).round() as i64;
+        (t_start.min(t_end).max(aln_target_start), t_start.max(t_end).min(aln_target_end))
+    } else {
+        let start_off = q_start - aln_query_start;
+        let end_off = q_end - aln_query_start;
+        let t_start = aln_target_start + (start_off as f64 * ratio).round() as i64;
+        let t_end = aln_target_start + (end_off as f64 * ratio).round() as i64;
+        (t_start.min(t_end).max(aln_target_start), t_start.max(t_end).min(aln_target_end))
+    }
+}
+
 /// Extract sample from PanSN format sequence name (sample#haplotype#chr -> sample)
 pub fn extract_sample(seq_name: &str, separator: &str) -> String {
     let parts: Vec<&str> = seq_name.split(separator).collect();
@@ -1283,11 +1316,17 @@ impl<'a> StreamingDepthEmitter<'a> {
                 interval.end - interval.start,
                 interval.depth()
             );
-            let _ = writeln!(
-                self.buf,
-                "\t{}:{}-{}",
-                self.seq_name, interval.start, interval.end
-            );
+            // Anchor position first
+            let _ = write!(self.buf, "\t{}:{}-{}", self.seq_name, interval.start, interval.end);
+            // Then other samples (non-anchor) sorted by sample_id
+            for &(sid, query_id, q_start, q_end) in &interval.samples {
+                if sid != self.anchor_sample_id {
+                    if let Some(name) = self.seq_index.get_name(query_id) {
+                        let _ = write!(self.buf, ";{}:{}-{}", name, q_start, q_end);
+                    }
+                }
+            }
+            let _ = writeln!(self.buf);
             self.intervals_counter.fetch_add(1, Ordering::Relaxed);
 
             // Periodic flush to bound per-thread buffer memory
@@ -1430,6 +1469,13 @@ fn merge_short_intervals(
             if let Some(left) = result.last_mut() {
                 left.end = interval.end;
                 left.pangenome_bases += interval.pangenome_bases;
+                // Union samples from absorbed interval
+                for sp in interval.samples {
+                    if !left.samples.iter().any(|s| s.0 == sp.0) {
+                        left.samples.push(sp);
+                    }
+                }
+                left.samples.sort_by_key(|s| s.0);
                 continue;
             }
             // No left neighbor yet — fall through; pass 2 will absorb into right.
@@ -1443,8 +1489,19 @@ fn merge_short_intervals(
         if b > 0 {
             let extra_pb: i64 = result[..b].iter().map(|iv| iv.pangenome_bases).sum();
             let new_start = result[0].start;
+            // Union samples from all absorbed leading intervals into result[b]
+            let absorbed_samples: Vec<SamplePosition> = result[..b]
+                .iter()
+                .flat_map(|iv| iv.samples.iter().copied())
+                .collect();
             result[b].start = new_start;
             result[b].pangenome_bases += extra_pb;
+            for sp in absorbed_samples {
+                if !result[b].samples.iter().any(|s| s.0 == sp.0) {
+                    result[b].samples.push(sp);
+                }
+            }
+            result[b].samples.sort_by_key(|s| s.0);
             result.drain(..b);
         }
     }
@@ -1554,6 +1611,26 @@ impl ConcurrentProcessedTracker {
         for &(seq_id, start, end) in regions {
             self.mark_processed(seq_id, start, end);
         }
+    }
+
+    /// Atomically claim unprocessed ranges within [start, end): returns what was claimed and marks it processed.
+    fn claim_unprocessed(&self, seq_id: u32, start: i64, end: i64) -> Vec<(i64, i64)> {
+        let mut lock = self.processed[seq_id as usize].lock();
+        let unprocessed = if lock.is_empty() {
+            vec![(start, end)]
+        } else {
+            let mut result = IntervalSet::new_single(start, end);
+            for &(s, e) in lock.intervals() {
+                if s >= end { break; }
+                if e <= start { continue; }
+                result.subtract(s, e);
+            }
+            result.intervals().to_vec()
+        };
+        for &(s, e) in &unprocessed {
+            lock.add(s, e);
+        }
+        unprocessed
     }
 }
 
@@ -2118,6 +2195,7 @@ fn process_anchor_region_raw(
     anchor_sample_id: u16,
     region_start: i64,
     region_end: i64,
+    global_used: &ConcurrentProcessedTracker,
 ) -> AnchorRegionResult {
     let mut discovered_regions: Vec<(u32, i64, i64)> = Vec::new();
     discovered_regions.push((anchor_seq_id, region_start, region_end));
@@ -2175,32 +2253,50 @@ fn process_anchor_region_raw(
             1.0
         };
 
-        let (clipped_query_start, clipped_query_end) = if aln.is_reverse {
+        // Compute clipped query range
+        let (cq_start, cq_end) = if aln.is_reverse {
             let cqe =
                 query_end - ((clipped_target_start - target_start) as f64 * ratio).round() as i64;
             let cqs =
                 query_end - ((clipped_target_end - target_start) as f64 * ratio).round() as i64;
-            (cqs, cqe)
+            (cqs.min(cqe), cqs.max(cqe))
         } else {
             let cqs =
                 query_start + ((clipped_target_start - target_start) as f64 * ratio).round() as i64;
             let cqe =
                 query_start + ((clipped_target_end - target_start) as f64 * ratio).round() as i64;
-            (cqs, cqe)
+            (cqs.min(cqe), cqs.max(cqe))
         };
 
-        alignments.push(CompactAlignmentInfo::new(
-            query_sample_id,
-            aln.query_id,
-            clipped_query_start.min(clipped_query_end),
-            clipped_query_start.max(clipped_query_end),
-            clipped_target_start,
-            clipped_target_end,
-            aln.is_reverse,
-        ));
+        // Atomically claim unconsumed sub-ranges of this query sequence
+        let claimed = global_used.claim_unprocessed(aln.query_id, cq_start, cq_end);
+        if claimed.is_empty() {
+            continue;
+        }
 
-        // Record discovered query region
-        discovered_regions.push((aln.query_id, query_start, query_end));
+        // Record discovered region using clipped coords
+        discovered_regions.push((aln.query_id, cq_start, cq_end));
+
+        for (uq_start, uq_end) in claimed {
+            let (ut_start, ut_end) = inverse_map_query_to_target(
+                target_start, target_end,
+                query_start, query_end,
+                uq_start, uq_end,
+                aln.is_reverse,
+            );
+            if ut_start >= ut_end {
+                continue;
+            }
+            alignments.push(CompactAlignmentInfo::new(
+                query_sample_id,
+                aln.query_id,
+                uq_start,
+                uq_end,
+                ut_start.max(region_start),
+                ut_end.min(region_end),
+                aln.is_reverse,
+            ));
+        }
     }
 
     // Sweep-line to compute depth intervals
@@ -2702,6 +2798,7 @@ fn process_anchor_region_raw_streaming(
     anchor_sample_id: u16,
     region_start: i64,
     region_end: i64,
+    global_used: &ConcurrentProcessedTracker,
     emit: &mut impl FnMut(SparseDepthInterval),
 ) -> Vec<(u32, i64, i64)> {
     let mut discovered_regions: Vec<(u32, i64, i64)> = Vec::new();
@@ -2748,30 +2845,50 @@ fn process_anchor_region_raw_streaming(
             1.0
         };
 
-        let (clipped_query_start, clipped_query_end) = if aln.is_reverse {
+        // Compute clipped query range
+        let (cq_start, cq_end) = if aln.is_reverse {
             let cqe =
                 query_end - ((clipped_target_start - target_start) as f64 * ratio).round() as i64;
             let cqs =
                 query_end - ((clipped_target_end - target_start) as f64 * ratio).round() as i64;
-            (cqs, cqe)
+            (cqs.min(cqe), cqs.max(cqe))
         } else {
             let cqs = query_start
                 + ((clipped_target_start - target_start) as f64 * ratio).round() as i64;
             let cqe = query_start
                 + ((clipped_target_end - target_start) as f64 * ratio).round() as i64;
-            (cqs, cqe)
+            (cqs.min(cqe), cqs.max(cqe))
         };
 
-        alignments.push(CompactAlignmentInfo::new(
-            query_sample_id,
-            aln.query_id,
-            clipped_query_start.min(clipped_query_end),
-            clipped_query_start.max(clipped_query_end),
-            clipped_target_start,
-            clipped_target_end,
-            aln.is_reverse,
-        ));
-        discovered_regions.push((aln.query_id, query_start, query_end));
+        // Atomically claim unconsumed sub-ranges of this query sequence
+        let claimed = global_used.claim_unprocessed(aln.query_id, cq_start, cq_end);
+        if claimed.is_empty() {
+            continue;
+        }
+
+        // Record discovered region using clipped coords
+        discovered_regions.push((aln.query_id, cq_start, cq_end));
+
+        for (uq_start, uq_end) in claimed {
+            let (ut_start, ut_end) = inverse_map_query_to_target(
+                target_start, target_end,
+                query_start, query_end,
+                uq_start, uq_end,
+                aln.is_reverse,
+            );
+            if ut_start >= ut_end {
+                continue;
+            }
+            alignments.push(CompactAlignmentInfo::new(
+                query_sample_id,
+                aln.query_id,
+                uq_start,
+                uq_end,
+                ut_start.max(region_start),
+                ut_end.min(region_end),
+                aln.is_reverse,
+            ));
+        }
     }
 
     sweep_line_depth_streaming(&alignments, num_samples, region_start, region_end, emit);
@@ -2949,8 +3066,8 @@ pub fn compute_depth_global(
         };
         let mut w = BufWriter::new(inner_writer);
 
-        // Write header: #id length depth position
-        writeln!(w, "#id\tlength\tdepth\tposition")?;
+        // Write header: #id length depth positions
+        writeln!(w, "#id\tlength\tdepth\tpositions")?;
         Some(Mutex::new(w))
     } else {
         None
@@ -2977,6 +3094,7 @@ pub fn compute_depth_global(
     impg.set_tree_cache_enabled(true);
 
     let tracker = ConcurrentProcessedTracker::new(num_sequences);
+    let global_used = std::sync::Arc::new(ConcurrentProcessedTracker::new(num_sequences));
 
     // =========================================================================
     // Two-phase parallel processing with hub-first guarantee.
@@ -3114,7 +3232,17 @@ pub fn compute_depth_global(
                         interval.depth()
                     )?;
 
-                    writeln!(buf, "\t{}:{}-{}", seq_name, interval.start, interval.end)?;
+                    // Anchor position first
+                    write!(buf, "\t{}:{}-{}", seq_name, interval.start, interval.end)?;
+                    // Then other samples (non-anchor) sorted by sample_id
+                    for &(sid, query_id, q_start, q_end) in &interval.samples {
+                        if sid != anchor_sample_id {
+                            if let Some(name) = impg.seq_index().get_name(query_id) {
+                                write!(buf, ";{}:{}-{}", name, q_start, q_end)?;
+                            }
+                        }
+                    }
+                    writeln!(buf)?;
 
                     intervals_counter.fetch_add(1, Ordering::Relaxed);
                 }
@@ -3313,6 +3441,7 @@ pub fn compute_depth_global(
                         sample_id,
                         0,
                         seq_len,
+                        &global_used,
                         &mut |interval| emitter.emit(interval),
                     );
                     emitter.flush()?;
@@ -3328,10 +3457,12 @@ pub fn compute_depth_global(
             pb_phase1.finish_and_clear();
         }
 
-        // Mark all Phase 1 sequences as fully processed in the tracker
+        // Mark all Phase 1 sequences as fully processed in both trackers.
+        // global_used prevents Phase 2 from double-counting bases already counted as anchor.
         for &seq_id in &phase1_seqs {
             let seq_len = compact_lengths.get_length(seq_id);
             tracker.mark_processed(seq_id, 0, seq_len);
+            global_used.mark_processed(seq_id, 0, seq_len);
         }
 
         processed_count.store(phase1_seqs.len(), Ordering::Relaxed);
@@ -3471,6 +3602,7 @@ pub fn compute_depth_global(
                             sample_id,
                             region_start,
                             region_end,
+                            &global_used,
                         );
                         tracker.mark_processed_batch(&result.discovered_regions);
                         vec![result]
@@ -3531,6 +3663,7 @@ pub fn compute_depth_global(
                         sample_id,
                         region_start,
                         region_end,
+                        &global_used,
                         &mut |interval| emitter.emit(interval),
                     );
                     // Flush merge state between gaps (each gap is independent)
