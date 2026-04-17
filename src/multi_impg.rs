@@ -89,10 +89,12 @@ pub struct MultiImpgCache {
     unified_forest_map: Vec<(u32, Vec<TreeLocationSer>)>,
     /// Local-to-unified translation tables per index
     local_to_unified: Vec<Vec<u32>>,
+    /// Whether all sub-indices are bidirectional (V2 format)
+    is_bidirectional: bool,
 }
 
 const CACHE_MAGIC: &[u8; 10] = b"MIMPGCACH1";
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2; // bumped: added is_bidirectional field
 
 /// Metadata loaded from a per-file index header (seq_index + forest_map only).
 struct IndexHeader {
@@ -336,9 +338,6 @@ impl MultiImpg {
             forest_map.len()
         );
 
-        // Note: When loading from cache, we assume bidirectional=true since
-        // caches are only created for new-format indices. If users have
-        // V1 indices, the cache will be invalidated and rebuilt.
         Ok(Self {
             seq_index: cache.unified_seq_index,
             forest_map,
@@ -347,7 +346,7 @@ impl MultiImpg {
             sequence_files: sequence_files.map(|s| s.to_vec()).unwrap_or_default(),
             local_to_unified: cache.local_to_unified,
             sub_indices: RwLock::new(vec![None; num_indices]),
-            is_bidirectional: true,
+            is_bidirectional: cache.is_bidirectional,
             tree_cache_enabled: std::sync::atomic::AtomicBool::new(true),
         })
     }
@@ -387,6 +386,7 @@ impl MultiImpg {
             unified_seq_index: self.seq_index.clone(),
             unified_forest_map,
             local_to_unified: self.local_to_unified.clone(),
+            is_bidirectional: self.is_bidirectional,
         };
 
         let file = File::create(cache_path)?;
@@ -851,7 +851,7 @@ impl ImpgIndex for MultiImpg {
         &self.sequence_files
     }
 
-    fn query_reverse_for_depth(&self, query_id: u32) -> Vec<(i64, i64, u32)> {
+    fn query_reverse_for_depth(&self, query_id: u32) -> Vec<(i64, i64, i64, i64, u32)> {
         let mut results = Vec::new();
 
         // Iterate through all target_ids in the forest map
@@ -866,7 +866,9 @@ impl ImpgIndex for MultiImpg {
                     if interval.metadata.query_id() == query_id {
                         let query_start = interval.metadata.query_start();
                         let query_end = interval.metadata.query_end();
-                        results.push((query_start, query_end, target_id));
+                        let target_start = interval.first as i64;
+                        let target_end = interval.last as i64;
+                        results.push((query_start, query_end, target_start, target_end, target_id));
                     }
                 }
             }
@@ -900,7 +902,7 @@ impl ImpgIndex for MultiImpg {
         &self,
         query_id: u32,
         query_to_targets: &FxHashMap<u32, Vec<u32>>,
-    ) -> Vec<(i64, i64, u32)> {
+    ) -> Vec<(i64, i64, i64, i64, u32)> {
         let mut results = Vec::new();
 
         if let Some(target_ids) = query_to_targets.get(&query_id) {
@@ -910,7 +912,9 @@ impl ImpgIndex for MultiImpg {
                         if interval.metadata.query_id() == query_id {
                             let query_start = interval.metadata.query_start();
                             let query_end = interval.metadata.query_end();
-                            results.push((query_start, query_end, target_id));
+                            let target_start = interval.first as i64;
+                            let target_end = interval.last as i64;
+                            results.push((query_start, query_end, target_start, target_end, target_id));
                         }
                     }
                 }

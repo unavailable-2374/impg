@@ -124,8 +124,11 @@ pub trait ImpgIndex: Send + Sync {
     fn sequence_files(&self) -> &[String];
 
     /// Query alignments where the specified sequence is the QUERY (reverse direction).
-    /// Returns: Vec of (query_start, query_end, target_id) tuples
-    fn query_reverse_for_depth(&self, query_id: u32) -> Vec<(i64, i64, u32)>;
+    /// Returns: Vec of (our_q_start, our_q_end, other_t_start, other_t_end, other_seq_id)
+    /// - our_q_start/our_q_end: coordinates on our sequence (appears as query in the alignment)
+    /// - other_t_start/other_t_end: coordinates on the other sequence (appears as target)
+    /// - other_seq_id: the other sequence's unified ID
+    fn query_reverse_for_depth(&self, query_id: u32) -> Vec<(i64, i64, i64, i64, u32)>;
 
     /// Build a lightweight reverse index: query_id -> [target_ids that have alignments with this query]
     fn build_query_to_targets_map(&self) -> FxHashMap<u32, Vec<u32>>;
@@ -135,7 +138,7 @@ pub trait ImpgIndex: Send + Sync {
         &self,
         query_id: u32,
         query_to_targets: &FxHashMap<u32, Vec<u32>>,
-    ) -> Vec<(i64, i64, u32)>;
+    ) -> Vec<(i64, i64, i64, i64, u32)>;
 
     /// Clear tree cache to free memory.
     fn clear_tree_cache(&self);
@@ -518,7 +521,7 @@ impl ImpgIndex for ImpgWrapper {
         }
     }
 
-    fn query_reverse_for_depth(&self, query_id: u32) -> Vec<(i64, i64, u32)> {
+    fn query_reverse_for_depth(&self, query_id: u32) -> Vec<(i64, i64, i64, i64, u32)> {
         match self {
             ImpgWrapper::Single(impg) => impg.query_reverse_for_depth(query_id),
             ImpgWrapper::Multi(multi) => multi.query_reverse_for_depth(query_id),
@@ -536,7 +539,7 @@ impl ImpgIndex for ImpgWrapper {
         &self,
         query_id: u32,
         query_to_targets: &FxHashMap<u32, Vec<u32>>,
-    ) -> Vec<(i64, i64, u32)> {
+    ) -> Vec<(i64, i64, i64, i64, u32)> {
         match self {
             ImpgWrapper::Single(impg) => impg.query_reverse_for_depth_with_map(query_id, query_to_targets),
             ImpgWrapper::Multi(multi) => multi.query_reverse_for_depth_with_map(query_id, query_to_targets),

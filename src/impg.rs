@@ -437,6 +437,10 @@ pub struct Impg {
     /// This bounds memory usage for commands like `depth` where transitive BFS
     /// would otherwise cache all trees simultaneously.
     tree_cache_enabled: std::sync::atomic::AtomicBool,
+    /// True iff this index was built in bidirectional mode (IMPGIDX2 format).
+    /// V1 indices only store forward-direction entries; depth queries on V1
+    /// must scan the reverse direction separately.
+    is_bidirectional: bool,
 }
 
 impl Impg {
@@ -1708,6 +1712,7 @@ impl Impg {
             sequence_files: sequence_files.map(|s| s.to_vec()).unwrap_or_default(),
             trace_spacing_cache: RwLock::new(vec![None; num_files]),
             tree_cache_enabled: std::sync::atomic::AtomicBool::new(true),
+            is_bidirectional: true, // new() always produces a V2 (bidirectional) index
         })
     }
 
@@ -1963,6 +1968,7 @@ impl Impg {
                 })?;
 
         let num_files = alignment_files.len();
+        let is_bidirectional = magic_buf == MAGIC_V2;
         Ok(Self {
             trees: RwLock::new(FxHashMap::default()),
             seq_index,
@@ -1972,6 +1978,7 @@ impl Impg {
             sequence_files: sequence_files.map(|s| s.to_vec()).unwrap_or_default(),
             trace_spacing_cache: RwLock::new(vec![None; num_files]),
             tree_cache_enabled: std::sync::atomic::AtomicBool::new(true),
+            is_bidirectional,
         })
     }
 
@@ -2060,7 +2067,7 @@ impl Impg {
     pub fn query_reverse_for_depth(
         &self,
         query_id: u32,
-    ) -> Vec<(i64, i64, u32)> {
+    ) -> Vec<(i64, i64, i64, i64, u32)> {
         let mut results = Vec::new();
 
         // Iterate through all target_ids in the forest map
@@ -2075,10 +2082,11 @@ impl Impg {
                 for interval in tree.iter() {
                     // Check if this alignment has our sequence as query
                     if interval.metadata.query_id == query_id {
-                        // Return the query coordinates (which is our ref in reverse direction)
                         let query_start = interval.metadata.query_start;
                         let query_end = interval.metadata.query_end;
-                        results.push((query_start, query_end, target_id));
+                        let target_start = interval.first as i64;
+                        let target_end = interval.last as i64;
+                        results.push((query_start, query_end, target_start, target_end, target_id));
                     }
                 }
             }
@@ -2126,7 +2134,7 @@ impl Impg {
         &self,
         query_id: u32,
         query_to_targets: &FxHashMap<u32, Vec<u32>>,
-    ) -> Vec<(i64, i64, u32)> {
+    ) -> Vec<(i64, i64, i64, i64, u32)> {
         let mut results = Vec::new();
 
         // Only query trees that we know have alignments with this query_id
@@ -2137,7 +2145,9 @@ impl Impg {
                         if interval.metadata.query_id == query_id {
                             let query_start = interval.metadata.query_start;
                             let query_end = interval.metadata.query_end;
-                            results.push((query_start, query_end, target_id));
+                            let target_start = interval.first as i64;
+                            let target_end = interval.last as i64;
+                            results.push((query_start, query_end, target_start, target_end, target_id));
                         }
                     }
                 }
@@ -2964,7 +2974,7 @@ impl ImpgIndex for Impg {
         &self.sequence_files
     }
 
-    fn query_reverse_for_depth(&self, query_id: u32) -> Vec<(i64, i64, u32)> {
+    fn query_reverse_for_depth(&self, query_id: u32) -> Vec<(i64, i64, i64, i64, u32)> {
         Impg::query_reverse_for_depth(self, query_id)
     }
 
@@ -2976,7 +2986,7 @@ impl ImpgIndex for Impg {
         &self,
         query_id: u32,
         query_to_targets: &FxHashMap<u32, Vec<u32>>,
-    ) -> Vec<(i64, i64, u32)> {
+    ) -> Vec<(i64, i64, i64, i64, u32)> {
         Impg::query_reverse_for_depth_with_map(self, query_id, query_to_targets)
     }
 
@@ -2993,10 +3003,7 @@ impl ImpgIndex for Impg {
     }
 
     fn is_bidirectional(&self) -> bool {
-        // Check the magic bytes stored during load
-        // For now, assume all Impg instances are bidirectional unless explicitly marked otherwise
-        // This will be properly tracked when we add the is_bidirectional field
-        true
+        self.is_bidirectional
     }
 
     fn query_raw_intervals(&self, target_id: u32) -> Vec<RawAlignmentInterval> {
