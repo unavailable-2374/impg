@@ -371,14 +371,14 @@ impl DepthStatsWithSamples {
     }
 
     /// Write combined output file sorted by chromosome and position
-    /// If merge_tolerance > 0, adjacent intervals with depth difference within tolerance are merged
-    /// tolerance is a fraction (e.g., 0.05 = 5%)
-    pub fn write_combined_output(&mut self, prefix: &str, merge_tolerance: f64) -> io::Result<()> {
+    /// Write combined output file sorted by chromosome and position.
+    /// Intervals shorter than `min_interval_len` bp are absorbed into adjacent neighbors.
+    pub fn write_combined_output(&mut self, prefix: &str, min_interval_len: i64) -> io::Result<()> {
         let path = format!("{}.combined.bed", prefix);
         let file = std::fs::File::create(&path)?;
         let mut writer = BufWriter::new(file);
 
-        // Sort intervals by sequence name, then by start position
+        // Sort by sequence name then start position
         self.intervals.sort_by(|a, b| {
             a.seq_name
                 .cmp(&b.seq_name)
@@ -386,150 +386,29 @@ impl DepthStatsWithSamples {
                 .then_with(|| a.end.cmp(&b.end))
         });
 
-        // Write header
         writeln!(writer, "#seq_name\tlength\tdepth\tsamples")?;
 
-        if merge_tolerance > 0.0 && !self.intervals.is_empty() {
-            // Merge adjacent intervals within tolerance
-            let merged = self.merge_intervals_with_tolerance(merge_tolerance);
-            info!(
-                "Merged {} intervals into {} intervals (tolerance: {:.1}%)",
-                self.intervals.len(),
-                merged.len(),
-                merge_tolerance * 100.0
-            );
-
-            for interval in &merged {
-                let samples_str = interval.samples.join(",");
-                writeln!(
-                    writer,
-                    "{}\t{}\t{}\t{}",
-                    interval.seq_name,
-                    interval.end - interval.start,
-                    interval.depth,
-                    samples_str
-                )?;
-            }
-
-            writer.flush()?;
-            info!(
-                "Wrote {} intervals to {} (combined output with samples)",
-                merged.len(),
-                path
-            );
+        let intervals = if min_interval_len > 0 {
+            merge_short_depth_intervals(std::mem::take(&mut self.intervals), min_interval_len)
         } else {
-            // No merging, write as-is
-            for interval in &self.intervals {
-                let samples_str = interval.samples.join(",");
-                writeln!(
-                    writer,
-                    "{}\t{}\t{}\t{}",
-                    interval.seq_name,
-                    interval.end - interval.start,
-                    interval.depth,
-                    samples_str
-                )?;
-            }
+            std::mem::take(&mut self.intervals)
+        };
 
-            writer.flush()?;
-            info!(
-                "Wrote {} intervals to {} (combined output with samples)",
-                self.intervals.len(),
-                path
-            );
+        for interval in &intervals {
+            let samples_str = interval.samples.join(",");
+            writeln!(
+                writer,
+                "{}\t{}\t{}\t{}",
+                interval.seq_name,
+                interval.end - interval.start,
+                interval.depth,
+                samples_str
+            )?;
         }
 
+        writer.flush()?;
+        info!("Wrote {} intervals to {} (combined output)", intervals.len(), path);
         Ok(())
-    }
-
-    /// Merge adjacent intervals where depth difference is within tolerance
-    /// tolerance: fraction (e.g., 0.05 means 5%)
-    /// When merging: depth = max, samples = union
-    /// Tracks full min-max range of merged group: (max - min) / max <= tolerance
-    fn merge_intervals_with_tolerance(&self, tolerance: f64) -> Vec<DepthIntervalWithSamples> {
-        if self.intervals.is_empty() {
-            return Vec::new();
-        }
-
-        let mut merged: Vec<DepthIntervalWithSamples> = Vec::new();
-
-        // Track current merge group with min and max depth
-        let mut current_seq = self.intervals[0].seq_name.clone();
-        let mut current_start = self.intervals[0].start;
-        let mut current_end = self.intervals[0].end;
-        let mut current_min_depth = self.intervals[0].depth;
-        let mut current_max_depth = self.intervals[0].depth;
-        let mut current_samples: FxHashSet<String> =
-            self.intervals[0].samples.iter().cloned().collect();
-
-        for interval in self.intervals.iter().skip(1) {
-            // Check if this interval can be merged with current group
-            // The new range after merging would be [min(current_min, new), max(current_max, new)]
-            // Check if this range is within tolerance
-            let can_merge = interval.seq_name == current_seq
-                && interval.start == current_end  // Adjacent
-                && Self::within_tolerance_range(current_min_depth, current_max_depth, interval.depth, tolerance);
-
-            if can_merge {
-                // Extend current group
-                current_end = interval.end;
-                current_min_depth = current_min_depth.min(interval.depth);
-                current_max_depth = current_max_depth.max(interval.depth);
-                current_samples.extend(interval.samples.iter().cloned());
-            } else {
-                // Emit current group and start new one
-                let mut samples_vec: Vec<String> = current_samples.into_iter().collect();
-                samples_vec.sort();
-                merged.push(DepthIntervalWithSamples::new(
-                    current_seq,
-                    current_start,
-                    current_end,
-                    current_max_depth, // Use max depth for output
-                    samples_vec,
-                ));
-
-                // Start new group
-                current_seq = interval.seq_name.clone();
-                current_start = interval.start;
-                current_end = interval.end;
-                current_min_depth = interval.depth;
-                current_max_depth = interval.depth;
-                current_samples = interval.samples.iter().cloned().collect();
-            }
-        }
-
-        // Emit final group
-        let mut samples_vec: Vec<String> = current_samples.into_iter().collect();
-        samples_vec.sort();
-        merged.push(DepthIntervalWithSamples::new(
-            current_seq,
-            current_start,
-            current_end,
-            current_max_depth,
-            samples_vec,
-        ));
-
-        merged
-    }
-
-    /// Check if adding a new depth to an existing range would keep it within tolerance
-    /// Returns true if (new_max - new_min) / new_max <= tolerance
-    /// where new_min = min(current_min, new_depth) and new_max = max(current_max, new_depth)
-    fn within_tolerance_range(
-        current_min: usize,
-        current_max: usize,
-        new_depth: usize,
-        tolerance: f64,
-    ) -> bool {
-        let new_min = current_min.min(new_depth);
-        let new_max = current_max.max(new_depth);
-
-        if new_max == 0 {
-            return true; // All zeros, can merge
-        }
-
-        let diff = (new_max - new_min) as f64 / new_max as f64;
-        diff <= tolerance
     }
 }
 
@@ -1294,11 +1173,11 @@ struct StreamingDepthEmitter<'a> {
     local_combined: Option<DepthStatsWithSamples>,
     sample_index: &'a SampleIndex,
 
-    // ---- Online merging state ----
-    merge_tolerance: f64,
-    merge_pending: Option<SparseDepthInterval>,
-    merge_min_depth: usize,
-    merge_max_depth: usize,
+    // ---- Short-interval merging ----
+    /// Intervals shorter than this (bp) are absorbed into adjacent neighbors. 0 = disabled.
+    min_interval_len: i64,
+    /// Buffer for the current contiguous depth region; flushed at each gap boundary.
+    seq_intervals: Vec<SparseDepthInterval>,
 
     // ---- Windowing ----
     window_size: Option<i64>,
@@ -1310,7 +1189,7 @@ impl<'a> StreamingDepthEmitter<'a> {
         if let Some(ws) = self.window_size {
             self.split_and_forward(interval, ws);
         } else {
-            self.forward_to_merge(interval);
+            self.seq_intervals.push(interval);
         }
     }
 
@@ -1349,7 +1228,7 @@ impl<'a> StreamingDepthEmitter<'a> {
             let chunk_pangenome_bases =
                 (interval.pangenome_bases as f64 * chunk_frac).round() as i64;
 
-            self.forward_to_merge(SparseDepthInterval {
+            self.seq_intervals.push(SparseDepthInterval {
                 start: pos,
                 end: chunk_end,
                 samples,
@@ -1359,63 +1238,7 @@ impl<'a> StreamingDepthEmitter<'a> {
         }
     }
 
-    /// Online merge stage: merge adjacent intervals with similar depth.
-    fn forward_to_merge(&mut self, interval: SparseDepthInterval) {
-        if self.merge_tolerance <= 0.0 {
-            self.emit_final(interval);
-            return;
-        }
 
-        if let Some(ref mut current) = self.merge_pending {
-            let new_depth = interval.depth();
-            let new_min = self.merge_min_depth.min(new_depth);
-            let new_max = self.merge_max_depth.max(new_depth);
-            let within_tolerance = if new_max == 0 {
-                true
-            } else {
-                (new_max - new_min) as f64 / new_max as f64 <= self.merge_tolerance
-            };
-
-            if interval.start == current.end && within_tolerance {
-                // Merge: extend end, union samples, update depth range
-                current.end = interval.end;
-                current.pangenome_bases += interval.pangenome_bases;
-                self.merge_min_depth = new_min;
-                self.merge_max_depth = new_max;
-
-                let mut sample_map: FxHashMap<u16, (u32, i64, i64)> = FxHashMap::default();
-                for (sid, qid, qs, qe) in current.samples.drain(..) {
-                    sample_map.insert(sid, (qid, qs, qe));
-                }
-                for (sid, qid, qs, qe) in interval.samples {
-                    sample_map
-                        .entry(sid)
-                        .and_modify(|e| {
-                            e.1 = e.1.min(qs);
-                            e.2 = e.2.max(qe);
-                        })
-                        .or_insert((qid, qs, qe));
-                }
-                current.samples = sample_map
-                    .into_iter()
-                    .map(|(sid, (qid, qs, qe))| (sid, qid, qs, qe))
-                    .collect();
-                current.samples.sort_by_key(|s| s.0);
-            } else {
-                // Emit pending, start new pending
-                let prev = self.merge_pending.take().unwrap();
-                self.emit_final(prev);
-                self.merge_min_depth = new_depth;
-                self.merge_max_depth = new_depth;
-                self.merge_pending = Some(interval);
-            }
-        } else {
-            let depth = interval.depth();
-            self.merge_min_depth = depth;
-            self.merge_max_depth = depth;
-            self.merge_pending = Some(interval);
-        }
-    }
 
     /// Terminal stage: format the interval (TSV or stats) and buffer the output.
     fn emit_final(&mut self, interval: SparseDepthInterval) {
@@ -1478,16 +1301,23 @@ impl<'a> StreamingDepthEmitter<'a> {
         // interval is DROPPED here — Vec<SamplePosition> freed immediately
     }
 
-    /// Flush any pending merge state (between gaps within the same sequence).
-    fn flush_pending_merge(&mut self) {
-        if let Some(interval) = self.merge_pending.take() {
+    /// Flush buffered intervals for the current contiguous depth region.
+    /// Applies min_interval_len merging before emitting, so short intervals
+    /// caused by transient alignment dropouts are absorbed into their neighbors.
+    fn flush_seq_intervals(&mut self) {
+        if self.seq_intervals.is_empty() {
+            return;
+        }
+        let intervals = std::mem::take(&mut self.seq_intervals);
+        let merged = merge_short_intervals(intervals, self.min_interval_len);
+        for interval in merged {
             self.emit_final(interval);
         }
     }
 
-    /// Flush everything: pending merge, remaining buffer, return stats for merging.
+    /// Flush everything: pending intervals, remaining buffer, return stats for merging.
     fn flush(&mut self) -> io::Result<()> {
-        self.flush_pending_merge();
+        self.flush_seq_intervals();
         if !self.buf.is_empty() {
             if let Some(ref w) = self.writer {
                 w.lock().write_all(&self.buf)?;
@@ -1574,73 +1404,103 @@ fn split_intervals_by_window(
     result
 }
 
-/// Merge adjacent intervals with similar depth
-/// tolerance: fraction (0.0-1.0), e.g., 0.05 = merge if depth diff <= 5%
-fn merge_sparse_intervals(
+/// Absorb intervals shorter than `min_len` bp into adjacent neighbors.
+///
+/// Short intervals caused by transient alignment dropouts (e.g., one sample
+/// briefly loses coverage) are absorbed into their left neighbor; if no left
+/// neighbor exists, they are absorbed into the right neighbor.  The absorbing
+/// neighbor's depth and sample set are preserved — only its coordinate span
+/// grows and its `pangenome_bases` accumulates the absorbed interval's bases.
+///
+/// Two passes are sufficient: the left-to-right pass handles all interior and
+/// trailing short intervals; the second pass absorbs any leading short
+/// intervals into the first long interval.
+fn merge_short_intervals(
     intervals: Vec<SparseDepthInterval>,
-    tolerance: f64,
+    min_len: i64,
 ) -> Vec<SparseDepthInterval> {
-    if intervals.is_empty() || tolerance <= 0.0 {
+    if min_len <= 0 || intervals.len() <= 1 {
         return intervals;
     }
 
-    let mut merged: Vec<SparseDepthInterval> = Vec::new();
-    let mut iter = intervals.into_iter();
-
-    let mut current = iter.next().unwrap();
-    let mut current_min_depth = current.depth();
-    let mut current_max_depth = current.depth();
-
-    for interval in iter {
-        // Check if can merge: adjacent and within tolerance
-        let new_depth = interval.depth();
-        let new_min = current_min_depth.min(new_depth);
-        let new_max = current_max_depth.max(new_depth);
-
-        let within_tolerance = if new_max == 0 {
-            true
-        } else {
-            (new_max - new_min) as f64 / new_max as f64 <= tolerance
-        };
-
-        if interval.start == current.end && within_tolerance {
-            // Merge: extend end, union samples, update depth range
-            current.end = interval.end;
-            current.pangenome_bases += interval.pangenome_bases;
-            current_min_depth = new_min;
-            current_max_depth = new_max;
-
-            // Union samples (merge by sample_id, extend coordinates)
-            let mut sample_map: FxHashMap<u16, (u32, i64, i64)> = FxHashMap::default();
-            for (sid, qid, qs, qe) in current.samples.drain(..) {
-                sample_map.insert(sid, (qid, qs, qe));
+    // Pass 1: left-to-right — absorb each short interval into its left neighbor.
+    let mut result: Vec<SparseDepthInterval> = Vec::with_capacity(intervals.len());
+    for interval in intervals {
+        if interval.end - interval.start < min_len {
+            if let Some(left) = result.last_mut() {
+                left.end = interval.end;
+                left.pangenome_bases += interval.pangenome_bases;
+                continue;
             }
-            for (sid, qid, qs, qe) in interval.samples {
-                sample_map
-                    .entry(sid)
-                    .and_modify(|e| {
-                        // Extend query range
-                        e.1 = e.1.min(qs);
-                        e.2 = e.2.max(qe);
-                    })
-                    .or_insert((qid, qs, qe));
+            // No left neighbor yet — fall through; pass 2 will absorb into right.
+        }
+        result.push(interval);
+    }
+
+    // Pass 2: absorb any remaining leading short intervals into the first long one.
+    let boundary = result.iter().position(|iv| iv.end - iv.start >= min_len);
+    if let Some(b) = boundary {
+        if b > 0 {
+            let extra_pb: i64 = result[..b].iter().map(|iv| iv.pangenome_bases).sum();
+            let new_start = result[0].start;
+            result[b].start = new_start;
+            result[b].pangenome_bases += extra_pb;
+            result.drain(..b);
+        }
+    }
+    // If boundary is None every interval is shorter than min_len — keep as-is.
+
+    result
+}
+
+/// Same absorption logic as `merge_short_intervals` but for the stats `DepthIntervalWithSamples`
+/// type. Short intervals are absorbed into their left neighbor (or right if no left exists);
+/// the absorbing neighbor's depth is kept and the sample sets are unioned.
+fn merge_short_depth_intervals(
+    intervals: Vec<DepthIntervalWithSamples>,
+    min_len: i64,
+) -> Vec<DepthIntervalWithSamples> {
+    if min_len <= 0 || intervals.len() <= 1 {
+        return intervals;
+    }
+
+    // Pass 1: left-to-right absorption
+    let mut result: Vec<DepthIntervalWithSamples> = Vec::with_capacity(intervals.len());
+    for interval in intervals {
+        if interval.end - interval.start < min_len {
+            if let Some(left) = result.last_mut() {
+                left.end = interval.end;
+                for s in interval.samples {
+                    if !left.samples.contains(&s) {
+                        left.samples.push(s);
+                    }
+                }
+                continue;
             }
-            current.samples = sample_map
-                .into_iter()
-                .map(|(sid, (qid, qs, qe))| (sid, qid, qs, qe))
+        }
+        result.push(interval);
+    }
+
+    // Pass 2: absorb leading short intervals into the first long one
+    let boundary = result.iter().position(|iv| iv.end - iv.start >= min_len);
+    if let Some(b) = boundary {
+        if b > 0 {
+            let new_start = result[0].start;
+            let extra_samples: Vec<String> = result[..b]
+                .iter()
+                .flat_map(|iv| iv.samples.iter().cloned())
                 .collect();
-            current.samples.sort_by_key(|s| s.0);
-        } else {
-            // Emit current, start new
-            merged.push(current);
-            current = interval;
-            current_min_depth = current.depth();
-            current_max_depth = current.depth();
+            result[b].start = new_start;
+            for s in extra_samples {
+                if !result[b].samples.contains(&s) {
+                    result[b].samples.push(s);
+                }
+            }
+            result.drain(..b);
         }
     }
 
-    merged.push(current);
-    merged
+    result
 }
 
 /// Thread-safe processed region tracker using per-sequence locks.
@@ -2955,7 +2815,7 @@ pub fn compute_depth_global(
     output_prefix: Option<&str>,
     fai_list: Option<&str>,
     window_size: Option<i64>,
-    merge_tolerance: f64,
+    min_interval_len: i64,
     ref_sample: Option<&str>,
     ref_only: bool,
     min_seq_length: i64,
@@ -2973,8 +2833,8 @@ pub fn compute_depth_global(
     } else {
         info!("Computing depth (global mode, pre-scan + sweep-line)");
     }
-    if merge_tolerance > 0.0 {
-        info!("Merge tolerance: {:.1}%", merge_tolerance * 100.0);
+    if min_interval_len > 0 {
+        info!("Min interval length: {} bp (shorter intervals absorbed into neighbors)", min_interval_len);
     }
 
     // Build compact data structures
@@ -3210,11 +3070,7 @@ pub fn compute_depth_global(
                 result.intervals
             };
 
-            let final_intervals = if merge_tolerance > 0.0 {
-                merge_sparse_intervals(windowed_intervals, merge_tolerance)
-            } else {
-                windowed_intervals
-            };
+            let final_intervals = merge_short_intervals(windowed_intervals, min_interval_len);
 
             for interval in &final_intervals {
                 if stats_mode {
@@ -3440,10 +3296,8 @@ pub fn compute_depth_global(
                             None
                         },
                         sample_index: &sample_index,
-                        merge_tolerance,
-                        merge_pending: None,
-                        merge_min_depth: 0,
-                        merge_max_depth: 0,
+                        min_interval_len,
+                        seq_intervals: Vec::new(),
                         window_size: if user_window_size.is_some() {
                             Some(window_size)
                         } else {
@@ -3579,10 +3433,8 @@ pub fn compute_depth_global(
                     None
                 },
                 sample_index: &sample_index,
-                merge_tolerance,
-                merge_pending: None,
-                merge_min_depth: 0,
-                merge_max_depth: 0,
+                min_interval_len,
+                seq_intervals: Vec::new(),
                 window_size: if user_window_size.is_some() {
                     Some(window_size)
                 } else {
@@ -3682,7 +3534,7 @@ pub fn compute_depth_global(
                         &mut |interval| emitter.emit(interval),
                     );
                     // Flush merge state between gaps (each gap is independent)
-                    emitter.flush_pending_merge();
+                    emitter.flush_seq_intervals();
                     tracker.mark_processed_batch(&discovered);
                 }
             }
@@ -3814,7 +3666,7 @@ pub fn compute_depth_global(
             stats.write_summary(&mut std::io::stdout())?;
 
             // Write combined output file (with optional merging)
-            stats.write_combined_output(prefix, merge_tolerance)?;
+            stats.write_combined_output(prefix, min_interval_len)?;
 
             info!(
                 "Stats complete: {} total bases, {} intervals, max depth = {}",

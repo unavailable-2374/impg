@@ -1406,12 +1406,13 @@ enum Args {
         #[clap(long, action, requires = "stats")]
         combined_output: bool,
 
-        /// Merge adjacent intervals with similar depth (works with depth and --combined-output)
-        /// Intervals are merged if (max_depth - min_depth) / max_depth <= tolerance
-        /// When merged: depth = max, samples = union. Default: 0.05 (5%)
+        /// Absorb intervals shorter than this length (bp) into adjacent neighbors.
+        /// Prevents fragmentation caused by transient single-sample alignment dropouts.
+        /// The absorbing neighbor's depth is preserved; only its coordinate span grows.
+        /// 0 = disabled (default).
         #[arg(help_heading = "Output options")]
-        #[clap(long, value_parser, default_value = "0.05")]
-        merge_tolerance: f64,
+        #[clap(long, value_parser, default_value = "0")]
+        min_interval_len: i64,
 
         /// Region query mode: target range in format `seq_name:start-end`
         #[arg(help_heading = "Mode selection")]
@@ -2726,7 +2727,7 @@ fn run() -> io::Result<()> {
             samples_file,
             stats,
             combined_output,
-            merge_tolerance,
+            min_interval_len,
             target_range,
             target_bed,
         } => {
@@ -2841,9 +2842,6 @@ fn run() -> io::Result<()> {
             if let Some(ws) = window_size {
                 info!("Window size: {} bp", ws);
             }
-            if merge_tolerance > 0.0 {
-                info!("Merge tolerance: {:.1}%", merge_tolerance * 100.0);
-            }
             if min_seq_length > 0 {
                 info!("Minimum sequence length filter: {} bp", min_seq_length);
             }
@@ -2860,7 +2858,7 @@ fn run() -> io::Result<()> {
                 output_prefix.as_deref(),
                 fai_list.as_deref(),
                 window_size,
-                merge_tolerance,
+                min_interval_len,
                 ref_sample.as_deref(),
                 ref_only,
                 min_seq_length as i64,
