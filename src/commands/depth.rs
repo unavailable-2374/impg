@@ -1911,6 +1911,7 @@ fn process_anchor_region_transitive_raw(
     region_end: i64,
     seq_included: &[bool],
     min_seq_length: i64,
+    global_used: &ConcurrentProcessedTracker,
 ) -> AnchorRegionResult {
     let mut discovered_regions: Vec<(u32, i64, i64)> = Vec::new();
     discovered_regions.push((anchor_seq_id, region_start, region_end));
@@ -1976,38 +1977,50 @@ fn process_anchor_region_transitive_raw(
         let query_start = hit.query_start.min(hit.query_end) as i64;
         let query_end = hit.query_start.max(hit.query_end) as i64;
 
-        discovered_regions.push((hit.query_id, query_start, query_end));
-
-        // Determine anchor coordinates
-        let (a_start, a_end) = if hit.target_id == anchor_seq_id {
-            let t_start = hit.target_start.min(hit.target_end) as i64;
-            let t_end = hit.target_start.max(hit.target_end) as i64;
-            (t_start.max(region_start), t_end.min(region_end))
+        // Compute full anchor coordinates for this hit (existing logic)
+        let hit_t_start = hit.target_start.min(hit.target_end) as i64;
+        let hit_t_end = hit.target_start.max(hit.target_end) as i64;
+        let (full_a_start, full_a_end) = if hit.target_id == anchor_seq_id {
+            (hit_t_start.max(region_start), hit_t_end.min(region_end))
         } else {
-            let t_start = hit.target_start.min(hit.target_end) as i64;
-            let t_end = hit.target_start.max(hit.target_end) as i64;
             project_hop0_coords(
                 seq_anchor_coverage.get(&hit.target_id),
-                t_start,
-                t_end,
-                region_start,
-                region_end,
+                hit_t_start, hit_t_end,
+                region_start, region_end,
             )
         };
-
-        if a_start >= a_end {
+        if full_a_start >= full_a_end {
             continue;
         }
 
-        alignments.push(CompactAlignmentInfo::new(
-            query_sample_id,
-            hit.query_id,
-            query_start,
-            query_end,
-            a_start,
-            a_end,
-            hit.is_reverse,
-        ));
+        // Atomically claim unconsumed sub-ranges of this query sequence
+        let claimed = global_used.claim_unprocessed(hit.query_id, query_start, query_end);
+        if claimed.is_empty() {
+            continue;
+        }
+
+        for (uq_start, uq_end) in claimed {
+            discovered_regions.push((hit.query_id, uq_start, uq_end));
+            // Map query sub-range proportionally within the full query→anchor mapping
+            let (ua_start, ua_end) = inverse_map_query_to_target(
+                full_a_start, full_a_end,
+                query_start, query_end,
+                uq_start, uq_end,
+                hit.is_reverse,
+            );
+            if ua_start >= ua_end {
+                continue;
+            }
+            alignments.push(CompactAlignmentInfo::new(
+                query_sample_id,
+                hit.query_id,
+                uq_start,
+                uq_end,
+                ua_start,
+                ua_end,
+                hit.is_reverse,
+            ));
+        }
     }
 
     // Sweep-line to compute depth intervals
@@ -2040,6 +2053,7 @@ fn process_anchor_region(
     region_end: i64,
     seq_included: &[bool],
     min_seq_length: i64,
+    global_used: &ConcurrentProcessedTracker,
 ) -> AnchorRegionResult {
     let is_transitive = config.transitive || config.transitive_dfs;
 
@@ -2057,6 +2071,7 @@ fn process_anchor_region(
                 region_end,
                 seq_included,
                 min_seq_length,
+                global_used,
             );
         } else {
             return process_anchor_region_transitive_raw(
@@ -2070,6 +2085,7 @@ fn process_anchor_region(
                 region_end,
                 seq_included,
                 min_seq_length,
+                global_used,
             );
         }
     }
@@ -2330,6 +2346,7 @@ fn process_anchor_region_transitive_cigar(
     region_end: i64,
     seq_included: &[bool],
     min_seq_length: i64,
+    global_used: &ConcurrentProcessedTracker,
 ) -> AnchorRegionResult {
     let mut discovered_regions: Vec<(u32, i64, i64)> = Vec::new();
     discovered_regions.push((anchor_seq_id, region_start, region_end));
@@ -2428,38 +2445,49 @@ fn process_anchor_region_transitive_cigar(
         let query_start = query_interval.first.min(query_interval.last) as i64;
         let query_end = query_interval.first.max(query_interval.last) as i64;
 
-        discovered_regions.push((query_id, query_start, query_end));
-
-        // Determine anchor coordinates
-        let (a_start, a_end) = if target_interval.metadata == anchor_seq_id {
-            let t_start = target_interval.first.min(target_interval.last) as i64;
-            let t_end = target_interval.first.max(target_interval.last) as i64;
-            (t_start.max(region_start), t_end.min(region_end))
+        // Compute full anchor coordinates for this overlap (existing logic)
+        let hit_t_start = target_interval.first.min(target_interval.last) as i64;
+        let hit_t_end = target_interval.first.max(target_interval.last) as i64;
+        let (full_a_start, full_a_end) = if target_interval.metadata == anchor_seq_id {
+            (hit_t_start.max(region_start), hit_t_end.min(region_end))
         } else {
-            let t_start = target_interval.first.min(target_interval.last) as i64;
-            let t_end = target_interval.first.max(target_interval.last) as i64;
             project_hop0_coords(
                 seq_anchor_coverage.get(&target_interval.metadata),
-                t_start,
-                t_end,
-                region_start,
-                region_end,
+                hit_t_start, hit_t_end,
+                region_start, region_end,
             )
         };
-
-        if a_start >= a_end {
+        if full_a_start >= full_a_end {
             continue;
         }
 
-        alignments.push(CompactAlignmentInfo::new(
-            query_sample_id,
-            query_id,
-            query_start,
-            query_end,
-            a_start,
-            a_end,
-            is_reverse,
-        ));
+        // Atomically claim unconsumed sub-ranges of this query sequence
+        let claimed = global_used.claim_unprocessed(query_id, query_start, query_end);
+        if claimed.is_empty() {
+            continue;
+        }
+
+        for (uq_start, uq_end) in claimed {
+            discovered_regions.push((query_id, uq_start, uq_end));
+            let (ua_start, ua_end) = inverse_map_query_to_target(
+                full_a_start, full_a_end,
+                query_start, query_end,
+                uq_start, uq_end,
+                is_reverse,
+            );
+            if ua_start >= ua_end {
+                continue;
+            }
+            alignments.push(CompactAlignmentInfo::new(
+                query_sample_id,
+                query_id,
+                uq_start,
+                uq_end,
+                ua_start,
+                ua_end,
+                is_reverse,
+            ));
+        }
     }
 
     // Augment discovered_regions with raw alignment extents for direct (hop 0) overlaps.
@@ -3318,6 +3346,7 @@ pub fn compute_depth_global(
                         chunk_end,
                         &seq_included,
                         min_seq_length,
+                        &global_used,
                     );
 
                     tracker.mark_processed_batch(&result.discovered_regions);
@@ -3622,6 +3651,7 @@ pub fn compute_depth_global(
                                 chunk_end,
                                 &seq_included,
                                 min_seq_length,
+                                &global_used,
                             );
                             tracker.mark_processed_batch(&result.discovered_regions);
                             results.push(result);
@@ -3640,6 +3670,7 @@ pub fn compute_depth_global(
                             region_end,
                             &seq_included,
                             min_seq_length,
+                            &global_used,
                         );
                         tracker.mark_processed_batch(&result.discovered_regions);
                         vec![result]
