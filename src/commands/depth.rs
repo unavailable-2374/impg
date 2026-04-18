@@ -1772,7 +1772,7 @@ fn depth_transitive_bfs(
             continue;
         }
 
-        let raw_alns = impg.query_raw_overlapping(current_target_id, current_start, current_end);
+        let raw_alns = impg.query_raw_overlapping_transient(current_target_id, current_start, current_end);
 
         // Collect next-depth ranges to sort and merge before adding to queue
         let mut next_ranges: Vec<(u32, i64, i64)> = Vec::new();
@@ -2503,7 +2503,7 @@ fn process_anchor_region_transitive_cigar(
     // coverage is marked as processed, preventing Phase 2 from re-processing these
     // regions and producing duplicate output (e.g., CHM13 appearing in Phase 2 rows).
     let raw_hop0 =
-        impg.query_raw_overlapping(anchor_seq_id, region_start, region_end);
+        impg.query_raw_overlapping_transient(anchor_seq_id, region_start, region_end);
     for aln in &raw_hop0 {
         if min_seq_length > 0
             && !seq_included
