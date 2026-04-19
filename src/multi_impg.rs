@@ -1254,6 +1254,76 @@ impl ImpgIndex for MultiImpg {
         }
         results
     }
+
+    /// Batch variant: groups all queries by sub-index file and loads each file
+    /// exactly once, answering every query that references it before dropping
+    /// the sub-index. Files are processed sequentially so at most one
+    /// sub-index is alive at any point — O(max_sub_index_size) peak memory
+    /// regardless of how many queries (or threads) share the same file.
+    fn batch_query_raw_overlapping(
+        &self,
+        queries: &[(u32, i64, i64)],
+    ) -> Vec<Vec<RawAlignmentInterval>> {
+        let n = queries.len();
+        if n == 0 {
+            return Vec::new();
+        }
+
+        let mut results: Vec<Vec<RawAlignmentInterval>> = vec![Vec::new(); n];
+
+        // Group: file_idx → Vec<(query_idx, local_target_id, start, end)>
+        let mut by_file: FxHashMap<usize, Vec<(usize, u32, i64, i64)>> = FxHashMap::default();
+        for (qi, &(unified_target_id, start, end)) in queries.iter().enumerate() {
+            if let Some(locs) = self.forest_map.get(&unified_target_id) {
+                for loc in locs {
+                    by_file
+                        .entry(loc.index_idx)
+                        .or_default()
+                        .push((qi, loc.local_target_id, start, end));
+                }
+            }
+        }
+
+        // Process files sequentially: one sub-index alive at a time.
+        // When many chunks query the same file (e.g., all hub chunks querying
+        // the same per-sample alignment file), it is loaded once and all
+        // queries answered before freeing.
+        for (file_idx, file_queries) in &by_file {
+            let impg = match self.load_sub_index_transient(*file_idx) {
+                Ok(i) => i,
+                Err(e) => {
+                    warn!(
+                        "batch_query_raw_overlapping: failed to load {:?}: {}",
+                        self.index_paths[*file_idx], e
+                    );
+                    continue;
+                }
+            };
+            let l2u = &self.local_to_unified[*file_idx];
+            for &(qi, local_target_id, start, end) in file_queries {
+                if let Some(tree) = impg.get_or_load_tree(local_target_id) {
+                    tree.query(start, end, |interval| {
+                        let m = &interval.metadata;
+                        if let Some(&unified_query_id) = l2u.get(m.query_id() as usize) {
+                            if unified_query_id != u32::MAX {
+                                results[qi].push(RawAlignmentInterval {
+                                    target_start: interval.first,
+                                    target_end: interval.last,
+                                    query_id: unified_query_id,
+                                    query_start: m.query_start(),
+                                    query_end: m.query_end(),
+                                    is_reverse: m.is_reverse_strand(),
+                                });
+                            }
+                        }
+                    });
+                }
+            }
+            // impg dropped here — sub-index freed immediately.
+        }
+
+        results
+    }
 }
 
 impl MultiImpg {

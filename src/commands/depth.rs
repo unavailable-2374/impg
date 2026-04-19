@@ -1725,6 +1725,379 @@ struct DepthBfsHit {
     is_reverse: bool,
 }
 
+/// Per-chunk BFS state used by `batch_depth_bfs`.
+///
+/// Each chunk maintains its own frontier queue and visited-ranges dedup table
+/// independently. `batch_depth_bfs` drives all chunk states together, loading
+/// each sub-index file only once per round regardless of how many chunks need
+/// it, so peak memory is bounded to one sub-index at a time.
+struct BfsChunkState {
+    queue: std::collections::VecDeque<(u32, i64, i64, u16)>, // (target_id, start, end, depth)
+    visited_ranges: FxHashMap<u32, SortedRanges>,
+    results: Vec<DepthBfsHit>,
+}
+
+impl BfsChunkState {
+    fn new(
+        anchor_seq_id: u32,
+        region_start: i64,
+        region_end: i64,
+        anchor_len: i64,
+        min_transitive_len: i64,
+    ) -> Self {
+        let mut visited_ranges: FxHashMap<u32, SortedRanges> = FxHashMap::default();
+        let anchor_sorted = visited_ranges
+            .entry(anchor_seq_id)
+            .or_insert_with(|| SortedRanges::new(anchor_len, 0));
+        let filtered = anchor_sorted.insert((region_start, region_end));
+
+        let mut queue = std::collections::VecDeque::new();
+        for (s, e) in filtered {
+            if (e - s).abs() >= min_transitive_len {
+                queue.push_back((anchor_seq_id, s, e, 0u16));
+            }
+        }
+
+        Self {
+            queue,
+            visited_ranges,
+            results: Vec::new(),
+        }
+    }
+
+    /// Process raw alignment results for one BFS hop, record hits, and enqueue
+    /// next-level frontier items. Mirrors the inner loop of `depth_transitive_bfs`.
+    fn process_hop(
+        &mut self,
+        current_target_id: u32,
+        current_start: i64,
+        current_end: i64,
+        current_depth: u16,
+        raw_alns: &[RawAlignmentInterval],
+        seq_len_fn: &impl Fn(u32) -> i64,
+        min_transitive_len: i64,
+        min_distance_between_ranges: i64,
+    ) {
+        let mut next_ranges: Vec<(u32, i64, i64)> = Vec::new();
+
+        for aln in raw_alns {
+            if aln.query_id == current_target_id {
+                continue;
+            }
+
+            let aln_target_start = aln.target_start;
+            let aln_target_end = aln.target_end;
+
+            let clipped_target_start = aln_target_start.max(current_start);
+            let clipped_target_end = aln_target_end.min(current_end);
+            if clipped_target_start >= clipped_target_end {
+                continue;
+            }
+
+            let target_len_aln = aln_target_end - aln_target_start;
+            let query_len_aln = aln.query_end - aln.query_start;
+            let ratio = if target_len_aln > 0 {
+                query_len_aln as f64 / target_len_aln as f64
+            } else {
+                1.0
+            };
+
+            let (clipped_query_start, clipped_query_end) = if aln.is_reverse {
+                let cqe = aln.query_end
+                    - ((clipped_target_start - aln_target_start) as f64 * ratio).round() as i64;
+                let cqs = aln.query_end
+                    - ((clipped_target_end - aln_target_start) as f64 * ratio).round() as i64;
+                (cqs.min(cqe), cqs.max(cqe))
+            } else {
+                let cqs = aln.query_start
+                    + ((clipped_target_start - aln_target_start) as f64 * ratio).round() as i64;
+                let cqe = aln.query_start
+                    + ((clipped_target_end - aln_target_start) as f64 * ratio).round() as i64;
+                (cqs.min(cqe), cqs.max(cqe))
+            };
+
+            self.results.push(DepthBfsHit {
+                query_id: aln.query_id,
+                query_start: clipped_query_start,
+                query_end: clipped_query_end,
+                target_id: current_target_id,
+                target_start: clipped_target_start,
+                target_end: clipped_target_end,
+                is_reverse: aln.is_reverse,
+            });
+
+            let explore_start = aln.query_start.min(aln.query_end);
+            let explore_end = aln.query_start.max(aln.query_end);
+            let query_seq_len = seq_len_fn(aln.query_id);
+            let ranges = self
+                .visited_ranges
+                .entry(aln.query_id)
+                .or_insert_with(|| SortedRanges::new(query_seq_len, 0));
+
+            let mut should_add = true;
+            if min_distance_between_ranges > 0 {
+                let (new_min, new_max) = (explore_start, explore_end);
+                let idx = match ranges
+                    .ranges
+                    .binary_search_by_key(&new_min, |&(start, _)| start)
+                {
+                    Ok(i) => i,
+                    Err(i) => i,
+                };
+                if idx > 0 {
+                    let (_, prev_end) = ranges.ranges[idx - 1];
+                    if (new_min - prev_end).abs() < min_distance_between_ranges {
+                        should_add = false;
+                    }
+                }
+                if should_add && idx < ranges.ranges.len() {
+                    let (next_start, _) = ranges.ranges[idx];
+                    if (next_start - new_max).abs() < min_distance_between_ranges {
+                        should_add = false;
+                    }
+                }
+            }
+
+            if should_add {
+                for (ns, ne) in ranges.insert((explore_start, explore_end)) {
+                    if (ne - ns).abs() >= min_transitive_len {
+                        next_ranges.push((aln.query_id, ns, ne));
+                    }
+                }
+            }
+        }
+
+        // Sort and merge contiguous ranges before enqueueing
+        if !next_ranges.is_empty() {
+            next_ranges.sort_by_key(|(id, start, _)| (*id, *start));
+            let mut write = 0;
+            for read in 1..next_ranges.len() {
+                if next_ranges[write].0 == next_ranges[read].0
+                    && next_ranges[write].2 >= next_ranges[read].1
+                {
+                    next_ranges[write].2 = next_ranges[write].2.max(next_ranges[read].2);
+                } else {
+                    write += 1;
+                    next_ranges.swap(write, read);
+                }
+            }
+            next_ranges.truncate(write + 1);
+            for (seq_id, start, end) in next_ranges {
+                self.queue.push_back((seq_id, start, end, current_depth + 1));
+            }
+        }
+    }
+}
+
+/// Batch BFS across all hub chunks simultaneously.
+///
+/// Instead of each chunk independently loading sub-index files (causing
+/// T × sub_index_size peak memory for T concurrent rayon threads), this
+/// function drives all chunk frontiers together: in each round, every pending
+/// query is collected, grouped by alignment file via
+/// `ImpgIndex::batch_query_raw_overlapping`, and each file is loaded exactly
+/// once to answer all queries referencing it before being freed. Sequential
+/// file processing keeps peak memory at one sub-index + all chunk states.
+///
+/// For hub-heavy workloads where many chunks share the same alignment files
+/// (e.g., 50 × 5 MB chunks of the same hub chromosome all need sample F's
+/// alignment file), the batch approach also reduces total I/O: F is read once
+/// rather than 50 times.
+///
+/// Returns one `Vec<DepthBfsHit>` per input chunk, in the same order.
+fn batch_depth_bfs(
+    impg: &impl ImpgIndex,
+    chunks: &[(u32, i64, i64)], // (anchor_seq_id, chunk_start, chunk_end)
+    max_depth: u16,
+    min_transitive_len: i64,
+    min_distance_between_ranges: i64,
+) -> Vec<Vec<DepthBfsHit>> {
+    if chunks.is_empty() {
+        return Vec::new();
+    }
+
+    let seq_len_fn = |id: u32| impg.seq_index().get_len_from_id(id).unwrap_or(0) as i64;
+
+    let mut states: Vec<BfsChunkState> = chunks
+        .iter()
+        .map(|&(anchor_id, start, end)| {
+            BfsChunkState::new(anchor_id, start, end, seq_len_fn(anchor_id), min_transitive_len)
+        })
+        .collect();
+
+    loop {
+        // Drain all active queue items across all chunk states.
+        // Items that exceed max_depth are discarded (same semantics as the
+        // sequential depth_transitive_bfs which calls `continue` on depth check).
+        let mut pending: Vec<(usize, u32, i64, i64, u16)> = Vec::new();
+        for (ci, state) in states.iter_mut().enumerate() {
+            while let Some((target_id, start, end, depth)) = state.queue.pop_front() {
+                if max_depth > 0 && depth >= max_depth {
+                    continue;
+                }
+                pending.push((ci, target_id, start, end, depth));
+            }
+        }
+
+        if pending.is_empty() {
+            break;
+        }
+
+        // Build query list (one entry per pending BFS item)
+        let queries: Vec<(u32, i64, i64)> = pending
+            .iter()
+            .map(|&(_, target_id, start, end, _)| (target_id, start, end))
+            .collect();
+
+        // Batch query: each alignment file is loaded at most once to serve
+        // all queries that reference it, then immediately freed.
+        let batch_results = impg.batch_query_raw_overlapping(&queries);
+
+        // Distribute results back and advance each chunk's frontier
+        for ((ci, target_id, start, end, depth), raw_alns) in
+            pending.iter().zip(batch_results.iter())
+        {
+            states[*ci].process_hop(
+                *target_id,
+                *start,
+                *end,
+                *depth,
+                raw_alns,
+                &seq_len_fn,
+                min_transitive_len,
+                min_distance_between_ranges,
+            );
+        }
+    }
+
+    states.into_iter().map(|s| s.results).collect()
+}
+
+/// Sweep-line half of `process_anchor_region_transitive_raw`, operating on
+/// pre-computed BFS hits instead of running BFS internally.
+///
+/// Used by the Phase 1 batch path: `batch_depth_bfs` produces hits for all
+/// chunks in one coordinated pass (sequential file loading, O(sub_index_size)
+/// peak memory), then this function runs the sweep-line in parallel across
+/// all chunks (CPU-only, no sub-index loading).
+fn process_anchor_region_transitive_raw_with_hits(
+    hits: Vec<DepthBfsHit>,
+    compact_lengths: &CompactSequenceLengths,
+    num_samples: usize,
+    anchor_seq_id: u32,
+    anchor_sample_id: u16,
+    region_start: i64,
+    region_end: i64,
+    seq_included: &[bool],
+    min_seq_length: i64,
+    global_used: &ConcurrentProcessedTracker,
+) -> AnchorRegionResult {
+    let mut discovered_regions: Vec<(u32, i64, i64)> = Vec::new();
+    discovered_regions.push((anchor_seq_id, region_start, region_end));
+
+    let mut alignments: Vec<CompactAlignmentInfo> = Vec::new();
+    alignments.push(CompactAlignmentInfo::new(
+        anchor_sample_id,
+        anchor_seq_id,
+        region_start,
+        region_end,
+        region_start,
+        region_end,
+        false,
+    ));
+
+    // Pass 1: build anchor coverage map from hop-0 hits (target on anchor)
+    let mut seq_anchor_coverage: FxHashMap<u32, Vec<HopZeroSeg>> = FxHashMap::default();
+    for hit in &hits {
+        if hit.target_id == anchor_seq_id {
+            let q_start = hit.query_start.min(hit.query_end);
+            let q_end = hit.query_start.max(hit.query_end);
+            let t_start = hit.target_start.min(hit.target_end);
+            let t_end = hit.target_start.max(hit.target_end);
+            seq_anchor_coverage
+                .entry(hit.query_id)
+                .or_default()
+                .push((q_start, q_end, t_start, t_end));
+        }
+    }
+
+    // Pass 2: process all hits for depth (identical to process_anchor_region_transitive_raw)
+    for hit in &hits {
+        if min_seq_length > 0
+            && !seq_included
+                .get(hit.query_id as usize)
+                .copied()
+                .unwrap_or(false)
+        {
+            continue;
+        }
+
+        let query_sample_id = compact_lengths.get_sample_id(hit.query_id);
+        if query_sample_id == anchor_sample_id {
+            continue;
+        }
+
+        let query_start = hit.query_start.min(hit.query_end);
+        let query_end = hit.query_start.max(hit.query_end);
+
+        let hit_t_start = hit.target_start.min(hit.target_end);
+        let hit_t_end = hit.target_start.max(hit.target_end);
+        let (full_a_start, full_a_end) = if hit.target_id == anchor_seq_id {
+            (hit_t_start.max(region_start), hit_t_end.min(region_end))
+        } else {
+            project_hop0_coords(
+                seq_anchor_coverage.get(&hit.target_id),
+                hit_t_start,
+                hit_t_end,
+                region_start,
+                region_end,
+            )
+        };
+        if full_a_start >= full_a_end {
+            continue;
+        }
+
+        let claimed = global_used.claim_unprocessed(hit.query_id, query_start, query_end);
+        if claimed.is_empty() {
+            continue;
+        }
+
+        for (uq_start, uq_end) in claimed {
+            discovered_regions.push((hit.query_id, uq_start, uq_end));
+            let (ua_start, ua_end) = inverse_map_query_to_target(
+                full_a_start,
+                full_a_end,
+                query_start,
+                query_end,
+                uq_start,
+                uq_end,
+                hit.is_reverse,
+            );
+            if ua_start >= ua_end {
+                continue;
+            }
+            alignments.push(CompactAlignmentInfo::new(
+                query_sample_id,
+                hit.query_id,
+                uq_start,
+                uq_end,
+                ua_start,
+                ua_end,
+                hit.is_reverse,
+            ));
+        }
+    }
+
+    let seq_intervals = sweep_line_depth(&alignments, num_samples, region_start, region_end);
+
+    AnchorRegionResult {
+        intervals: seq_intervals,
+        discovered_regions,
+        anchor_seq_id,
+        anchor_sample_id,
+    }
+}
+
 /// Depth-specific raw-interval BFS using `query_raw_overlapping()` at each hop.
 ///
 /// Unlike the CIGAR-based BFS in `impg.rs`, this uses raw alignment extents with
@@ -3304,8 +3677,26 @@ pub fn compute_depth_global(
     // =========================================================================
     if !phase1_seqs.is_empty() {
         if is_transitive {
-            // Transitive mode: chunk-level parallelism for full thread utilization.
-            // Split hub sequences into 5MB chunks → ~1200 tasks for 128 threads.
+            // Transitive mode (raw BFS path): two-phase approach to bound memory.
+            //
+            // Old approach: par_iter over all chunks → each thread independently loads
+            // sub-index files → T threads × sub_index_size peak memory (120 GB+).
+            //
+            // New approach (batch BFS):
+            //   Phase A) batch_depth_bfs drives all chunk frontiers together.
+            //            Each alignment file is loaded once per BFS round, shared
+            //            across every chunk that needs it, then immediately freed.
+            //            Peak memory = one sub-index at a time (sequential files).
+            //            For hub workloads where N chunks all query the same sample
+            //            files, this also reduces total I/O N-fold.
+            //   Phase B) Parallel sweep-line: no sub-index loading, CPU-only.
+            //            128 threads process the pre-computed hits concurrently.
+            //
+            // CIGAR BFS (--use-BFS): kept on the old par_iter path — CIGAR BFS
+            // needs CIGAR-precise projection and doesn't benefit from the batch
+            // optimisation; it is also rarely used in practice.
+
+            // Split hub sequences into 5MB chunks
             let phase1_chunks: Vec<(u32, u16, i64, i64)> = phase1_seqs
                 .iter()
                 .flat_map(|&seq_id| {
@@ -3324,7 +3715,7 @@ pub fn compute_depth_global(
 
             let num_chunks = phase1_chunks.len();
             info!(
-                "Phase 1: {} hub sequences -> {} chunks ({}MB each), chunk-level parallelism",
+                "Phase 1: {} hub sequences -> {} chunks ({}MB each), batch BFS",
                 phase1_seqs.len(),
                 num_chunks,
                 TRANSITIVE_CHUNK_SIZE / 1_000_000
@@ -3340,42 +3731,89 @@ pub fn compute_depth_global(
 
             let phase1_count = AtomicUsize::new(0);
 
-            phase1_chunks.par_iter().try_for_each(
-                |&(seq_id, sample_id, chunk_start, chunk_end)| -> io::Result<()> {
-                    let result = process_anchor_region(
-                        impg,
-                        config,
-                        &compact_lengths,
-                        num_samples,
-                        seq_id,
-                        sample_id,
-                        chunk_start,
-                        chunk_end,
-                        &seq_included,
-                        min_seq_length,
-                        &global_used,
-                    );
-
-                    tracker.mark_processed_batch(&result.discovered_regions);
-
-                    let mut buf: Vec<u8> = Vec::new();
-                    write_results(vec![result], &mut buf)?;
-                    if !buf.is_empty() {
-                        if let Some(ref w) = writer {
-                            w.lock().write_all(&buf)?;
+            if config.use_cigar_bfs {
+                // CIGAR path: keep existing per-chunk parallel approach
+                phase1_chunks.par_iter().try_for_each(
+                    |&(seq_id, sample_id, chunk_start, chunk_end)| -> io::Result<()> {
+                        let result = process_anchor_region(
+                            impg,
+                            config,
+                            &compact_lengths,
+                            num_samples,
+                            seq_id,
+                            sample_id,
+                            chunk_start,
+                            chunk_end,
+                            &seq_included,
+                            min_seq_length,
+                            &global_used,
+                        );
+                        tracker.mark_processed_batch(&result.discovered_regions);
+                        let mut buf: Vec<u8> = Vec::new();
+                        write_results(vec![result], &mut buf)?;
+                        if !buf.is_empty() {
+                            if let Some(ref w) = writer {
+                                w.lock().write_all(&buf)?;
+                            }
                         }
-                    }
+                        let count = phase1_count.fetch_add(1, Ordering::Relaxed) + 1;
+                        pb_phase1.set_position(count as u64);
+                        Ok(())
+                    },
+                )?;
+            } else {
+                // Raw BFS path (default): batch BFS — sequential file loading,
+                // then parallel sweep-line.
 
-                    let count = phase1_count.fetch_add(1, Ordering::Relaxed) + 1;
-                    pb_phase1.set_position(count as u64);
+                // Phase A: batch BFS (single-threaded file loading, all chunks coordinated)
+                let chunk_coords: Vec<(u32, i64, i64)> = phase1_chunks
+                    .iter()
+                    .map(|&(seq_id, _, start, end)| (seq_id, start, end))
+                    .collect();
 
-                    Ok(())
-                },
-            )?;
+                info!("Phase 1: running batch BFS across {} chunks...", num_chunks);
+                let all_hits = batch_depth_bfs(
+                    impg,
+                    &chunk_coords,
+                    config.max_depth,
+                    config.min_transitive_len,
+                    config.min_distance_between_ranges,
+                );
+                info!("Phase 1: batch BFS complete, starting parallel sweep-line...");
 
-            // Clear sub-index cache once after all Phase 1 chunks complete, not per-chunk.
-            // Clearing inside the parallel loop races with other workers that may still hold
-            // the same sub-index Arc, causing redundant reloads and higher peak memory.
+                // Phase B: parallel sweep-line (CPU-only, no sub-index loading)
+                phase1_chunks
+                    .par_iter()
+                    .zip(all_hits.into_par_iter())
+                    .try_for_each(
+                        |(&(seq_id, sample_id, chunk_start, chunk_end), hits)| -> io::Result<()> {
+                            let result = process_anchor_region_transitive_raw_with_hits(
+                                hits,
+                                &compact_lengths,
+                                num_samples,
+                                seq_id,
+                                sample_id,
+                                chunk_start,
+                                chunk_end,
+                                &seq_included,
+                                min_seq_length,
+                                &global_used,
+                            );
+                            tracker.mark_processed_batch(&result.discovered_regions);
+                            let mut buf: Vec<u8> = Vec::new();
+                            write_results(vec![result], &mut buf)?;
+                            if !buf.is_empty() {
+                                if let Some(ref w) = writer {
+                                    w.lock().write_all(&buf)?;
+                                }
+                            }
+                            let count = phase1_count.fetch_add(1, Ordering::Relaxed) + 1;
+                            pb_phase1.set_position(count as u64);
+                            Ok(())
+                        },
+                    )?;
+            }
+
             impg.clear_sub_index_cache();
             pb_phase1.finish_and_clear();
         } else {

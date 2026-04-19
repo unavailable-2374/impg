@@ -202,6 +202,31 @@ pub trait ImpgIndex: Send + Sync {
         self.query_raw_overlapping(target_id, start, end)
     }
 
+    /// Batch variant of `query_raw_overlapping_transient`.
+    ///
+    /// Given a slice of `(unified_target_id, start, end)` queries, returns a
+    /// parallel Vec of results — `output[i]` holds the raw intervals for
+    /// `queries[i]`. The key optimisation for `MultiImpg`: every query that
+    /// touches the same alignment file is served by a single transient
+    /// sub-index load, so each file is read from disk at most once per call
+    /// regardless of how many queries reference it. Peak live memory is
+    /// bounded to one sub-index at a time (sequential file processing).
+    ///
+    /// Default: calls `query_raw_overlapping_transient` individually for each
+    /// query — correct for single-file `Impg` which has no file sharing to
+    /// exploit.
+    fn batch_query_raw_overlapping(
+        &self,
+        queries: &[(u32, i64, i64)],
+    ) -> Vec<Vec<RawAlignmentInterval>> {
+        queries
+            .iter()
+            .map(|&(target_id, start, end)| {
+                self.query_raw_overlapping_transient(target_id, start, end)
+            })
+            .collect()
+    }
+
     /// Pre-scan: for each unified target in `seq_included`, count unique OTHER samples
     /// directly aligned to it. Used by the depth command to auto-detect hub sequences.
     ///
@@ -606,6 +631,16 @@ impl ImpgIndex for ImpgWrapper {
         match self {
             ImpgWrapper::Single(impg) => impg.query_raw_overlapping_transient(target_id, start, end),
             ImpgWrapper::Multi(multi) => multi.query_raw_overlapping_transient(target_id, start, end),
+        }
+    }
+
+    fn batch_query_raw_overlapping(
+        &self,
+        queries: &[(u32, i64, i64)],
+    ) -> Vec<Vec<RawAlignmentInterval>> {
+        match self {
+            ImpgWrapper::Single(impg) => impg.batch_query_raw_overlapping(queries),
+            ImpgWrapper::Multi(multi) => multi.batch_query_raw_overlapping(queries),
         }
     }
 
