@@ -1288,18 +1288,26 @@ impl ImpgIndex for MultiImpg {
         // When many chunks query the same file (e.g., all hub chunks querying
         // the same per-sample alignment file), it is loaded once and all
         // queries answered before freeing.
-        for (file_idx, file_queries) in &by_file {
-            let impg = match self.load_sub_index_transient(*file_idx) {
+        //
+        // Sort by file_idx so files are loaded in a deterministic, ascending order.
+        // This improves OS page-cache locality (sequential file access patterns are
+        // prefetched more effectively) and makes behaviour reproducible across runs.
+        // It does not affect correctness: results[qi] slots are index-addressed.
+        let mut file_order: Vec<usize> = by_file.keys().copied().collect();
+        file_order.sort_unstable();
+        for file_idx in file_order {
+            let file_queries = &by_file[&file_idx];
+            let impg = match self.load_sub_index_transient(file_idx) {
                 Ok(i) => i,
                 Err(e) => {
                     warn!(
                         "batch_query_raw_overlapping: failed to load {:?}: {}",
-                        self.index_paths[*file_idx], e
+                        self.index_paths[file_idx], e
                     );
                     continue;
                 }
             };
-            let l2u = &self.local_to_unified[*file_idx];
+            let l2u = &self.local_to_unified[file_idx];
             for &(qi, local_target_id, start, end) in file_queries {
                 if let Some(tree) = impg.get_or_load_tree(local_target_id) {
                     tree.query(start, end, |interval| {

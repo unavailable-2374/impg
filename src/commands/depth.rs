@@ -1469,16 +1469,26 @@ fn merge_short_intervals(
             if let Some(left) = result.last_mut() {
                 left.end = interval.end;
                 left.pangenome_bases += interval.pangenome_bases;
-                // Union samples: extend existing positions, add new samples
+                // Build a position index for O(1) lookup per absorbed sample.
+                let mut sample_idx: FxHashMap<u16, usize> = left
+                    .samples
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| (s.0, i))
+                    .collect();
                 for sp in interval.samples {
-                    if let Some(existing) = left.samples.iter_mut().find(|s| s.0 == sp.0) {
-                        // Extend the position range to cover the absorbed interval's coords
-                        existing.2 = existing.2.min(sp.2);
-                        existing.3 = existing.3.max(sp.3);
+                    if let Some(&i) = sample_idx.get(&sp.0) {
+                        left.samples[i].2 = left.samples[i].2.min(sp.2);
+                        left.samples[i].3 = left.samples[i].3.max(sp.3);
                     } else {
+                        sample_idx.insert(sp.0, left.samples.len());
                         left.samples.push(sp);
                     }
                 }
+                // samples remains sorted because active_samples() yielded sorted IDs;
+                // newly pushed entries from the absorbed interval are already sorted
+                // relative to existing ones only if the absorbed set is a superset disjoint
+                // from left — in the general case we must re-sort.
                 left.samples.sort_by_key(|s| s.0);
                 continue;
             }
@@ -1500,11 +1510,18 @@ fn merge_short_intervals(
                 .collect();
             result[b].start = new_start;
             result[b].pangenome_bases += extra_pb;
+            let mut sample_idx: FxHashMap<u16, usize> = result[b]
+                .samples
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (s.0, i))
+                .collect();
             for sp in absorbed_samples {
-                if let Some(existing) = result[b].samples.iter_mut().find(|s| s.0 == sp.0) {
-                    existing.2 = existing.2.min(sp.2);
-                    existing.3 = existing.3.max(sp.3);
+                if let Some(&i) = sample_idx.get(&sp.0) {
+                    result[b].samples[i].2 = result[b].samples[i].2.min(sp.2);
+                    result[b].samples[i].3 = result[b].samples[i].3.max(sp.3);
                 } else {
+                    sample_idx.insert(sp.0, result[b].samples.len());
                     result[b].samples.push(sp);
                 }
             }
@@ -1925,11 +1942,17 @@ fn batch_depth_bfs(
         })
         .collect();
 
+    let mut pending: Vec<(usize, u32, i64, i64, u16)> = Vec::new();
+    let mut queries: Vec<(u32, i64, i64)> = Vec::new();
     loop {
         // Drain all active queue items across all chunk states.
+        // This is safe because process_hop only enqueues new items at depth+1,
+        // so everything in the queue right now belongs to the same BFS level
+        // for each chunk. Draining the full queue then calling process_hop
+        // preserves level-by-level BFS ordering per chunk.
         // Items that exceed max_depth are discarded (same semantics as the
         // sequential depth_transitive_bfs which calls `continue` on depth check).
-        let mut pending: Vec<(usize, u32, i64, i64, u16)> = Vec::new();
+        pending.clear();
         for (ci, state) in states.iter_mut().enumerate() {
             while let Some((target_id, start, end, depth)) = state.queue.pop_front() {
                 if max_depth > 0 && depth >= max_depth {
@@ -1944,10 +1967,8 @@ fn batch_depth_bfs(
         }
 
         // Build query list (one entry per pending BFS item)
-        let queries: Vec<(u32, i64, i64)> = pending
-            .iter()
-            .map(|&(_, target_id, start, end, _)| (target_id, start, end))
-            .collect();
+        queries.clear();
+        queries.extend(pending.iter().map(|&(_, target_id, start, end, _)| (target_id, start, end)));
 
         // Batch query: each alignment file is loaded at most once to serve
         // all queries that reference it, then immediately freed.
@@ -2967,6 +2988,8 @@ fn sweep_line_depth(
     let mut active_bitmap = SampleBitmap::new(num_samples);
     let mut active_alns: Vec<Vec<usize>> = vec![Vec::new(); num_samples];
     let mut prev_pos: Option<i64> = None;
+    // Hoisted to avoid repeated HashMap allocation; cleared before each per-sample use.
+    let mut query_intervals_by_contig: FxHashMap<u32, Vec<(i64, i64)>> = FxHashMap::default();
 
     for event in events {
         if let Some(prev) = prev_pos {
@@ -2988,8 +3011,7 @@ fn sweep_line_depth(
 
                         // Compute query projections for ALL active alignments of this sample,
                         // grouped by query_id (contig) to correctly compute union lengths.
-                        let mut query_intervals_by_contig: FxHashMap<u32, Vec<(i64, i64)>> =
-                            FxHashMap::default();
+                        query_intervals_by_contig.clear();
                         let mut best_idx: Option<usize> = None;
                         let mut best_overlap: i64 = -1;
 
@@ -3047,7 +3069,8 @@ fn sweep_line_depth(
                     }
 
                     if !samples.is_empty() {
-                        samples.sort_by_key(|s| s.0);
+                        // active_samples() yields IDs via iter_ones() in ascending order,
+                        // so samples is already sorted — no sort needed.
                         seq_intervals.push(SparseDepthInterval {
                             start: clipped_start,
                             end: clipped_end,
@@ -3065,7 +3088,10 @@ fn sweep_line_depth(
             active_alns[event.sample_id as usize].push(event.alignment_idx);
         } else {
             active_bitmap.remove(event.sample_id);
-            active_alns[event.sample_id as usize].retain(|&idx| idx != event.alignment_idx);
+            let v = &mut active_alns[event.sample_id as usize];
+            if let Some(pos) = v.iter().position(|&idx| idx == event.alignment_idx) {
+                v.swap_remove(pos);
+            }
         }
 
         prev_pos = Some(event.position);
@@ -3105,6 +3131,8 @@ fn sweep_line_depth_streaming(
     let mut active_bitmap = SampleBitmap::new(num_samples);
     let mut active_alns: Vec<Vec<usize>> = vec![Vec::new(); num_samples];
     let mut prev_pos: Option<i64> = None;
+    // Hoisted to avoid repeated HashMap allocation; cleared before each per-sample use.
+    let mut query_intervals_by_contig: FxHashMap<u32, Vec<(i64, i64)>> = FxHashMap::default();
 
     for event in events {
         if let Some(prev) = prev_pos {
@@ -3118,8 +3146,7 @@ fn sweep_line_depth_streaming(
 
                     for sample_id in active_bitmap.active_samples() {
                         let alns = &active_alns[sample_id as usize];
-                        let mut query_intervals_by_contig: FxHashMap<u32, Vec<(i64, i64)>> =
-                            FxHashMap::default();
+                        query_intervals_by_contig.clear();
                         let mut best_idx: Option<usize> = None;
                         let mut best_overlap: i64 = -1;
 
@@ -3173,7 +3200,8 @@ fn sweep_line_depth_streaming(
                     }
 
                     if !samples.is_empty() {
-                        samples.sort_by_key(|s| s.0);
+                        // active_samples() yields IDs via iter_ones() in ascending order,
+                        // so samples is already sorted — no sort needed.
                         emit(SparseDepthInterval {
                             start: clipped_start,
                             end: clipped_end,
@@ -3190,7 +3218,10 @@ fn sweep_line_depth_streaming(
             active_alns[event.sample_id as usize].push(event.alignment_idx);
         } else {
             active_bitmap.remove(event.sample_id);
-            active_alns[event.sample_id as usize].retain(|&idx| idx != event.alignment_idx);
+            let v = &mut active_alns[event.sample_id as usize];
+            if let Some(pos) = v.iter().position(|&idx| idx == event.alignment_idx) {
+                v.swap_remove(pos);
+            }
         }
         prev_pos = Some(event.position);
     }
@@ -3861,7 +3892,6 @@ pub fn compute_depth_global(
                                 .copied()
                                 .unwrap_or(false)
                         });
-                        raw_alns.shrink_to_fit();
                     }
                     raw_alns.sort_unstable_by_key(|aln| aln.target_start);
 
@@ -3999,7 +4029,6 @@ pub fn compute_depth_global(
                             .copied()
                             .unwrap_or(false)
                     });
-                    raw_alns.shrink_to_fit();
                 }
                 raw_alns.sort_unstable_by_key(|aln| aln.target_start);
                 Some(raw_alns)
@@ -4047,6 +4076,7 @@ pub fn compute_depth_global(
                 },
             };
 
+            let mut buf: Vec<u8> = Vec::new();
             for (region_start, region_end) in unprocessed {
                 if is_transitive {
                     let gap_len = region_end - region_start;
@@ -4122,7 +4152,7 @@ pub fn compute_depth_global(
                     };
 
                     // Format output into thread-local buffer, then write atomically
-                    let mut buf: Vec<u8> = Vec::new();
+                    buf.clear();
                     write_results(region_results, &mut buf)?;
                     if !buf.is_empty() {
                         if let Some(ref w) = writer {
