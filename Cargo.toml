@@ -90,6 +90,12 @@ jemalloc = ["dep:tikv-jemallocator"]
 # `vm.max_map_count` when running `impg depth` with ≥ 10⁴ per-file indices;
 # see src/main.rs for the full rationale.
 system-alloc = []
+# Enable diagnostic eprintln! probes inside `impg depth`'s anchor-region pass-1 /
+# pass-2 / sweep-line stages (project_hop0_coords fallback, seq_anchor_coverage
+# summaries, HOP2 projections, sweep-line input). Used when triaging
+# `impg depth` ↔ `impg query -x` divergence — see PLAN_depth_100pct.md §3.3.
+# Off by default (zero overhead in the regular build).
+depth-trace = []
 
 # It can be removed once the ragc PR is merged and we switch both impg and sweepga to the same upstream rev
 [patch."https://github.com/ekg/ragc"]

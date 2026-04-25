@@ -7,8 +7,34 @@ use log::{debug, info};
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::BTreeMap;
 use std::io::{self, BufWriter, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+// ============================================================================
+// `depth-trace` cargo feature — diagnostic eprintln! probes for triaging
+// `impg depth` ↔ `impg query -x` divergence (PLAN_depth_100pct.md §3.3).
+//
+// Off by default: the macro expands to a no-op so there is zero runtime cost.
+// Enable with `cargo build --features depth-trace` to dump per-stage trace
+// records to stderr. Output is emitted as `[depth-trace] ...` lines.
+//
+// Stages emitted (greppable tags):
+//   FALLBACK  project_hop0_coords fell through to (region_start, region_end)
+//   PASS1     pass-1 finished building seq_anchor_coverage
+//   HOP2      pass-2 hop ≥ 1 hit projected through `project_hop0_coords`
+//   SWEEP     alignments handed to `sweep_line_depth` (count + unique samples)
+// ============================================================================
+#[cfg(feature = "depth-trace")]
+macro_rules! depth_trace {
+    ($($arg:tt)*) => {{
+        eprintln!("[depth-trace] {}", format_args!($($arg)*));
+    }};
+}
+#[cfg(not(feature = "depth-trace"))]
+macro_rules! depth_trace {
+    ($($arg:tt)*) => {};
+}
 
 /// Configuration for the depth command
 pub struct DepthConfig {
@@ -444,12 +470,20 @@ impl RegionDepthResult {
         }
     }
 
-    /// Add a sample position
+    /// Add a sample position. No-op if the exact `(seq_name, start, end)` tuple
+    /// is already present for this sample — this keeps the per-sample column
+    /// from emitting `pos;pos` when several distinct raw alignments project
+    /// (via linear interpolation) to coincident coordinates within the sweep
+    /// window. Distinct projected ranges are still preserved.
     pub fn add_sample_position(&mut self, sample: &str, seq_name: &str, start: i64, end: i64) {
-        self.sample_positions
-            .entry(sample.to_string())
-            .or_default()
-            .push((seq_name.to_string(), start, end));
+        let positions = self.sample_positions.entry(sample.to_string()).or_default();
+        if positions
+            .iter()
+            .any(|(s, ds, de)| s == seq_name && *ds == start && *de == end)
+        {
+            return;
+        }
+        positions.push((seq_name.to_string(), start, end));
     }
 
     /// Update depth based on sample_positions
@@ -817,11 +851,21 @@ impl Default for SampleBitmap {
     }
 }
 
-/// High-performance interval set with efficient intersection and subtraction
+/// High-performance interval set with efficient intersection and subtraction.
+///
+/// Backed by `BTreeMap<start, end>` (half-open [start, end)), invariant:
+/// intervals are sorted, non-overlapping, and non-adjacent (touching intervals
+/// are merged on insertion).
+///
+/// All mutating ops are O(log N + k) where k = number of intervals affected
+/// (typically 0-2 in `ConcurrentProcessedTracker` usage). The previous sorted
+/// `Vec` backend was O(N) per insert due to `Vec::insert`/`splice` memmove;
+/// under VGP 581-sample workloads that pushed claim_unprocessed to >90% of
+/// Phase 2 CPU as the per-sequence IntervalSet grew into the millions.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct IntervalSet {
-    /// Sorted, non-overlapping intervals [(start, end), ...]
-    intervals: Vec<(i64, i64)>,
+    /// Sorted, non-overlapping, non-adjacent intervals keyed by start
+    intervals: BTreeMap<i64, i64>,
     /// Total covered length (for quick empty check)
     total_length: i64,
 }
@@ -830,70 +874,64 @@ impl IntervalSet {
     /// Create a new empty interval set
     pub fn new() -> Self {
         Self {
-            intervals: Vec::new(),
+            intervals: BTreeMap::new(),
             total_length: 0,
         }
     }
 
     /// Create interval set with a single interval
     pub fn new_single(start: i64, end: i64) -> Self {
-        if start >= end {
-            return Self::new();
+        let mut s = Self::new();
+        if start < end {
+            s.intervals.insert(start, end);
+            s.total_length = end - start;
         }
-        Self {
-            intervals: vec![(start, end)],
-            total_length: end - start,
-        }
+        s
     }
 
-    /// Add an interval to this set (merging with existing if overlapping)
-    /// Uses binary search for O(log n) lookup instead of O(n) linear scan
+    /// Add an interval to this set (merging with existing if overlapping or touching).
+    /// O(log N + k), where k = number of intervals merged (typically 0-2).
     pub fn add(&mut self, start: i64, end: i64) {
         if start >= end {
             return;
         }
 
-        if self.intervals.is_empty() {
-            self.intervals.push((start, end));
-            self.total_length = end - start;
-            return;
-        }
+        let mut merge_start = start;
+        let mut merge_end = end;
+        let mut removed_length: i64 = 0;
 
-        // Binary search: find the first interval whose end >= start (could overlap)
-        // partition_point returns the first index where predicate is false
-        let first_overlap_idx = self
+        // Check the interval immediately before `start`: it may reach into us
+        // if prev_end >= start (touching or overlapping).
+        let prev = self
             .intervals
-            .partition_point(|&(_, iv_end)| iv_end < start);
-
-        // Find the last overlapping interval: first interval whose start > end
-        // Only search from first_overlap_idx onward
-        let last_overlap_end = first_overlap_idx
-            + self.intervals[first_overlap_idx..].partition_point(|&(iv_start, _)| iv_start <= end);
-
-        if first_overlap_idx == last_overlap_end {
-            // No overlapping intervals - just insert at correct position
-            self.intervals.insert(first_overlap_idx, (start, end));
-            self.total_length += end - start;
-        } else {
-            // Merge with overlapping intervals [first_overlap_idx, last_overlap_end)
-            let merged_start = start.min(self.intervals[first_overlap_idx].0);
-            let merged_end = end.max(self.intervals[last_overlap_end - 1].1);
-
-            // Calculate removed length
-            let removed_length: i64 = self.intervals[first_overlap_idx..last_overlap_end]
-                .iter()
-                .map(|&(s, e)| e - s)
-                .sum();
-
-            // Replace overlapping range with merged interval using drain + insert
-            self.intervals.drain(first_overlap_idx..last_overlap_end);
-            self.intervals
-                .insert(first_overlap_idx, (merged_start, merged_end));
-
-            // Update total length
-            let added_length = merged_end - merged_start;
-            self.total_length = self.total_length - removed_length + added_length;
+            .range(..start)
+            .next_back()
+            .map(|(&k, &v)| (k, v));
+        if let Some((prev_start, prev_end)) = prev {
+            if prev_end >= start {
+                merge_start = prev_start;
+                merge_end = merge_end.max(prev_end);
+                removed_length += prev_end - prev_start;
+                self.intervals.remove(&prev_start);
+            }
         }
+
+        // Any interval whose start is in [start, end] is touching or overlapping.
+        // Collect keys first to avoid iterator-invalidation during removal.
+        let keys_to_merge: Vec<i64> = self
+            .intervals
+            .range(start..=end)
+            .map(|(&k, _)| k)
+            .collect();
+        for k in keys_to_merge {
+            let v = self.intervals.remove(&k).unwrap();
+            merge_end = merge_end.max(v);
+            removed_length += v - k;
+        }
+
+        self.intervals.insert(merge_start, merge_end);
+        let added_length = merge_end - merge_start;
+        self.total_length = self.total_length - removed_length + added_length;
     }
 
     /// Check if empty
@@ -906,58 +944,94 @@ impl IntervalSet {
         self.total_length
     }
 
-    /// Get all intervals
-    pub fn intervals(&self) -> &[(i64, i64)] {
-        &self.intervals
+    /// Iterator over all intervals, sorted by start.
+    pub fn intervals(&self) -> impl Iterator<Item = (i64, i64)> + '_ {
+        self.intervals.iter().map(|(&s, &e)| (s, e))
     }
 
-    /// Subtract a single interval from this set
-    /// Uses binary search for O(log n) lookup of affected range
+    /// Iterator over intervals that overlap `[range_start, range_end)`, in order.
+    /// O(log N + k) where k is the number of overlapping intervals — much
+    /// cheaper than iterating all intervals when the set is dense.
+    pub fn iter_overlapping(
+        &self,
+        range_start: i64,
+        range_end: i64,
+    ) -> impl Iterator<Item = (i64, i64)> + '_ {
+        // An interval (s, e) overlaps [range_start, range_end) iff
+        //   s < range_end AND e > range_start.
+        // Start scanning from the predecessor of range_start (its key < range_start
+        // but it may reach forward), then through all keys < range_end.
+        let scan_from = self
+            .intervals
+            .range(..range_start)
+            .next_back()
+            .map(|(&k, _)| k)
+            .unwrap_or(i64::MIN);
+        self.intervals
+            .range(scan_from..range_end)
+            .filter_map(move |(&s, &e)| {
+                if e > range_start {
+                    Some((s, e))
+                } else {
+                    None
+                }
+            })
+    }
+
+    /// Subtract a single interval from this set.
+    /// O(log N + k), where k = number of intervals overlapping [sub_start, sub_end).
     pub fn subtract(&mut self, sub_start: i64, sub_end: i64) {
         if sub_start >= sub_end || self.intervals.is_empty() {
             return;
         }
 
-        // Binary search: find the first interval whose end > sub_start (could overlap)
-        let first_overlap_idx = self
-            .intervals
-            .partition_point(|&(_, iv_end)| iv_end <= sub_start);
-
-        // Find the last overlapping interval: first interval whose start >= sub_end
-        let last_overlap_end = first_overlap_idx
-            + self.intervals[first_overlap_idx..]
-                .partition_point(|&(iv_start, _)| iv_start < sub_end);
-
-        if first_overlap_idx == last_overlap_end {
-            // No overlapping intervals - nothing to subtract
-            return;
-        }
-
-        // Process only the affected range [first_overlap_idx, last_overlap_end)
-        let mut replacement = Vec::new();
         let mut removed_length: i64 = 0;
+        let mut to_insert: Vec<(i64, i64)> = Vec::new();
 
-        for &(iv_start, iv_end) in &self.intervals[first_overlap_idx..last_overlap_end] {
-            // Keep left portion if it exists
-            if iv_start < sub_start {
-                replacement.push((iv_start, sub_start));
+        // Predecessor (key < sub_start): may partially overlap if prev_end > sub_start.
+        let prev = self
+            .intervals
+            .range(..sub_start)
+            .next_back()
+            .map(|(&k, &v)| (k, v));
+        if let Some((prev_start, prev_end)) = prev {
+            if prev_end > sub_start {
+                // Split / trim the predecessor.
+                self.intervals.remove(&prev_start);
+                let overlap_end = prev_end.min(sub_end);
+                removed_length += overlap_end - sub_start;
+                if prev_start < sub_start {
+                    to_insert.push((prev_start, sub_start));
+                }
+                if prev_end > sub_end {
+                    to_insert.push((sub_end, prev_end));
+                }
             }
-            // Keep right portion if it exists
-            if iv_end > sub_end {
-                replacement.push((sub_end, iv_end));
-            }
-            // Calculate removed length
-            let overlap_start = iv_start.max(sub_start);
-            let overlap_end = iv_end.min(sub_end);
-            removed_length += overlap_end - overlap_start;
         }
 
-        // Replace affected range with replacement intervals
-        self.intervals
-            .splice(first_overlap_idx..last_overlap_end, replacement);
+        // All intervals whose start is in [sub_start, sub_end) are affected.
+        // Invariant guarantees they're disjoint from the predecessor case above
+        // (the predecessor can only span past sub_end if there are NO intervals
+        // with start in [sub_start, sub_end), by non-overlap).
+        let keys_in_range: Vec<i64> = self
+            .intervals
+            .range(sub_start..sub_end)
+            .map(|(&k, _)| k)
+            .collect();
+        for k in keys_in_range {
+            let v = self.intervals.remove(&k).unwrap();
+            let overlap_end = v.min(sub_end);
+            removed_length += overlap_end - k;
+            if v > sub_end {
+                to_insert.push((sub_end, v));
+            }
+        }
+
+        for (s, e) in to_insert {
+            self.intervals.insert(s, e);
+        }
         self.total_length -= removed_length;
     }
-
 }
 
 /// Map a target coordinate range to query coordinates using linear interpolation.
@@ -1055,6 +1129,24 @@ type HopZeroSeg = (i64, i64, i64, i64);
 /// region_end)` when no segment contains the range (gap between hop-0
 /// hits, or strand-specific coverage that does not match).
 #[inline]
+/// Project a hop≥1 BFS hit's target-side range `(t_start, t_end)` (lying on
+/// some intermediate hub sequence) back onto the anchor's coordinate system,
+/// using the pass-1 `seq_anchor_coverage` map of `(q_start, q_end, anc_start,
+/// anc_end)` segments registered for that hub.
+///
+/// Clip-then-project semantics:
+///
+/// - For every segment whose `(seq_start, seq_end)` overlaps the hit's
+///   `(t_start, t_end)`, clip the hit to the segment, linearly interpolate the
+///   clipped range to anchor coordinates, and union the projections.
+/// - Multiple overlapping segments contribute via min/max — equivalent to
+///   "take the convex hull of the projected ranges on anchor".
+/// - If no segment overlaps the hit, return an empty range
+///   `(region_start, region_start)` so the caller's
+///   `if a_start >= a_end { continue }` drops the hit instead of crediting the
+///   entire anchor span. This is the critical correctness fix
+///   (PLAN_depth_100pct.md §3): the previous strict-containment + whole-region
+///   fallback was the source of raw-BFS over-reports at high transitive depth.
 fn project_hop0_coords(
     segments: Option<&Vec<HopZeroSeg>>,
     t_start: i64,
@@ -1063,24 +1155,49 @@ fn project_hop0_coords(
     region_end: i64,
 ) -> (i64, i64) {
     if let Some(segs) = segments {
+        let mut proj_min: i64 = i64::MAX;
+        let mut proj_max: i64 = i64::MIN;
         for &(seq_start, seq_end, anc_start, anc_end) in segs {
-            if seq_start <= t_start && t_end <= seq_end {
-                let seq_len = seq_end - seq_start;
-                let anc_len = anc_end - anc_start;
-                if seq_len > 0 && anc_len > 0 {
-                    let frac_s = (t_start - seq_start) as f64 / seq_len as f64;
-                    let frac_e = (t_end - seq_start) as f64 / seq_len as f64;
-                    let proj_s = anc_start + (frac_s * anc_len as f64).round() as i64;
-                    let proj_e = anc_start + (frac_e * anc_len as f64).round() as i64;
-                    return (
-                        proj_s.min(proj_e).max(region_start),
-                        proj_s.max(proj_e).min(region_end),
-                    );
-                }
+            // Clip the hit's t-range into this segment.
+            let clip_s = t_start.max(seq_start);
+            let clip_e = t_end.min(seq_end);
+            if clip_s >= clip_e {
+                continue; // no overlap with this segment
+            }
+            let seq_len = seq_end - seq_start;
+            let anc_len = anc_end - anc_start;
+            if seq_len <= 0 || anc_len <= 0 {
+                continue;
+            }
+            let frac_s = (clip_s - seq_start) as f64 / seq_len as f64;
+            let frac_e = (clip_e - seq_start) as f64 / seq_len as f64;
+            let proj_s = anc_start + (frac_s * anc_len as f64).round() as i64;
+            let proj_e = anc_start + (frac_e * anc_len as f64).round() as i64;
+            let lo = proj_s.min(proj_e);
+            let hi = proj_s.max(proj_e);
+            if lo < proj_min {
+                proj_min = lo;
+            }
+            if hi > proj_max {
+                proj_max = hi;
             }
         }
+        if proj_min < proj_max {
+            return (
+                proj_min.max(region_start),
+                proj_max.min(region_end),
+            );
+        }
     }
-    (region_start, region_end)
+    // No segment overlaps the hit: drop it. Empty range routes to the caller's
+    // `if a_start >= a_end { continue }` check.
+    depth_trace!(
+        "FALLBACK project_hop0_coords t={}-{} segs={} → empty [no overlap; hit dropped]",
+        t_start,
+        t_end,
+        segments.map_or(0, |v| v.len())
+    );
+    (region_start, region_start)
 }
 // ============================================================================
 // Compact depth computation using ID-based data structures
@@ -1610,18 +1727,13 @@ impl ConcurrentProcessedTracker {
         if lock.is_empty() {
             return vec![(start, end)];
         }
-        // Subtract processed intervals from [start, end)
+        // Subtract only those processed intervals that actually overlap [start, end).
+        // `iter_overlapping` is O(log N + k) instead of O(N).
         let mut unprocessed = IntervalSet::new_single(start, end);
-        for &(s, e) in lock.intervals() {
-            if s >= end {
-                break;
-            }
-            if e <= start {
-                continue;
-            }
+        for (s, e) in lock.iter_overlapping(start, end) {
             unprocessed.subtract(s, e);
         }
-        unprocessed.intervals().to_vec()
+        unprocessed.intervals().collect()
     }
 
     /// Mark a region as processed
@@ -1643,13 +1755,14 @@ impl ConcurrentProcessedTracker {
         let unprocessed = if lock.is_empty() {
             vec![(start, end)]
         } else {
+            // Only the processed intervals that actually overlap [start, end)
+            // can affect the result. Bounded range iteration keeps each claim
+            // O(log N + k) instead of O(N).
             let mut result = IntervalSet::new_single(start, end);
-            for &(s, e) in lock.intervals() {
-                if s >= end { break; }
-                if e <= start { continue; }
+            for (s, e) in lock.iter_overlapping(start, end) {
                 result.subtract(s, e);
             }
-            result.intervals().to_vec()
+            result.intervals().collect::<Vec<_>>()
         };
         for &(s, e) in &unprocessed {
             lock.add(s, e);
@@ -2041,6 +2154,14 @@ fn process_anchor_region_transitive_raw_with_hits(
                 .push((q_start, q_end, t_start, t_end));
         }
     }
+    depth_trace!(
+        "PASS1 stage=raw_with_hits anchor={} region={}-{} hits={} keys={}",
+        anchor_seq_id,
+        region_start,
+        region_end,
+        hits.len(),
+        seq_anchor_coverage.len()
+    );
 
     // Pass 2: process all hits for depth (identical to process_anchor_region_transitive_raw)
     for hit in &hits {
@@ -2066,49 +2187,72 @@ fn process_anchor_region_transitive_raw_with_hits(
         let (full_a_start, full_a_end) = if hit.target_id == anchor_seq_id {
             (hit_t_start.max(region_start), hit_t_end.min(region_end))
         } else {
-            project_hop0_coords(
+            let p = project_hop0_coords(
                 seq_anchor_coverage.get(&hit.target_id),
                 hit_t_start,
                 hit_t_end,
                 region_start,
                 region_end,
-            )
+            );
+            depth_trace!(
+                "HOP2 stage=raw_with_hits sample={} q_id={} t_id={} t={}-{} a={}-{}",
+                query_sample_id,
+                hit.query_id,
+                hit.target_id,
+                hit_t_start,
+                hit_t_end,
+                p.0,
+                p.1
+            );
+            p
         };
         if full_a_start >= full_a_end {
             continue;
         }
 
-        let claimed = global_used.claim_unprocessed(hit.query_id, query_start, query_end);
-        if claimed.is_empty() {
-            continue;
-        }
-
-        for (uq_start, uq_end) in claimed {
-            discovered_regions.push((hit.query_id, uq_start, uq_end));
-            let (ua_start, ua_end) = inverse_map_query_to_target(
-                full_a_start,
-                full_a_end,
-                query_start,
-                query_end,
-                uq_start,
-                uq_end,
-                hit.is_reverse,
-            );
-            if ua_start >= ua_end {
-                continue;
-            }
+        // Always add the hit to the sweep-line for correct depth counting. See
+        // process_anchor_region_raw_streaming for the full rationale — gating
+        // the sweep on claim_unprocessed undercounts samples when another anchor
+        // has already claimed the query range.
+        let (ua_start, ua_end) = inverse_map_query_to_target(
+            full_a_start,
+            full_a_end,
+            query_start,
+            query_end,
+            query_start,
+            query_end,
+            hit.is_reverse,
+        );
+        if ua_start < ua_end {
             alignments.push(CompactAlignmentInfo::new(
                 query_sample_id,
                 hit.query_id,
-                uq_start,
-                uq_end,
+                query_start,
+                query_end,
                 ua_start,
                 ua_end,
                 hit.is_reverse,
             ));
         }
+
+        let claimed = global_used.claim_unprocessed(hit.query_id, query_start, query_end);
+        for (uq_start, uq_end) in claimed {
+            discovered_regions.push((hit.query_id, uq_start, uq_end));
+        }
     }
 
+    #[cfg(feature = "depth-trace")]
+    {
+        let unique: FxHashSet<u16> = alignments.iter().map(|a| a.sample_id).collect();
+        depth_trace!(
+            "SWEEP stage=raw_with_hits anchor={} region={}-{} alignments={} unique_samples={}",
+            anchor_seq_id,
+            region_start,
+            region_end,
+            alignments.len(),
+            unique.len()
+        );
+    }
     let seq_intervals = sweep_line_depth(&alignments, num_samples, region_start, region_end);
 
     AnchorRegionResult {
@@ -2355,6 +2499,14 @@ fn process_anchor_region_transitive_raw(
                 .push((q_start, q_end, t_start, t_end));
         }
     }
+    depth_trace!(
+        "PASS1 stage=transitive_raw anchor={} region={}-{} hits={} keys={}",
+        anchor_seq_id,
+        region_start,
+        region_end,
+        hits.len(),
+        seq_anchor_coverage.len()
+    );
 
     // Pass 2: Process all hits for depth
     for hit in &hits {
@@ -2384,46 +2536,57 @@ fn process_anchor_region_transitive_raw(
         let (full_a_start, full_a_end) = if hit.target_id == anchor_seq_id {
             (hit_t_start.max(region_start), hit_t_end.min(region_end))
         } else {
-            project_hop0_coords(
+            let p = project_hop0_coords(
                 seq_anchor_coverage.get(&hit.target_id),
                 hit_t_start, hit_t_end,
                 region_start, region_end,
-            )
+            );
+            depth_trace!(
+                "HOP2 stage=transitive_raw sample={} q_id={} t_id={} t={}-{} a={}-{}",
+                query_sample_id, hit.query_id, hit.target_id,
+                hit_t_start, hit_t_end, p.0, p.1
+            );
+            p
         };
         if full_a_start >= full_a_end {
             continue;
         }
 
-        // Atomically claim unconsumed sub-ranges of this query sequence
-        let claimed = global_used.claim_unprocessed(hit.query_id, query_start, query_end);
-        if claimed.is_empty() {
-            continue;
-        }
-
-        for (uq_start, uq_end) in claimed {
-            discovered_regions.push((hit.query_id, uq_start, uq_end));
-            // Map query sub-range proportionally within the full query→anchor mapping
-            let (ua_start, ua_end) = inverse_map_query_to_target(
-                full_a_start, full_a_end,
-                query_start, query_end,
-                uq_start, uq_end,
-                hit.is_reverse,
-            );
-            if ua_start >= ua_end {
-                continue;
-            }
+        // Always add the hit to the sweep-line for correct depth counting. See
+        // process_anchor_region_raw_streaming for the full rationale.
+        let (ua_start, ua_end) = inverse_map_query_to_target(
+            full_a_start, full_a_end,
+            query_start, query_end,
+            query_start, query_end,
+            hit.is_reverse,
+        );
+        if ua_start < ua_end {
             alignments.push(CompactAlignmentInfo::new(
                 query_sample_id,
                 hit.query_id,
-                uq_start,
-                uq_end,
+                query_start,
+                query_end,
                 ua_start,
                 ua_end,
                 hit.is_reverse,
             ));
         }
+
+        let claimed = global_used.claim_unprocessed(hit.query_id, query_start, query_end);
+        for (uq_start, uq_end) in claimed {
+            discovered_regions.push((hit.query_id, uq_start, uq_end));
+        }
     }
 
+    #[cfg(feature = "depth-trace")]
+    {
+        let unique: FxHashSet<u16> = alignments.iter().map(|a| a.sample_id).collect();
+        depth_trace!(
+            "SWEEP stage=transitive_raw anchor={} region={}-{} alignments={} unique_samples={}",
+            anchor_seq_id, region_start, region_end,
+            alignments.len(), unique.len()
+        );
+    }
     // Sweep-line to compute depth intervals
     let seq_intervals = sweep_line_depth(&alignments, num_samples, region_start, region_end);
 
@@ -2685,34 +2848,23 @@ fn process_anchor_region_raw(
             (cqs.min(cqe), cqs.max(cqe))
         };
 
-        // Atomically claim unconsumed sub-ranges of this query sequence
+        // Always add the alignment to the sweep-line for correct depth counting.
+        // See the streaming variant for the full rationale — gating the sweep on
+        // claim_unprocessed causes samples that genuinely cover the anchor region
+        // to be omitted when their query range was claimed by a prior anchor.
+        alignments.push(CompactAlignmentInfo::new(
+            query_sample_id,
+            aln.query_id,
+            cq_start,
+            cq_end,
+            clipped_target_start,
+            clipped_target_end,
+            aln.is_reverse,
+        ));
+
         let claimed = global_used.claim_unprocessed(aln.query_id, cq_start, cq_end);
-        if claimed.is_empty() {
-            continue;
-        }
-
-        // Record discovered region using clipped coords
-        discovered_regions.push((aln.query_id, cq_start, cq_end));
-
-        for (uq_start, uq_end) in claimed {
-            let (ut_start, ut_end) = inverse_map_query_to_target(
-                target_start, target_end,
-                query_start, query_end,
-                uq_start, uq_end,
-                aln.is_reverse,
-            );
-            if ut_start >= ut_end {
-                continue;
-            }
-            alignments.push(CompactAlignmentInfo::new(
-                query_sample_id,
-                aln.query_id,
-                uq_start,
-                uq_end,
-                ut_start.max(region_start),
-                ut_end.min(region_end),
-                aln.is_reverse,
-            ));
+        if !claimed.is_empty() {
+            discovered_regions.push((aln.query_id, cq_start, cq_end));
         }
     }
 
@@ -2817,6 +2969,14 @@ fn process_anchor_region_transitive_cigar(
                 .push((q_start, q_end, t_start, t_end));
         }
     }
+    depth_trace!(
+        "PASS1 stage=transitive_cigar anchor={} region={}-{} overlaps={} keys={}",
+        anchor_seq_id,
+        region_start,
+        region_end,
+        overlaps.len(),
+        seq_anchor_coverage.len()
+    );
 
     // Pass 2: Process all results for depth
     for overlap in &overlaps {
@@ -2852,42 +3012,45 @@ fn process_anchor_region_transitive_cigar(
         let (full_a_start, full_a_end) = if target_interval.metadata == anchor_seq_id {
             (hit_t_start.max(region_start), hit_t_end.min(region_end))
         } else {
-            project_hop0_coords(
+            let p = project_hop0_coords(
                 seq_anchor_coverage.get(&target_interval.metadata),
                 hit_t_start, hit_t_end,
                 region_start, region_end,
-            )
+            );
+            depth_trace!(
+                "HOP2 stage=transitive_cigar sample={} q_id={} t_id={} t={}-{} a={}-{}",
+                query_sample_id, query_id, target_interval.metadata,
+                hit_t_start, hit_t_end, p.0, p.1
+            );
+            p
         };
         if full_a_start >= full_a_end {
             continue;
         }
 
-        // Atomically claim unconsumed sub-ranges of this query sequence
-        let claimed = global_used.claim_unprocessed(query_id, query_start, query_end);
-        if claimed.is_empty() {
-            continue;
-        }
-
-        for (uq_start, uq_end) in claimed {
-            discovered_regions.push((query_id, uq_start, uq_end));
-            let (ua_start, ua_end) = inverse_map_query_to_target(
-                full_a_start, full_a_end,
-                query_start, query_end,
-                uq_start, uq_end,
-                is_reverse,
-            );
-            if ua_start >= ua_end {
-                continue;
-            }
+        // Always add the hit to the sweep-line for correct depth counting. See
+        // process_anchor_region_raw_streaming for the full rationale.
+        let (ua_start, ua_end) = inverse_map_query_to_target(
+            full_a_start, full_a_end,
+            query_start, query_end,
+            query_start, query_end,
+            is_reverse,
+        );
+        if ua_start < ua_end {
             alignments.push(CompactAlignmentInfo::new(
                 query_sample_id,
                 query_id,
-                uq_start,
-                uq_end,
+                query_start,
+                query_end,
                 ua_start,
                 ua_end,
                 is_reverse,
             ));
+        }
+
+        let claimed = global_used.claim_unprocessed(query_id, query_start, query_end);
+        for (uq_start, uq_end) in claimed {
+            discovered_regions.push((query_id, uq_start, uq_end));
         }
     }
 
@@ -2919,6 +3082,15 @@ fn process_anchor_region_transitive_cigar(
         discovered_regions.push((aln.query_id, aln.query_start as i64, aln.query_end as i64));
     }
 
+    #[cfg(feature = "depth-trace")]
+    {
+        let unique: FxHashSet<u16> = alignments.iter().map(|a| a.sample_id).collect();
+        depth_trace!(
+            "SWEEP stage=transitive_cigar anchor={} region={}-{} alignments={} unique_samples={}",
+            anchor_seq_id, region_start, region_end,
+            alignments.len(), unique.len()
+        );
+    }
     // Sweep-line to compute depth intervals
     let seq_intervals = sweep_line_depth(&alignments, num_samples, region_start, region_end);
 
@@ -3299,34 +3471,29 @@ fn process_anchor_region_raw_streaming(
             (cqs.min(cqe), cqs.max(cqe))
         };
 
-        // Atomically claim unconsumed sub-ranges of this query sequence
+        // Always add the alignment to the sweep-line for correct depth counting.
+        // Depth at the anchor's target position is a function of sample coverage
+        // and is independent of which anchor "owns" the query sub-range for output.
+        // Using claim_unprocessed to gate the sweep causes samples that genuinely
+        // cover the anchor region to be omitted when their query range was claimed
+        // by a prior anchor, producing a silent undercount.
+        alignments.push(CompactAlignmentInfo::new(
+            query_sample_id,
+            aln.query_id,
+            cq_start,
+            cq_end,
+            clipped_target_start,
+            clipped_target_end,
+            aln.is_reverse,
+        ));
+
+        // claim_unprocessed still atomically marks the query range in global_used
+        // and tells us which sub-ranges this anchor newly owns. We only push to
+        // discovered_regions when this anchor won the claim race — preventing the
+        // tracker from double-counting anchor ownership.
         let claimed = global_used.claim_unprocessed(aln.query_id, cq_start, cq_end);
-        if claimed.is_empty() {
-            continue;
-        }
-
-        // Record discovered region using clipped coords
-        discovered_regions.push((aln.query_id, cq_start, cq_end));
-
-        for (uq_start, uq_end) in claimed {
-            let (ut_start, ut_end) = inverse_map_query_to_target(
-                target_start, target_end,
-                query_start, query_end,
-                uq_start, uq_end,
-                aln.is_reverse,
-            );
-            if ut_start >= ut_end {
-                continue;
-            }
-            alignments.push(CompactAlignmentInfo::new(
-                query_sample_id,
-                aln.query_id,
-                uq_start,
-                uq_end,
-                ut_start.max(region_start),
-                ut_end.min(region_end),
-                aln.is_reverse,
-            ));
+        if !claimed.is_empty() {
+            discovered_regions.push((aln.query_id, cq_start, cq_end));
         }
     }
 
@@ -4249,17 +4416,14 @@ pub fn compute_depth_global(
                 let rid = row_counter.fetch_add(1, Ordering::Relaxed) + 1;
                 let mut w = w.lock();
 
-                // Output as depth=1 for entire sequence
-                write!(w, "{}\t{}\t1", rid, seq_len)?;
-                for sample_id in 0..num_samples as u16 {
-                    let current_sample = sample_index.get_name(sample_id).unwrap_or("");
-                    if current_sample == sample_name {
-                        write!(w, "\t{}:0-{}", seq_name, seq_len)?;
-                    } else {
-                        write!(w, "\tNA")?;
-                    }
-                }
-                writeln!(w)?;
+                // Output as depth=1 for entire sequence. Match the normal row
+                // format: id, length, depth, positions (semicolon-separated);
+                // for an unaligned FAI scaffold the positions list has exactly
+                // one entry — the sequence itself.
+                let _ = num_samples;
+                let _ = sample_index;
+                let _ = sample_name;
+                writeln!(w, "{}\t{}\t1\t{}:0-{}", rid, seq_len, seq_name, seq_len)?;
             }
         }
     }
@@ -4625,6 +4789,14 @@ pub fn query_region_depth(
                     .push((q_start, q_end, t_start, t_end));
             }
         }
+        depth_trace!(
+            "PASS1 stage=region_use_bfs target={} region={}-{} overlaps={} keys={}",
+            target_id,
+            region_start,
+            region_end,
+            overlaps.len(),
+            seq_anchor_coverage.len()
+        );
 
         // Pass 2: Process all results for depth
         for overlap in &overlaps {
@@ -4659,13 +4831,19 @@ pub fn query_region_depth(
             } else {
                 let t_start = target_interval.first.min(target_interval.last) as i64;
                 let t_end = target_interval.first.max(target_interval.last) as i64;
-                project_hop0_coords(
+                let p = project_hop0_coords(
                     seq_anchor_coverage.get(&target_interval.metadata),
                     t_start,
                     t_end,
                     region_start,
                     region_end,
-                )
+                );
+                depth_trace!(
+                    "HOP2 stage=region_use_bfs sample={} q_id={} t_id={} t={}-{} a={}-{}",
+                    sample, query_id, target_interval.metadata,
+                    t_start, t_end, p.0, p.1
+                );
+                p
             };
 
             if a_start >= a_end {
@@ -4712,6 +4890,14 @@ pub fn query_region_depth(
                     .push((q_start, q_end, t_start, t_end));
             }
         }
+        depth_trace!(
+            "PASS1 stage=region_raw_bfs target={} region={}-{} hits={} keys={}",
+            target_id,
+            region_start,
+            region_end,
+            hits.len(),
+            seq_anchor_coverage.len()
+        );
 
         // Pass 2: Process all hits for depth
         for hit in &hits {
@@ -4741,13 +4927,19 @@ pub fn query_region_depth(
             } else {
                 let t_start = hit.target_start.min(hit.target_end) as i64;
                 let t_end = hit.target_start.max(hit.target_end) as i64;
-                project_hop0_coords(
+                let p = project_hop0_coords(
                     seq_anchor_coverage.get(&hit.target_id),
                     t_start,
                     t_end,
                     region_start,
                     region_end,
-                )
+                );
+                depth_trace!(
+                    "HOP2 stage=region_raw_bfs sample={} q_id={} t_id={} t={}-{} a={}-{}",
+                    sample, hit.query_id, hit.target_id,
+                    t_start, t_end, p.0, p.1
+                );
+                p
             };
 
             if a_start >= a_end {
@@ -4944,8 +5136,51 @@ pub fn query_region_depth(
         });
     }
 
+    // Deduplicate alignments before sweep-line. Two sources of duplicates:
+    //   1. V2 bidirectional indices store every alignment twice (target→query
+    //      and query→target). Querying one side returns both copies.
+    //   2. All-vs-all PAF inputs (e.g. both A_vs_B.paf and B_vs_A.paf) further
+    //      double each entry because each direction is indexed separately.
+    //   3. The non-transitive paths above include the input range as
+    //      `impg.query`'s result[0], and we also unconditionally push self at
+    //      the end of this function — duplicating the anchor sample.
+    // `impg query` collapses these via `merge_query_adjusted_intervals` at
+    // output time; depth's sweep-line, by contrast, would emit `pos;pos` in
+    // the per-sample column. Dedup the alignment vec in place to match.
+    alignments.sort_by(|a, b| {
+        a.query_name
+            .cmp(&b.query_name)
+            .then(a.query_start.cmp(&b.query_start))
+            .then(a.query_end.cmp(&b.query_end))
+            .then(a.target_start.cmp(&b.target_start))
+            .then(a.target_end.cmp(&b.target_end))
+            .then(a.is_reverse.cmp(&b.is_reverse))
+    });
+    alignments.dedup_by(|a, b| {
+        a.query_name == b.query_name
+            && a.query_start == b.query_start
+            && a.query_end == b.query_end
+            && a.target_start == b.target_start
+            && a.target_end == b.target_end
+            && a.is_reverse == b.is_reverse
+    });
+
     // Compute depth windows using sweep-line
     let seq_len = impg.seq_index().get_len_from_id(target_id).unwrap_or(0) as i64;
+    #[cfg(feature = "depth-trace")]
+    {
+        let unique: std::collections::BTreeSet<&str> =
+            alignments.iter().map(|a| a.sample.as_str()).collect();
+        depth_trace!(
+            "SWEEP stage=region target_seq={} target_range={}-{} alignments={} unique_samples={} samples={:?}",
+            target_seq,
+            target_start,
+            target_end,
+            alignments.len(),
+            unique.len(),
+            unique
+        );
+    }
     let results = compute_sweep_line_depth_multi(target_seq, seq_len, &alignments, config);
 
     // Filter results to only include the query region
@@ -5073,6 +5308,326 @@ mod tests {
     }
 
     #[test]
+    fn test_interval_set_add_merge_touching_and_overlapping() {
+        let mut s = IntervalSet::new();
+        s.add(10, 20);
+        s.add(30, 40);
+        s.add(20, 30); // touches both neighbors -> merged
+        assert_eq!(s.intervals().collect::<Vec<_>>(), vec![(10, 40)]);
+        assert_eq!(s.total_length(), 30);
+
+        // Overlapping add that subsumes multiple
+        let mut t = IntervalSet::new();
+        t.add(0, 10);
+        t.add(20, 30);
+        t.add(40, 50);
+        t.add(5, 45);
+        assert_eq!(t.intervals().collect::<Vec<_>>(), vec![(0, 50)]);
+        assert_eq!(t.total_length(), 50);
+
+        // Idempotent re-add
+        let mut u = IntervalSet::new_single(0, 100);
+        u.add(30, 70);
+        assert_eq!(u.intervals().collect::<Vec<_>>(), vec![(0, 100)]);
+        assert_eq!(u.total_length(), 100);
+    }
+
+    #[test]
+    fn test_interval_set_subtract_splits_and_trims() {
+        // Full split
+        let mut s = IntervalSet::new_single(0, 100);
+        s.subtract(30, 70);
+        assert_eq!(s.intervals().collect::<Vec<_>>(), vec![(0, 30), (70, 100)]);
+        assert_eq!(s.total_length(), 60);
+
+        // Left trim
+        let mut t = IntervalSet::new_single(0, 100);
+        t.subtract(0, 40);
+        assert_eq!(t.intervals().collect::<Vec<_>>(), vec![(40, 100)]);
+
+        // Right trim
+        let mut u = IntervalSet::new_single(0, 100);
+        u.subtract(60, 100);
+        assert_eq!(u.intervals().collect::<Vec<_>>(), vec![(0, 60)]);
+
+        // Subtract spanning multiple
+        let mut v = IntervalSet::new();
+        v.add(0, 20);
+        v.add(30, 50);
+        v.add(60, 80);
+        v.subtract(10, 70);
+        assert_eq!(v.intervals().collect::<Vec<_>>(), vec![(0, 10), (70, 80)]);
+        assert_eq!(v.total_length(), 20);
+
+        // No-op (disjoint)
+        let mut w = IntervalSet::new_single(0, 50);
+        w.subtract(100, 200);
+        assert_eq!(w.intervals().collect::<Vec<_>>(), vec![(0, 50)]);
+        assert_eq!(w.total_length(), 50);
+    }
+
+    #[test]
+    fn test_interval_set_fuzz_equivalence_to_boolean_bitmap() {
+        // Cross-check IntervalSet against a naive bitmap reference over
+        // 10,000 random add/subtract ops in a bounded universe.
+        use std::collections::BTreeMap as BM;
+        let _ = BM::<i64, i64>::new(); // silence unused import if any
+
+        // Deterministic LCG to keep the test reproducible without adding deps
+        let mut state: u64 = 0xdead_beef_cafe_babe;
+        let mut rand_u32 = || -> u32 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 32) as u32
+        };
+
+        const U: usize = 4096;
+        let mut bitmap = vec![false; U];
+        let mut set = IntervalSet::new();
+
+        for _ in 0..10_000 {
+            let a = (rand_u32() as usize) % U;
+            let b = (rand_u32() as usize) % U;
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            let is_add = rand_u32() & 1 == 0;
+            if is_add {
+                for i in lo..hi { bitmap[i] = true; }
+                set.add(lo as i64, hi as i64);
+            } else {
+                for i in lo..hi { bitmap[i] = false; }
+                set.subtract(lo as i64, hi as i64);
+            }
+
+            // Materialize bitmap to intervals
+            let mut expected: Vec<(i64, i64)> = Vec::new();
+            let mut i = 0;
+            while i < U {
+                if bitmap[i] {
+                    let start = i;
+                    while i < U && bitmap[i] { i += 1; }
+                    expected.push((start as i64, i as i64));
+                } else {
+                    i += 1;
+                }
+            }
+
+            let got: Vec<(i64, i64)> = set.intervals().collect();
+            assert_eq!(got, expected,
+                "mismatch after op lo={} hi={} add={}", lo, hi, is_add);
+
+            let expected_total: i64 = expected.iter().map(|(s, e)| e - s).sum();
+            assert_eq!(set.total_length(), expected_total,
+                "total_length mismatch: expected={}, got={}", expected_total, set.total_length());
+        }
+    }
+
+    // Old Vec-backed IntervalSet, inlined verbatim for side-by-side
+    // benchmarking against the BTreeMap-backed implementation.
+    struct OldIntervalSetVec {
+        intervals: Vec<(i64, i64)>,
+        total_length: i64,
+    }
+
+    impl OldIntervalSetVec {
+        fn new() -> Self { Self { intervals: Vec::new(), total_length: 0 } }
+        fn new_single(s: i64, e: i64) -> Self {
+            if s >= e { Self::new() }
+            else { Self { intervals: vec![(s, e)], total_length: e - s } }
+        }
+        fn add(&mut self, start: i64, end: i64) {
+            if start >= end { return; }
+            if self.intervals.is_empty() {
+                self.intervals.push((start, end));
+                self.total_length = end - start;
+                return;
+            }
+            let first_overlap_idx = self.intervals.partition_point(|&(_, e)| e < start);
+            let last_overlap_end = first_overlap_idx
+                + self.intervals[first_overlap_idx..].partition_point(|&(s, _)| s <= end);
+            if first_overlap_idx == last_overlap_end {
+                self.intervals.insert(first_overlap_idx, (start, end));
+                self.total_length += end - start;
+            } else {
+                let ms = start.min(self.intervals[first_overlap_idx].0);
+                let me = end.max(self.intervals[last_overlap_end - 1].1);
+                let removed: i64 = self.intervals[first_overlap_idx..last_overlap_end]
+                    .iter().map(|&(s, e)| e - s).sum();
+                self.intervals.drain(first_overlap_idx..last_overlap_end);
+                self.intervals.insert(first_overlap_idx, (ms, me));
+                self.total_length = self.total_length - removed + (me - ms);
+            }
+        }
+        fn subtract(&mut self, ss: i64, se: i64) {
+            if ss >= se || self.intervals.is_empty() { return; }
+            let first_overlap_idx = self.intervals.partition_point(|&(_, e)| e <= ss);
+            let last_overlap_end = first_overlap_idx
+                + self.intervals[first_overlap_idx..].partition_point(|&(s, _)| s < se);
+            if first_overlap_idx == last_overlap_end { return; }
+            let mut repl = Vec::new();
+            let mut removed: i64 = 0;
+            for &(s, e) in &self.intervals[first_overlap_idx..last_overlap_end] {
+                if s < ss { repl.push((s, ss)); }
+                if e > se { repl.push((se, e)); }
+                let os = s.max(ss);
+                let oe = e.min(se);
+                removed += oe - os;
+            }
+            self.intervals.splice(first_overlap_idx..last_overlap_end, repl);
+            self.total_length -= removed;
+        }
+        fn total_length(&self) -> i64 { self.total_length }
+        fn intervals(&self) -> &[(i64, i64)] { &self.intervals }
+    }
+
+    // Simulates the inner claim_unprocessed path using the old impl.
+    fn old_claim(set: &mut OldIntervalSetVec, start: i64, end: i64) -> Vec<(i64, i64)> {
+        let unprocessed = if set.intervals().is_empty() {
+            vec![(start, end)]
+        } else {
+            let mut result = OldIntervalSetVec::new_single(start, end);
+            for &(s, e) in set.intervals() {
+                if s >= end { break; }
+                if e <= start { continue; }
+                result.subtract(s, e);
+            }
+            result.intervals().to_vec()
+        };
+        for &(s, e) in &unprocessed {
+            set.add(s, e);
+        }
+        unprocessed
+    }
+
+    fn lcg_step(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *state
+    }
+
+    /// Ignored side-by-side perf smoke: old Vec-backed vs new BTreeMap-backed
+    /// IntervalSet under the VGP-style claim_unprocessed workload.
+    #[test]
+    #[ignore]
+    fn bench_interval_set_oldvsnew_claim_scaling() {
+        use std::time::Instant;
+        const UNIVERSE: u64 = 1_000_000_000_000;
+        const CLAIM_W: u64 = 10_000;
+        const OPS: usize = 1000;
+
+        println!();
+        println!(
+            "  {:>10}  {:>12}  {:>12}  {:>8}",
+            "size_N", "old_us/op", "new_us/op", "speedup"
+        );
+        for &target_size in &[1_000usize, 10_000, 100_000, 1_000_000] {
+            // Seed both impls with the identical sequence of intervals so
+            // their states stay in sync; count only disjoint inserts.
+            let mut state = 0xdeadbeefcafebabe_u64;
+            let mut old_set = OldIntervalSetVec::new();
+            let mut new_set = IntervalSet::new();
+            let mut inserted = 0usize;
+            while inserted < target_size {
+                let s = lcg_step(&mut state) % (UNIVERSE - CLAIM_W);
+                let e = s + CLAIM_W;
+                let b_old = old_set.total_length();
+                old_set.add(s as i64, e as i64);
+                new_set.add(s as i64, e as i64);
+                if old_set.total_length() == b_old + CLAIM_W as i64 {
+                    inserted += 1;
+                }
+            }
+            assert_eq!(old_set.total_length(), new_set.total_length());
+
+            // Save RNG checkpoint so both impls see identical op sequences.
+            let ops_state_init = state;
+
+            state = ops_state_init;
+            let t_old = Instant::now();
+            for _ in 0..OPS {
+                let s = lcg_step(&mut state) % (UNIVERSE - CLAIM_W);
+                let e = s + CLAIM_W;
+                let _ = old_claim(&mut old_set, s as i64, e as i64);
+            }
+            let old_elapsed = t_old.elapsed();
+
+            state = ops_state_init;
+            let tracker = ConcurrentProcessedTracker::new(1);
+            *tracker.processed[0].lock() = new_set;
+            let t_new = Instant::now();
+            for _ in 0..OPS {
+                let s = lcg_step(&mut state) % (UNIVERSE - CLAIM_W);
+                let e = s + CLAIM_W;
+                let _ = tracker.claim_unprocessed(0, s as i64, e as i64);
+            }
+            let new_elapsed = t_new.elapsed();
+
+            let old_us = old_elapsed.as_secs_f64() * 1e6 / OPS as f64;
+            let new_us = new_elapsed.as_secs_f64() * 1e6 / OPS as f64;
+            println!(
+                "  {:>10}  {:>12.3}  {:>12.3}  {:>7.1}x",
+                target_size,
+                old_us,
+                new_us,
+                old_us / new_us
+            );
+        }
+    }
+
+    /// Ignored perf-smoke that approximates the VGP depth workload:
+    /// repeatedly claim unprocessed ranges at random query offsets in a
+    /// single IntervalSet that grows into the millions. With the old
+    /// sorted-Vec backend this is O(N²); the BTreeMap backend keeps each
+    /// op at O(log N). Run with:
+    ///     cargo test --release --lib \
+    ///         commands::depth::tests::bench_interval_set_claim_scaling \
+    ///         -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_interval_set_claim_scaling() {
+        use std::time::Instant;
+
+        const UNIVERSE: u64 = 1_000_000_000_000;
+        const CLAIM_W: u64 = 10_000;
+        const OPS: usize = 1000;
+
+        for &target_size in &[1_000usize, 10_000, 100_000, 1_000_000] {
+            let mut state = 0x1234_5678_9abc_def0_u64;
+            let mut set = IntervalSet::new();
+            let mut inserted = 0usize;
+            while inserted < target_size {
+                let s = lcg_step(&mut state) % (UNIVERSE - CLAIM_W);
+                let e = s + CLAIM_W;
+                let before = set.total_length();
+                set.add(s as i64, e as i64);
+                if set.total_length() == before + CLAIM_W as i64 {
+                    inserted += 1;
+                }
+            }
+
+            let tracker = ConcurrentProcessedTracker::new(1);
+            *tracker.processed[0].lock() = set;
+
+            let t0 = Instant::now();
+            for _ in 0..OPS {
+                let s = lcg_step(&mut state) % (UNIVERSE - CLAIM_W);
+                let e = s + CLAIM_W;
+                let _ = tracker.claim_unprocessed(0, s as i64, e as i64);
+            }
+            let elapsed = t0.elapsed();
+
+            let final_size = tracker.processed[0].lock().intervals().count();
+            println!(
+                "IntervalSet size={:>8} -> {:>8} | {} ops in {:>9.3} ms | {:>8.2} us/op",
+                target_size,
+                final_size,
+                OPS,
+                elapsed.as_secs_f64() * 1000.0,
+                elapsed.as_secs_f64() * 1e6 / OPS as f64,
+            );
+        }
+    }
+
+    #[test]
     fn test_is_self_alignment_same_sample_different_contigs() {
         assert!(is_self_alignment(1, 1, 10, 10));
         assert!(is_self_alignment(1, 1, 10, 20));
@@ -5119,10 +5674,13 @@ mod tests {
 
         let segments: Vec<HopZeroSeg> = vec![(100, 200, 50, 150), (800, 900, 60, 140)];
 
-        // In the gap between hop-0 segments: fallback.
+        // In the gap between hop-0 segments: drop the hit (empty range so the
+        // caller's `if a_start >= a_end { continue }` skips it). The previous
+        // whole-region fallback caused raw-BFS over-reports at high transitive
+        // depth — see PLAN_depth_100pct.md §3 for the correctness rationale.
         assert_eq!(
             project_hop0_coords(Some(&segments), 500, 600, region_start, region_end),
-            (region_start, region_end)
+            (region_start, region_start)
         );
 
         // Inside first segment: linear projection into [50,150).
@@ -5138,10 +5696,11 @@ mod tests {
             (76, 124)
         );
 
-        // No segments at all: fallback.
+        // No segments at all: drop the hit. The empty range routes the caller
+        // to its "skip" branch instead of crediting the whole anchor span.
         assert_eq!(
             project_hop0_coords(None, 500, 600, region_start, region_end),
-            (region_start, region_end)
+            (region_start, region_start)
         );
     }
 }
