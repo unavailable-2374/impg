@@ -1213,6 +1213,19 @@ struct CompactDepthEvent {
     alignment_idx: usize,
 }
 
+impl CompactDepthEvent {
+    /// Pack (position, !is_start, sample_id) into a single u64 sort key matching
+    /// the Ord impl: position ascending, then starts before ends, then sample_id.
+    /// Assumes 0 <= position < 2^47 (chr length << 2^47).
+    #[inline]
+    fn packed_sort_key(&self) -> u64 {
+        debug_assert!(self.position >= 0 && self.position < (1i64 << 47));
+        ((self.position as u64) << 17)
+            | ((!self.is_start as u64) << 16)
+            | (self.sample_id as u64)
+    }
+}
+
 impl Ord for CompactDepthEvent {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.position
@@ -1911,6 +1924,7 @@ impl ConcurrentProcessedTracker {
     /// alignment — at CHM13 / 580-sample scale that is tens of millions of
     /// invocations and the original Vec allocation showed up as significant
     /// allocator pressure under jemalloc profiling).
+    #[allow(dead_code)] // retained for parity tests vs claim_any_unprocessed_batch
     fn claim_any_unprocessed(&self, seq_id: u32, start: i64, end: i64) -> bool {
         if start >= end {
             return false;
@@ -1937,6 +1951,49 @@ impl ConcurrentProcessedTracker {
         };
         lock.add(start, end);
         any_unprocessed
+    }
+
+    /// Batched [`claim_any_unprocessed`] for one `seq_id`: takes the per-seq
+    /// mutex once and processes `ranges` in input order, with the same
+    /// per-range semantics as the single-shot version. The output is appended
+    /// to `out` in input order so callers can map results back to range indices.
+    /// End state and per-range bool sequence are identical to N serial calls.
+    fn claim_any_unprocessed_batch(
+        &self,
+        seq_id: u32,
+        ranges: &[(i64, i64)],
+        out: &mut Vec<bool>,
+    ) {
+        out.reserve(ranges.len());
+        if ranges.is_empty() {
+            return;
+        }
+        let mut lock = self.processed[seq_id as usize].lock();
+        for &(start, end) in ranges {
+            if start >= end {
+                out.push(false);
+                continue;
+            }
+            let span = end - start;
+            let any_unprocessed = if lock.is_empty() {
+                true
+            } else {
+                let mut covered: i64 = 0;
+                for (s, e) in lock.iter_overlapping(start, end) {
+                    let cs = s.max(start);
+                    let ce = e.min(end);
+                    if ce > cs {
+                        covered += ce - cs;
+                        if covered >= span {
+                            break;
+                        }
+                    }
+                }
+                covered < span
+            };
+            lock.add(start, end);
+            out.push(any_unprocessed);
+        }
     }
 }
 
@@ -2060,7 +2117,7 @@ impl BfsChunkState {
         Self {
             queue,
             visited_ranges,
-            results: Vec::new(),
+            results: Vec::with_capacity(64),
         }
     }
 
@@ -2295,10 +2352,10 @@ fn process_anchor_region_transitive_raw_with_hits(
     min_seq_length: i64,
     global_used: &ConcurrentProcessedTracker,
 ) -> AnchorRegionResult {
-    let mut discovered_regions: Vec<(u32, i64, i64)> = Vec::new();
+    let mut discovered_regions: Vec<(u32, i64, i64)> = Vec::with_capacity(hits.len() + 1);
     discovered_regions.push((anchor_seq_id, region_start, region_end));
 
-    let mut alignments: Vec<CompactAlignmentInfo> = Vec::new();
+    let mut alignments: Vec<CompactAlignmentInfo> = Vec::with_capacity(hits.len() + 1);
     alignments.push(CompactAlignmentInfo::new(
         anchor_sample_id,
         anchor_seq_id,
@@ -2946,10 +3003,11 @@ fn process_anchor_region_raw(
     region_end: i64,
     global_used: &ConcurrentProcessedTracker,
 ) -> AnchorRegionResult {
-    let mut discovered_regions: Vec<(u32, i64, i64)> = Vec::new();
+    let mut discovered_regions: Vec<(u32, i64, i64)> = Vec::with_capacity(raw_intervals.len() + 1);
     discovered_regions.push((anchor_seq_id, region_start, region_end));
 
-    let mut alignments: Vec<CompactAlignmentInfo> = Vec::new();
+    let mut alignments: Vec<CompactAlignmentInfo> =
+        Vec::with_capacity(raw_intervals.len() + 1);
 
     // Self alignment (anchor covers itself)
     alignments.push(CompactAlignmentInfo::new(
@@ -2961,6 +3019,11 @@ fn process_anchor_region_raw(
         region_end,
         false,
     ));
+
+    // Per-task buffer: collects (orig_idx, query_id, cq_start, cq_end). After
+    // the loop we group runs of equal query_id and call claim_*_batch once per
+    // group, holding the per-seq mutex for the whole group instead of per-aln.
+    let mut claim_buf: Vec<(usize, u32, i64, i64)> = Vec::with_capacity(raw_intervals.len());
 
     // Binary search: only scan intervals where target_start < region_end
     // (alignment_table is sorted by target_start after pre-scan)
@@ -3021,6 +3084,7 @@ fn process_anchor_region_raw(
         // See the streaming variant for the full rationale — gating the sweep on
         // claim_unprocessed causes samples that genuinely cover the anchor region
         // to be omitted when their query range was claimed by a prior anchor.
+        let aln_idx = alignments.len();
         alignments.push(CompactAlignmentInfo::new(
             query_sample_id,
             aln.query_id,
@@ -3031,8 +3095,39 @@ fn process_anchor_region_raw(
             aln.is_reverse,
         ));
 
-        if global_used.claim_any_unprocessed(aln.query_id, cq_start, cq_end) {
-            discovered_regions.push((aln.query_id, cq_start, cq_end));
+        claim_buf.push((aln_idx, aln.query_id, cq_start, cq_end));
+    }
+
+    // Stage 1 F: batch claims by query_id. Stable sort_by_key keeps secondary
+    // idx ascending so within-group call order matches iteration order; the
+    // post-pass sort by idx restores discovered_regions to original order.
+    if !claim_buf.is_empty() {
+        claim_buf.sort_by_key(|&(idx, qid, _, _)| (qid, idx));
+        let mut group_buf: Vec<(i64, i64)> = Vec::new();
+        let mut bool_buf: Vec<bool> = Vec::new();
+        let mut newly_owned: Vec<(usize, u32, i64, i64)> = Vec::new();
+        let mut i = 0;
+        while i < claim_buf.len() {
+            let qid = claim_buf[i].1;
+            let mut j = i;
+            while j < claim_buf.len() && claim_buf[j].1 == qid {
+                j += 1;
+            }
+            group_buf.clear();
+            group_buf.extend(claim_buf[i..j].iter().map(|&(_, _, s, e)| (s, e)));
+            bool_buf.clear();
+            global_used.claim_any_unprocessed_batch(qid, &group_buf, &mut bool_buf);
+            for (k, &b) in bool_buf.iter().enumerate() {
+                if b {
+                    let (idx, _, s, e) = claim_buf[i + k];
+                    newly_owned.push((idx, qid, s, e));
+                }
+            }
+            i = j;
+        }
+        newly_owned.sort_by_key(|&(idx, _, _, _)| idx);
+        for (_, qid, s, e) in newly_owned {
+            discovered_regions.push((qid, s, e));
         }
     }
 
@@ -3321,7 +3416,7 @@ fn sweep_line_depth(
             alignment_idx: idx,
         });
     }
-    events.sort();
+    events.sort_by_key(|e| e.packed_sort_key());
 
     // Sweep-line to compute depth intervals with SPARSE storage
     let mut seq_intervals: Vec<SparseDepthInterval> = Vec::new();
@@ -3343,7 +3438,8 @@ fn sweep_line_depth(
 
                 if clipped_start < clipped_end {
                     // Build SPARSE sample positions + compute pangenome bases
-                    let mut samples: Vec<SamplePosition> = Vec::new();
+                    let mut samples: Vec<SamplePosition> =
+                        Vec::with_capacity(active_bitmap.depth());
                     let mut pangenome_bases: i64 = 0;
 
                     for sample_id in active_bitmap.active_samples() {
@@ -3354,6 +3450,8 @@ fn sweep_line_depth(
                         query_intervals_by_contig.clear();
                         let mut best_idx: Option<usize> = None;
                         let mut best_overlap: i64 = -1;
+                        let mut best_qs: i64 = 0;
+                        let mut best_qe: i64 = 0;
 
                         for &idx in alns {
                             let aln = &alignments[idx];
@@ -3383,23 +3481,16 @@ fn sweep_line_depth(
                             if overlap > best_overlap {
                                 best_overlap = overlap;
                                 best_idx = Some(idx);
+                                best_qs = q_start;
+                                best_qe = q_end;
                             }
                         }
 
-                        // Best alignment for TSV output (same as before)
+                        // Best alignment for TSV output: reuse the (q_start, q_end)
+                        // already computed above instead of mapping a second time.
                         if let Some(idx) = best_idx {
                             let aln = &alignments[idx];
-                            let (q_start, q_end) = map_target_to_query_linear(
-                                &[],
-                                aln.target_start,
-                                aln.target_end,
-                                aln.query_start,
-                                aln.query_end,
-                                clipped_start,
-                                clipped_end,
-                                aln.is_reverse,
-                            );
-                            samples.push((sample_id, aln.query_id, q_start, q_end));
+                            samples.push((sample_id, aln.query_id, best_qs, best_qe));
                         }
 
                         // Pangenome bases: union of query projections per contig
@@ -3466,7 +3557,7 @@ fn sweep_line_depth_streaming(
             alignment_idx: idx,
         });
     }
-    events.sort();
+    events.sort_by_key(|e| e.packed_sort_key());
 
     let mut active_bitmap = SampleBitmap::new(num_samples);
     let mut active_alns: Vec<Vec<usize>> = vec![Vec::new(); num_samples];
@@ -3481,7 +3572,8 @@ fn sweep_line_depth_streaming(
                 let clipped_end = event.position.min(region_end);
 
                 if clipped_start < clipped_end {
-                    let mut samples: Vec<SamplePosition> = Vec::new();
+                    let mut samples: Vec<SamplePosition> =
+                        Vec::with_capacity(active_bitmap.depth());
                     let mut pangenome_bases: i64 = 0;
 
                     for sample_id in active_bitmap.active_samples() {
@@ -3489,6 +3581,8 @@ fn sweep_line_depth_streaming(
                         query_intervals_by_contig.clear();
                         let mut best_idx: Option<usize> = None;
                         let mut best_overlap: i64 = -1;
+                        let mut best_qs: i64 = 0;
+                        let mut best_qe: i64 = 0;
 
                         for &idx in alns {
                             let aln = &alignments[idx];
@@ -3516,22 +3610,14 @@ fn sweep_line_depth_streaming(
                             if overlap > best_overlap {
                                 best_overlap = overlap;
                                 best_idx = Some(idx);
+                                best_qs = q_start;
+                                best_qe = q_end;
                             }
                         }
 
                         if let Some(idx) = best_idx {
                             let aln = &alignments[idx];
-                            let (q_start, q_end) = map_target_to_query_linear(
-                                &[],
-                                aln.target_start,
-                                aln.target_end,
-                                aln.query_start,
-                                aln.query_end,
-                                clipped_start,
-                                clipped_end,
-                                aln.is_reverse,
-                            );
-                            samples.push((sample_id, aln.query_id, q_start, q_end));
+                            samples.push((sample_id, aln.query_id, best_qs, best_qe));
                         }
 
                         for (_, intervals) in query_intervals_by_contig.iter_mut() {
@@ -3580,10 +3666,11 @@ fn process_anchor_region_raw_streaming(
     global_used: &ConcurrentProcessedTracker,
     emit: &mut impl FnMut(SparseDepthInterval),
 ) -> Vec<(u32, i64, i64)> {
-    let mut discovered_regions: Vec<(u32, i64, i64)> = Vec::new();
+    let mut discovered_regions: Vec<(u32, i64, i64)> = Vec::with_capacity(raw_intervals.len() + 1);
     discovered_regions.push((anchor_seq_id, region_start, region_end));
 
-    let mut alignments: Vec<CompactAlignmentInfo> = Vec::new();
+    let mut alignments: Vec<CompactAlignmentInfo> =
+        Vec::with_capacity(raw_intervals.len() + 1);
     alignments.push(CompactAlignmentInfo::new(
         anchor_sample_id,
         anchor_seq_id,
@@ -3593,6 +3680,9 @@ fn process_anchor_region_raw_streaming(
         region_end,
         false,
     ));
+
+    // Per-task buffer: see process_anchor_region_raw for rationale (Stage 1 F).
+    let mut claim_buf: Vec<(usize, u32, i64, i64)> = Vec::with_capacity(raw_intervals.len());
 
     let end_idx = raw_intervals.partition_point(|aln| (aln.target_start as i64) < region_end);
     for aln in &raw_intervals[..end_idx] {
@@ -3645,6 +3735,7 @@ fn process_anchor_region_raw_streaming(
         // Using claim_unprocessed to gate the sweep causes samples that genuinely
         // cover the anchor region to be omitted when their query range was claimed
         // by a prior anchor, producing a silent undercount.
+        let aln_idx = alignments.len();
         alignments.push(CompactAlignmentInfo::new(
             query_sample_id,
             aln.query_id,
@@ -3655,12 +3746,37 @@ fn process_anchor_region_raw_streaming(
             aln.is_reverse,
         ));
 
-        // claim_unprocessed still atomically marks the query range in global_used
-        // and tells us which sub-ranges this anchor newly owns. We only push to
-        // discovered_regions when this anchor won the claim race — preventing the
-        // tracker from double-counting anchor ownership.
-        if global_used.claim_any_unprocessed(aln.query_id, cq_start, cq_end) {
-            discovered_regions.push((aln.query_id, cq_start, cq_end));
+        claim_buf.push((aln_idx, aln.query_id, cq_start, cq_end));
+    }
+
+    // Stage 1 F: batched claim by query_id. See process_anchor_region_raw.
+    if !claim_buf.is_empty() {
+        claim_buf.sort_by_key(|&(idx, qid, _, _)| (qid, idx));
+        let mut group_buf: Vec<(i64, i64)> = Vec::new();
+        let mut bool_buf: Vec<bool> = Vec::new();
+        let mut newly_owned: Vec<(usize, u32, i64, i64)> = Vec::new();
+        let mut i = 0;
+        while i < claim_buf.len() {
+            let qid = claim_buf[i].1;
+            let mut j = i;
+            while j < claim_buf.len() && claim_buf[j].1 == qid {
+                j += 1;
+            }
+            group_buf.clear();
+            group_buf.extend(claim_buf[i..j].iter().map(|&(_, _, s, e)| (s, e)));
+            bool_buf.clear();
+            global_used.claim_any_unprocessed_batch(qid, &group_buf, &mut bool_buf);
+            for (k, &b) in bool_buf.iter().enumerate() {
+                if b {
+                    let (idx, _, s, e) = claim_buf[i + k];
+                    newly_owned.push((idx, qid, s, e));
+                }
+            }
+            i = j;
+        }
+        newly_owned.sort_by_key(|&(idx, _, _, _)| idx);
+        for (_, qid, s, e) in newly_owned {
+            discovered_regions.push((qid, s, e));
         }
     }
 
