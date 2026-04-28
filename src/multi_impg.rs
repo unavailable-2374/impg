@@ -20,16 +20,40 @@ use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
 /// Location of a tree within a specific sub-index.
-#[derive(Debug, Clone)]
-struct TreeLocation {
-    /// Index into `sub_indices`
-    index_idx: usize,
-    /// Local target_id within that sub-index
-    local_target_id: u32,
+///
+/// Packed as `(index_idx as u64) << 32 | local_target_id as u64`.
+///
+/// On 64-bit Linux the natural `{ usize, u32 }` layout is 16 B due to padding;
+/// at CHM13 / 580-file scale the unified `forest_map` holds ~280 K targets ×
+/// ~580 locations each, so 16 → 8 B per entry saves ~1.3 GB of constant
+/// resident memory. `index_idx` is bounded by the number of input alignment
+/// files (always < 2³² in practice) and `local_target_id` is the per-file
+/// target id (already u32 in the on-disk format), so the pack is lossless.
+#[derive(Debug, Clone, Copy)]
+#[repr(transparent)]
+struct TreeLocation(u64);
+
+impl TreeLocation {
+    #[inline]
+    fn new(index_idx: usize, local_target_id: u32) -> Self {
+        debug_assert!(index_idx <= u32::MAX as usize, "index_idx overflows u32");
+        TreeLocation(((index_idx as u64) << 32) | local_target_id as u64)
+    }
+
+    #[inline]
+    fn index_idx(&self) -> usize {
+        (self.0 >> 32) as usize
+    }
+
+    #[inline]
+    fn local_target_id(&self) -> u32 {
+        self.0 as u32
+    }
 }
 
 /// Serializable version of TreeLocation for cache.
@@ -42,18 +66,15 @@ struct TreeLocationSer {
 impl From<&TreeLocation> for TreeLocationSer {
     fn from(loc: &TreeLocation) -> Self {
         TreeLocationSer {
-            index_idx: loc.index_idx as u32,
-            local_target_id: loc.local_target_id,
+            index_idx: loc.index_idx() as u32,
+            local_target_id: loc.local_target_id(),
         }
     }
 }
 
 impl From<TreeLocationSer> for TreeLocation {
     fn from(ser: TreeLocationSer) -> Self {
-        TreeLocation {
-            index_idx: ser.index_idx as usize,
-            local_target_id: ser.local_target_id,
-        }
+        TreeLocation::new(ser.index_idx as usize, ser.local_target_id)
     }
 }
 
@@ -136,6 +157,57 @@ pub struct MultiImpg {
     /// Lazily-loaded sub-indices (only loaded when tree data is needed)
     sub_indices: RwLock<Vec<Option<Arc<Impg>>>>,
 
+    /// Per-file lazy header cache for the **transient** query path.
+    ///
+    /// Each slot holds an `Arc<Impg>` parsed from one alignment file's index
+    /// header (seq_index + forest_map only). Trees are NOT pinned: each cached
+    /// `Impg` has `set_tree_cache_enabled(false)`, so subsequent
+    /// `get_or_load_tree` calls fetch the COITree from disk and the
+    /// `Arc<COITree>` drops as soon as the caller releases it.
+    ///
+    /// Why a separate cache from `sub_indices`:
+    ///   - `sub_indices` services the BFS / transitive query path which
+    ///     deliberately keeps tree caching ON for re-use across BFS hops; we
+    ///     can't safely flip the cache flag once an `Arc<Impg>` has been
+    ///     handed out from there.
+    ///   - The transient path (`load_sub_index_transient`, used by chunked
+    ///     non-transitive Phase 1/2) was previously a fresh `File::open` +
+    ///     bincode-decode per call. Once Phase 1 was chunked at 5 MB the
+    ///     same file gets revisited dozens of times per chromosome × every
+    ///     hub chromosome, multiplying the O(N_files) header-parse cost by
+    ///     two orders of magnitude.
+    ///
+    /// Per-slot `PlMutex` (vs a single `RwLock<Vec<...>>`) so the first miss
+    /// for file A doesn't block the first miss for file B.
+    transient_header_cache: Vec<PlMutex<Option<Arc<Impg>>>>,
+
+    /// Number of populated slots in `transient_header_cache`.
+    ///
+    /// Tracked separately from the slot mutexes so we can decide on a cheap
+    /// upper bound without scanning all `num_indices` slots. Updated under
+    /// the same per-slot lock that flips a slot from `None` → `Some` (or
+    /// vice-versa) so it stays consistent with the cache contents.
+    transient_cache_count: AtomicUsize,
+
+    /// Soft upper bound on `transient_cache_count`. When a fresh miss would
+    /// push the cache above this, `load_sub_index_transient` evicts every
+    /// slot before populating the new one.
+    ///
+    /// Why this matters: with hundreds of thousands of per-file indices,
+    /// retaining one `Arc<Impg>` per file blows past the kernel
+    /// `vm.max_map_count` limit (default 65530 on Linux) — each cached `Impg`
+    /// holds several internal allocations and glibc spreads them across
+    /// per-thread arenas, each of which costs VMA slots. Long before RSS
+    /// approaches the host limit the allocator returns ENOMEM and Rust
+    /// aborts with `memory allocation of N bytes failed`. A bounded cache
+    /// trades a small amount of redundant header parsing for survival on
+    /// these workloads.
+    ///
+    /// Tunable via `IMPG_TRANSIENT_HEADER_CACHE_LIMIT` (number of slots).
+    /// Default: `min(num_indices, 8192)`. Set to `0` to disable bounding
+    /// (recovers the prior unbounded behaviour).
+    transient_cache_limit: usize,
+
     /// Whether all indices are bidirectional (V2 format)
     /// True only if ALL sub-indices are V2 format
     is_bidirectional: bool,
@@ -143,6 +215,26 @@ pub struct MultiImpg {
     /// Whether tree caching is enabled for sub-indices.
     /// Propagated to newly lazy-loaded sub-indices.
     tree_cache_enabled: std::sync::atomic::AtomicBool,
+}
+
+/// Resolve the transient-header-cache size limit from the environment, with a
+/// safe default. Returns `0` to mean "unbounded" (legacy behaviour).
+fn resolve_transient_cache_limit(num_indices: usize) -> usize {
+    if let Ok(s) = std::env::var("IMPG_TRANSIENT_HEADER_CACHE_LIMIT") {
+        if let Ok(v) = s.parse::<usize>() {
+            return v;
+        } else {
+            warn!(
+                "IMPG_TRANSIENT_HEADER_CACHE_LIMIT='{}' is not a non-negative integer; using default",
+                s
+            );
+        }
+    }
+    // 8192 keeps the cache well under typical vm.max_map_count budgets even
+    // when several internal allocations per cached Impg back into mmap, and
+    // is large enough that file-locality re-hits dominate at chunked depth
+    // workloads on per-file indices in the few-thousand-files regime.
+    num_indices.min(8192)
 }
 
 impl MultiImpg {
@@ -203,10 +295,7 @@ impl MultiImpg {
                     unified_forest_map
                         .entry(unified_id)
                         .or_default()
-                        .push(TreeLocation {
-                            index_idx,
-                            local_target_id,
-                        });
+                        .push(TreeLocation::new(index_idx, local_target_id));
                 }
             }
         }
@@ -236,6 +325,9 @@ impl MultiImpg {
             sequence_files: sequence_files.map(|s| s.to_vec()).unwrap_or_default(),
             local_to_unified,
             sub_indices: RwLock::new(vec![None; num_indices]),
+            transient_header_cache: (0..num_indices).map(|_| PlMutex::new(None)).collect(),
+            transient_cache_count: AtomicUsize::new(0),
+            transient_cache_limit: resolve_transient_cache_limit(num_indices),
             is_bidirectional: all_bidirectional,
             tree_cache_enabled: std::sync::atomic::AtomicBool::new(true),
         })
@@ -346,6 +438,9 @@ impl MultiImpg {
             sequence_files: sequence_files.map(|s| s.to_vec()).unwrap_or_default(),
             local_to_unified: cache.local_to_unified,
             sub_indices: RwLock::new(vec![None; num_indices]),
+            transient_header_cache: (0..num_indices).map(|_| PlMutex::new(None)).collect(),
+            transient_cache_count: AtomicUsize::new(0),
+            transient_cache_limit: resolve_transient_cache_limit(num_indices),
             is_bidirectional: cache.is_bidirectional,
             tree_cache_enabled: std::sync::atomic::AtomicBool::new(true),
         })
@@ -495,11 +590,109 @@ impl MultiImpg {
 
     /// Load a sub-index WITHOUT storing it in `self.sub_indices`.
     ///
-    /// Used by the file-parallel pre-scan (`compute_sample_degrees`) to bound peak memory:
-    /// at most `num_threads` sub-indices are alive simultaneously, versus O(num_files)
-    /// if they were cached. The returned `Arc<Impg>` should be dropped as soon as
-    /// per-file work is done.
+    /// Originally used by the file-parallel pre-scan (`compute_sample_degrees`)
+    /// to bound peak memory; now also the workhorse for chunked Phase 1/2
+    /// non-transitive depth.
+    ///
+    /// The returned `Arc<Impg>` has `tree_cache_enabled = false`, so any tree
+    /// walked via `get_or_load_tree` is freed when the caller drops the
+    /// `Arc<COITree>` it received — `self.trees` never accumulates.
+    ///
+    /// Header caching: the parsed `Impg` (seq_index + forest_map; trees not
+    /// included) is stashed in `self.transient_header_cache[index_idx]` after
+    /// the first call. Subsequent calls return a clone of the cached `Arc`,
+    /// avoiding the `File::open` + bincode-decode round trip. With chunked
+    /// Phase 1 hitting the same file once per 5 MB chunk per hub chromosome,
+    /// the cache cuts header-parse work by 2–3 orders of magnitude on
+    /// CHM13-scale workloads. Per-file `PlMutex` keeps misses for distinct
+    /// files independent.
     fn load_sub_index_transient(&self, index_idx: usize) -> std::io::Result<Arc<Impg>> {
+        // Cache hit fast path.
+        {
+            let slot = self.transient_header_cache[index_idx].lock();
+            if let Some(ref impg) = *slot {
+                return Ok(Arc::clone(impg));
+            }
+        }
+
+        // Cache miss. If the cache is already at its soft cap, evict every
+        // slot before populating the new one. Doing this *before* the
+        // expensive load/parse means we never temporarily hold N+1 entries
+        // and never spike `vm.max_map_count` past the budget that produced
+        // the cap in the first place.
+        //
+        // The eviction is "drop everything", not LRU: with chunked depth
+        // workloads the per-thread access pattern over `index_idx` is
+        // approximately uniform within a phase, so any per-slot priority
+        // would have to be paid on every hit (expensive) for limited gain;
+        // a periodic flush bounds memory at the cost of some extra header
+        // re-parses, which empirically is a small fraction of the
+        // chunk-processing time.
+        if self.transient_cache_limit > 0
+            && self.transient_cache_count.load(AtomicOrdering::Relaxed) >= self.transient_cache_limit
+        {
+            self.evict_transient_header_cache();
+        }
+
+        let arc = self.load_sub_index_uncached(index_idx)?;
+
+        // Stash for next time. Race-tolerant: if another thread populated the
+        // slot first, we drop our copy and use theirs (functionally identical).
+        let mut slot = self.transient_header_cache[index_idx].lock();
+        match *slot {
+            Some(ref existing) => Ok(Arc::clone(existing)),
+            None => {
+                *slot = Some(Arc::clone(&arc));
+                self.transient_cache_count
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                Ok(arc)
+            }
+        }
+    }
+
+    /// Drop every cached header and reset the populated-slot counter.
+    ///
+    /// Concurrency: another thread may walk past the limit check and start
+    /// loading a fresh sub-index while we're evicting. That's safe — its
+    /// final write-back acquires the per-slot mutex *after* our eviction
+    /// has released it, so the two operations serialize and the final
+    /// `transient_cache_count` matches the populated-slot total.
+    fn evict_transient_header_cache(&self) {
+        let mut dropped: usize = 0;
+        for slot in &self.transient_header_cache {
+            let mut s = slot.lock();
+            if s.is_some() {
+                *s = None;
+                dropped += 1;
+            }
+        }
+        // Decrement by what we actually dropped, so concurrent populate-misses
+        // don't drive the counter negative.
+        if dropped > 0 {
+            self.transient_cache_count
+                .fetch_sub(dropped, AtomicOrdering::Relaxed);
+        }
+    }
+
+    /// Like `load_sub_index_transient` but never writes to
+    /// `transient_header_cache`. Use for one-shot scans that visit each file
+    /// exactly once (e.g. the degree pre-scan in `compute_sample_degrees`),
+    /// where caching only ratchets up retained allocations / VMAs.
+    ///
+    /// Will still honour an existing cache hit: if another caller has already
+    /// stashed this `index_idx`, we hand back that `Arc` to avoid a redundant
+    /// disk parse. The new behaviour is purely "do not pollute the cache on a
+    /// miss" — peak retained sub-indices for a parallel pre-scan stays bounded
+    /// by the rayon worker count, regardless of `index_paths.len()`.
+    ///
+    /// Why this matters: with hundreds of thousands of per-file indices,
+    /// caching every loaded `Impg` in `transient_header_cache` blows past
+    /// `vm.max_map_count` (default 65530 on Linux) long before RSS gets close
+    /// to the host limit, because each cached `Impg` retains several
+    /// glibc-mmap'd allocations. The allocator then aborts the process with
+    /// `memory allocation of N bytes failed` even though physical memory is
+    /// nowhere near exhausted.
+    fn load_sub_index_uncached(&self, index_idx: usize) -> std::io::Result<Arc<Impg>> {
         let path = &self.index_paths[index_idx];
         let alignment_files = vec![self.alignment_files[index_idx].clone()];
         let seq_files = if self.sequence_files.is_empty() {
@@ -516,11 +709,12 @@ impl MultiImpg {
             seq_files,
         )?;
         // Always disable tree caching on transient sub-indices so that trees
-        // walked during the pre-scan are released as soon as the caller drops
-        // the Arc returned by get_or_load_tree.
+        // walked through the loaded header are released as soon as the caller
+        // drops the Arc returned by get_or_load_tree.
         impg.set_tree_cache_enabled(false);
         Ok(Arc::new(impg))
     }
+
 
     /// Translate an AdjustedInterval from local IDs to unified IDs.
     fn translate_to_unified(
@@ -582,17 +776,17 @@ impl MultiImpg {
         let results: Vec<Vec<AdjustedInterval>> = locations
             .par_iter()
             .filter_map(|loc| {
-                let impg = match self.get_sub_index(loc.index_idx) {
+                let impg = match self.get_sub_index(loc.index_idx()) {
                     Ok(i) => i,
                     Err(e) => {
-                        warn!("Failed to load sub-index {}: {}", loc.index_idx, e);
+                        warn!("Failed to load sub-index {}: {}", loc.index_idx(), e);
                         return None;
                     }
                 };
 
                 // Query using local target ID
                 let local_results = impg.query(
-                    loc.local_target_id,
+                    loc.local_target_id(),
                     range_start,
                     range_end,
                     store_cigar,
@@ -604,7 +798,7 @@ impl MultiImpg {
                 // Translate results to unified IDs
                 let unified_results: Vec<AdjustedInterval> = local_results
                     .into_iter()
-                    .filter_map(|r| self.translate_to_unified(r, loc.index_idx))
+                    .filter_map(|r| self.translate_to_unified(r, loc.index_idx()))
                     .collect();
 
                 Some(unified_results)
@@ -828,9 +1022,9 @@ impl ImpgIndex for MultiImpg {
 
         // Get the first location and try to load its tree
         let loc = locations.first()?;
-        let local_target_id = loc.local_target_id;
+        let local_target_id = loc.local_target_id();
 
-        let impg = self.get_sub_index(loc.index_idx).ok()?;
+        let impg = self.get_sub_index(loc.index_idx()).ok()?;
         impg.get_or_load_tree(local_target_id)
     }
 
@@ -940,6 +1134,15 @@ impl ImpgIndex for MultiImpg {
         }
     }
 
+    fn clear_transient_header_cache(&self) {
+        // Drop every Arc<Impg> stashed by load_sub_index_transient so the
+        // backing mmap regions are returned to the kernel. Independent from
+        // clear_sub_index_cache, which targets the BFS/transitive cache.
+        // Routes through evict_transient_header_cache so the populated-slot
+        // counter that gates our soft cap stays in sync.
+        self.evict_transient_header_cache();
+    }
+
     fn set_tree_cache_enabled(&self, enabled: bool) {
         // Store at MultiImpg level so newly lazy-loaded sub-indices inherit the setting
         self.tree_cache_enabled.store(enabled, std::sync::atomic::Ordering::Relaxed);
@@ -962,12 +1165,12 @@ impl ImpgIndex for MultiImpg {
 
         let mut results = Vec::new();
         for loc in locations {
-            let impg = match self.get_sub_index(loc.index_idx) {
+            let impg = match self.get_sub_index(loc.index_idx()) {
                 Ok(i) => i,
                 Err(_) => continue,
             };
-            if let Some(tree) = impg.get_or_load_tree(loc.local_target_id) {
-                let l2u = &self.local_to_unified[loc.index_idx];
+            if let Some(tree) = impg.get_or_load_tree(loc.local_target_id()) {
+                let l2u = &self.local_to_unified[loc.index_idx()];
                 for interval in tree.iter() {
                     let m = &interval.metadata;
                     let unified_query_id = match l2u.get(m.query_id() as usize) {
@@ -994,9 +1197,10 @@ impl ImpgIndex for MultiImpg {
     /// and loads every sub-index that touches each target). That default scales as
     /// O(num_files) retained sub-indices and OOMs with hundreds of thousands of
     /// per-file indices. This override iterates files in parallel: each worker loads
-    /// ONE sub-index via `load_sub_index_transient`, walks its trees, accumulates
+    /// ONE sub-index via `load_sub_index_uncached`, walks its trees, accumulates
     /// degree contributions into a shared per-target aggregator, then drops the
-    /// sub-index. Peak retained sub-indices = rayon worker count.
+    /// sub-index. The no-cache loader bypasses `transient_header_cache` so peak
+    /// retained sub-indices = rayon worker count, regardless of `num_files`.
     ///
     /// Correctness vs. default:
     /// - Both count "unique OTHER samples with direct alignments to this target".
@@ -1009,18 +1213,42 @@ impl ImpgIndex for MultiImpg {
         seq_included: &[bool],
         seq_to_sample: &[u16],
     ) -> Vec<u16> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
         let num_unified = self.seq_index.len();
-        // One mutex-guarded set per unified target. Contention is low because a
-        // given target is only touched by files that contain a tree for it, and
-        // per-file work first builds a thread-local set before taking the lock.
-        let aggregator: Vec<PlMutex<FxHashSet<u16>>> = (0..num_unified)
-            .map(|_| PlMutex::new(FxHashSet::default()))
-            .collect();
+
+        // Aggregator is a flat lock-free bitset: one row of `chunks_per_row`
+        // u64 chunks per unified target, one bit per sample.
+        //
+        // Why this beats the previous `Vec<PlMutex<FxHashSet<u16>>>`:
+        //   1. Memory: one contiguous Vec<AtomicU64> instead of `num_unified`
+        //      independent FxHashSet heap allocations + per-target Mutex.
+        //      For 280K targets × ~600 samples that's ~21 MB vs. ≥160 MB at
+        //      full occupancy, and — more importantly on hosts with low
+        //      `vm.max_map_count` — collapses tens of thousands of small
+        //      allocations into a single mmap-backed VMA.
+        //   2. Concurrency: `fetch_or` on a u64 chunk is wait-free, so the
+        //      per-file workers no longer queue on a per-target mutex when
+        //      two files report alignments to the same target.
+        //   3. Insertion is O(1) per (target, sample) pair instead of
+        //      hash-and-rehash inside the local FxHashSet plus a mutex
+        //      critical section to merge it.
+        let max_sample = seq_to_sample.iter().copied().max().unwrap_or(0);
+        let num_samples = max_sample as usize + 1;
+        let chunks_per_row = num_samples.div_ceil(64);
+        let total_chunks = num_unified.checked_mul(chunks_per_row).unwrap_or(0);
+        let mut bitset: Vec<AtomicU64> = Vec::with_capacity(total_chunks);
+        bitset.resize_with(total_chunks, || AtomicU64::new(0));
 
         (0..self.index_paths.len())
             .into_par_iter()
             .for_each(|index_idx| {
-                let impg = match self.load_sub_index_transient(index_idx) {
+                // Pre-scan visits each file exactly once. Use the no-cache
+                // loader so the transient header cache doesn't accumulate
+                // hundreds of thousands of `Arc<Impg>` headers (each with its
+                // own glibc-mmap'd allocations) and trip the kernel's
+                // vm.max_map_count limit on hosts with many per-file indices.
+                let impg = match self.load_sub_index_uncached(index_idx) {
                     Ok(i) => i,
                     Err(e) => {
                         warn!(
@@ -1035,6 +1263,20 @@ impl ImpgIndex for MultiImpg {
                 // Iterate every local target in this file.
                 let local_target_ids: Vec<u32> =
                     impg.forest_map.entries.keys().copied().collect();
+
+                // Per-thread reusable scratch buffers — drop only when the
+                // closure returns, so a single allocation amortises across
+                // every target processed by this rayon worker on this file.
+                //
+                // `local_seen` is a dense byte bitmap (Vec<u8>) so dedup is
+                // O(1) per interval. We also remember which sample ids were
+                // touched in `touched_samples` so we can clear `local_seen`
+                // in O(unique-samples) instead of O(num_samples) between
+                // targets — this matters when num_samples is much larger
+                // than the actual fan-out of any one target.
+                let mut local_seen: Vec<u8> = vec![0u8; num_samples];
+                let mut touched_samples: Vec<u16> = Vec::new();
+
                 for local_target_id in local_target_ids {
                     let unified_target_id = match l2u.get(local_target_id as usize) {
                         Some(&id) if id != u32::MAX => id,
@@ -1057,8 +1299,12 @@ impl ImpgIndex for MultiImpg {
                         None => continue,
                     };
 
-                    // Dedup locally first — keeps the mutex critical section small.
-                    let mut local_samples: FxHashSet<u16> = FxHashSet::default();
+                    // Reset only the bytes we touched on the previous target.
+                    for &s in &touched_samples {
+                        local_seen[s as usize] = 0;
+                    }
+                    touched_samples.clear();
+
                     for interval in tree.iter() {
                         let m = &interval.metadata;
                         let unified_query_id = match l2u.get(m.query_id() as usize) {
@@ -1077,13 +1323,30 @@ impl ImpgIndex for MultiImpg {
                             .copied()
                             .unwrap_or(0);
                         if query_sample != self_sample {
-                            local_samples.insert(query_sample);
+                            // Safe: query_sample <= max_sample by construction.
+                            let slot = unsafe {
+                                local_seen.get_unchecked_mut(query_sample as usize)
+                            };
+                            if *slot == 0 {
+                                *slot = 1;
+                                touched_samples.push(query_sample);
+                            }
                         }
                     }
 
-                    if !local_samples.is_empty() {
-                        let mut guard = aggregator[unified_target_id as usize].lock();
-                        guard.extend(local_samples);
+                    if !touched_samples.is_empty() {
+                        let row_base = unified_target_id as usize * chunks_per_row;
+                        for &sample in &touched_samples {
+                            let chunk_idx = sample as usize / 64;
+                            let bit_idx = sample as usize % 64;
+                            // SAFETY: chunk_idx < chunks_per_row and
+                            // row_base + chunks_per_row <= total_chunks.
+                            unsafe {
+                                bitset
+                                    .get_unchecked(row_base + chunk_idx)
+                                    .fetch_or(1u64 << bit_idx, Ordering::Relaxed);
+                            }
+                        }
                     }
                     // Tree Arc dropped here; with tree caching disabled on this
                     // transient Impg, the underlying COITree is freed immediately.
@@ -1091,9 +1354,20 @@ impl ImpgIndex for MultiImpg {
                 // Impg Arc dropped here — entire sub-index is freed.
             });
 
-        aggregator
-            .into_iter()
-            .map(|m| m.into_inner().len().min(u16::MAX as usize) as u16)
+        // Final pass: popcount each row to recover the per-target degree.
+        if chunks_per_row == 0 {
+            return vec![0u16; num_unified];
+        }
+        (0..num_unified)
+            .into_par_iter()
+            .map(|t| {
+                let row_base = t * chunks_per_row;
+                let mut count: u32 = 0;
+                for c in 0..chunks_per_row {
+                    count += bitset[row_base + c].load(Ordering::Relaxed).count_ones();
+                }
+                count.min(u16::MAX as u32) as u16
+            })
             .collect()
     }
 
@@ -1105,12 +1379,12 @@ impl ImpgIndex for MultiImpg {
 
         let mut results = Vec::new();
         for loc in locations {
-            let impg = match self.get_sub_index(loc.index_idx) {
+            let impg = match self.get_sub_index(loc.index_idx()) {
                 Ok(i) => i,
                 Err(_) => continue,
             };
-            if let Some(tree) = impg.get_or_load_tree(loc.local_target_id) {
-                let l2u = &self.local_to_unified[loc.index_idx];
+            if let Some(tree) = impg.get_or_load_tree(loc.local_target_id()) {
+                let l2u = &self.local_to_unified[loc.index_idx()];
                 tree.query(start, end, |interval| {
                     let m = &interval.metadata;
                     if let Some(&unified_query_id) = l2u.get(m.query_id() as usize) {
@@ -1153,9 +1427,9 @@ impl ImpgIndex for MultiImpg {
         let mut by_index: FxHashMap<usize, Vec<u32>> = FxHashMap::default();
         for loc in locations {
             by_index
-                .entry(loc.index_idx)
+                .entry(loc.index_idx())
                 .or_default()
-                .push(loc.local_target_id);
+                .push(loc.local_target_id());
         }
 
         let mut results = Vec::new();
@@ -1214,9 +1488,9 @@ impl ImpgIndex for MultiImpg {
         let mut by_index: FxHashMap<usize, Vec<u32>> = FxHashMap::default();
         for loc in locations {
             by_index
-                .entry(loc.index_idx)
+                .entry(loc.index_idx())
                 .or_default()
-                .push(loc.local_target_id);
+                .push(loc.local_target_id());
         }
 
         let mut results = Vec::new();
@@ -1255,11 +1529,18 @@ impl ImpgIndex for MultiImpg {
         results
     }
 
-    /// Batch variant: groups all queries by sub-index file and loads each file
-    /// exactly once, answering every query that references it before dropping
-    /// the sub-index. Files are processed sequentially so at most one
-    /// sub-index is alive at any point — O(max_sub_index_size) peak memory
-    /// regardless of how many queries (or threads) share the same file.
+    /// Batch variant: groups all queries by sub-index file, then drives the
+    /// per-file work in parallel via rayon. Each rayon worker loads one
+    /// sub-index transiently, answers every query referencing it, and frees
+    /// the sub-index before moving on. Peak retained memory is bounded to
+    /// `rayon::current_num_threads()` sub-indices.
+    ///
+    /// History: previously processed files sequentially to keep peak at one
+    /// sub-index. That serialised Phase 1 transitive depth to a single thread
+    /// (`top -H` showed 1 worker running, 47 sleeping for 30+ minutes on a
+    /// 200-PAF subset). Per-thread transient loads keep memory bounded while
+    /// restoring the original goal of the batch design — "answer many queries
+    /// per file load" — to actually run in parallel.
     fn batch_query_raw_overlapping(
         &self,
         queries: &[(u32, i64, i64)],
@@ -1269,33 +1550,34 @@ impl ImpgIndex for MultiImpg {
             return Vec::new();
         }
 
-        let mut results: Vec<Vec<RawAlignmentInterval>> = vec![Vec::new(); n];
-
         // Group: file_idx → Vec<(query_idx, local_target_id, start, end)>
         let mut by_file: FxHashMap<usize, Vec<(usize, u32, i64, i64)>> = FxHashMap::default();
         for (qi, &(unified_target_id, start, end)) in queries.iter().enumerate() {
             if let Some(locs) = self.forest_map.get(&unified_target_id) {
                 for loc in locs {
                     by_file
-                        .entry(loc.index_idx)
+                        .entry(loc.index_idx())
                         .or_default()
-                        .push((qi, loc.local_target_id, start, end));
+                        .push((qi, loc.local_target_id(), start, end));
                 }
             }
         }
 
-        // Process files sequentially: one sub-index alive at a time.
-        // When many chunks query the same file (e.g., all hub chunks querying
-        // the same per-sample alignment file), it is loaded once and all
-        // queries answered before freeing.
-        //
-        // Sort by file_idx so files are loaded in a deterministic, ascending order.
-        // This improves OS page-cache locality (sequential file access patterns are
-        // prefetched more effectively) and makes behaviour reproducible across runs.
-        // It does not affect correctness: results[qi] slots are index-addressed.
+        // Per-slot Mutex: when a unified target lives in multiple sub-index
+        // files, two parallel workers may both push into the same `results[qi]`.
+        // Lock contention is low because per-target file fan-out is typically 1
+        // (per-PAF indices) and the critical section is a `Vec::extend` of a
+        // small thread-local buffer.
+        let results: Vec<PlMutex<Vec<RawAlignmentInterval>>> =
+            (0..n).map(|_| PlMutex::new(Vec::new())).collect();
+
+        // Sort file_order for deterministic scheduling (rayon may still steal
+        // out of order). This keeps progress observable and makes reproduction
+        // easier in case of regressions.
         let mut file_order: Vec<usize> = by_file.keys().copied().collect();
         file_order.sort_unstable();
-        for file_idx in file_order {
+
+        file_order.par_iter().for_each(|&file_idx| {
             let file_queries = &by_file[&file_idx];
             let impg = match self.load_sub_index_transient(file_idx) {
                 Ok(i) => i,
@@ -1304,17 +1586,21 @@ impl ImpgIndex for MultiImpg {
                         "batch_query_raw_overlapping: failed to load {:?}: {}",
                         self.index_paths[file_idx], e
                     );
-                    continue;
+                    return;
                 }
             };
             let l2u = &self.local_to_unified[file_idx];
+
+            // Per-query thread-local scratch buffer keeps the global
+            // results[qi] mutex critical section to a single `extend`.
+            let mut local: Vec<RawAlignmentInterval> = Vec::new();
             for &(qi, local_target_id, start, end) in file_queries {
                 if let Some(tree) = impg.get_or_load_tree(local_target_id) {
                     tree.query(start, end, |interval| {
                         let m = &interval.metadata;
                         if let Some(&unified_query_id) = l2u.get(m.query_id() as usize) {
                             if unified_query_id != u32::MAX {
-                                results[qi].push(RawAlignmentInterval {
+                                local.push(RawAlignmentInterval {
                                     target_start: interval.first,
                                     target_end: interval.last,
                                     query_id: unified_query_id,
@@ -1326,11 +1612,14 @@ impl ImpgIndex for MultiImpg {
                         }
                     });
                 }
+                if !local.is_empty() {
+                    results[qi].lock().append(&mut local);
+                }
             }
             // impg dropped here — sub-index freed immediately.
-        }
+        });
 
-        results
+        results.into_iter().map(|m| m.into_inner()).collect()
     }
 }
 

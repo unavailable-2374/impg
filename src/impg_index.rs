@@ -148,6 +148,16 @@ pub trait ImpgIndex: Send + Sync {
     /// Useful for depth computation with many alignment files to bound peak memory.
     fn clear_sub_index_cache(&self);
 
+    /// Clear the transient per-file header cache used by `MultiImpg`'s
+    /// chunked Phase 1/2 hot paths (`load_sub_index_transient`). For single
+    /// `Impg` this is a no-op; the default implementation matches that.
+    ///
+    /// Call between distinct phases (e.g. after the global degree pre-scan)
+    /// to release retained `Arc<Impg>` headers that are no longer needed,
+    /// freeing the kernel mmap regions they hold. Independent of
+    /// `clear_sub_index_cache`, which targets the BFS/transitive cache.
+    fn clear_transient_header_cache(&self) {}
+
     /// Enable or disable tree caching.
     /// When disabled, trees loaded from disk are not stored in the cache,
     /// bounding peak memory for transitive queries.
@@ -582,6 +592,19 @@ impl ImpgIndex for ImpgWrapper {
         match self {
             ImpgWrapper::Single(impg) => impg.clear_sub_index_cache(),
             ImpgWrapper::Multi(multi) => multi.clear_sub_index_cache(),
+        }
+    }
+
+    fn clear_transient_header_cache(&self) {
+        // Without this override, calls on a `&dyn ImpgIndex` / `&impl ImpgIndex`
+        // typed as `ImpgWrapper` would silently use the trait default no-op,
+        // leaking cached `Arc<Impg>` headers across phase boundaries and
+        // exhausting `vm.max_map_count` at large `--index-mode per-file`
+        // alignment-file counts (depth `memory allocation of N bytes failed`
+        // crash long before RSS approaches the host limit).
+        match self {
+            ImpgWrapper::Single(_) => {}
+            ImpgWrapper::Multi(multi) => multi.clear_transient_header_cache(),
         }
     }
 

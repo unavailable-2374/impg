@@ -16,14 +16,16 @@ path = "vendor/gfaffix/src/main.rs"
 # BFS-like workloads, where per-thread arena behavior reduces global allocator
 # lock contention.
 #
-# Tradeoff: jemalloc's per-arena chunked mmap model produces many more distinct
-# VMAs than glibc's sbrk-backed main arena. On hosts with a low
-# `vm.max_map_count` (Linux default 65530) and `impg depth` running against
-# ≥ 10⁴ per-file indices with 64+ threads, jemalloc can exhaust
-# `max_map_count` before the process is anywhere near its physical-memory
-# limit, causing small allocations to start failing. In that situation,
-# opt out with `--no-default-features --features system-alloc` — see the
-# commentary above `#[global_allocator]` in src/main.rs for the full rationale.
+# VMA budget: jemalloc's per-arena chunked mmap model produces many more
+# distinct VMAs than glibc's sbrk-backed main arena, which previously exhausted
+# `vm.max_map_count` (Linux default 65530) on hosts where `impg depth` ran
+# against ≥ 10⁴ per-file indices with 64+ threads — the process aborted on a
+# small allocation while RSS was still well below physical memory. The default
+# build now ships a static `_rjem_malloc_conf` (see src/main.rs) that pins
+# `narenas:8` and tunes decay times so the in-use VMA count stays well below
+# the kernel limit on those workloads. Users who still hit the limit (e.g.
+# site-tightened `vm.max_map_count`) can opt out with
+# `--no-default-features --features system-alloc`.
 tikv-jemallocator = { version = "0.6", optional = true }
 
 # Lightweight mutex implementation (1 byte vs std::sync::Mutex's 40+ bytes)

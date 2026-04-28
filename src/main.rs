@@ -3,17 +3,79 @@
 // Default: tikv-jemalloc. Handles multi-threaded alloc/free patterns far better
 // than glibc malloc and avoids ptmalloc arena fragmentation under heavy BFS.
 //
-// Opt-out: build with `--no-default-features --features system-alloc` to switch
-// to `std::alloc::System` (glibc). Needed on machines with a low
-// `vm.max_map_count` (default 65530 on Linux) when running `impg depth` with
-// per-file indexing at ≫ 10⁴ alignment files: jemalloc's per-arena mmap model
-// creates enough distinct VMAs under 64-thread Phase 1 fan-out to exhaust
-// `max_map_count`, whereas glibc keeps small allocations inside a single sbrk
-// heap segment and uses mmap only for blocks ≥ 128 KB, keeping the VMA count
-// well below the kernel limit.
+// VMA-bounded jemalloc config (see `JEMALLOC_MALLOC_CONF` below): on hosts with
+// the Linux default `vm.max_map_count = 65530`, jemalloc's per-arena mmap model
+// — defaulting to `4 * num_cpus` arenas, each holding many extents — used to
+// exhaust the kernel VMA limit when `impg depth` ran per-file indexing across
+// ≥ 10⁴ alignment files with 64+ threads. The crash signature was a small
+// allocation (e.g. "memory allocation of 6144 bytes failed") aborting the
+// process while RSS was still well below physical memory (~80% on a 128 GB
+// node). Pinning narenas + tuning decay times keeps the process inside the VMA
+// budget without losing jemalloc's multi-thread allocator throughput, so the
+// default build now works on those hosts without rebuilding.
+//
+// The `system-alloc` feature is retained as an escape hatch for environments
+// where this configuration is still insufficient (e.g. `vm.max_map_count`
+// further reduced by site policy). Build with
+// `--no-default-features --features system-alloc` in that case.
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// Static jemalloc tuning, read by jemalloc at allocator init (before `main`).
+//
+// Why each option:
+//   - `narenas:8`         — cap arena count at 8 instead of the default
+//                           `4 * num_cpus` (= 320 on a 80-core node). Each
+//                           arena owns its own extent set, so VMA count grows
+//                           with arenas. Going from 320 → 8 cuts in-use VMAs
+//                           by ~40× while leaving 10 threads / arena, which is
+//                           below the contention threshold for impg's
+//                           BFS / sweep-line workload (allocator is not the
+//                           hotspot — sub-index I/O and tree walks are).
+//   - `dirty_decay_ms:1000` — return dirty pages to the OS faster than the
+//                             default 10 s, shortening the window where freed
+//                             memory still counts against RSS.
+//   - `muzzy_decay_ms:0`    — skip the muzzy state; transition straight from
+//                             dirty → clean on purge so MADV_FREE pages don't
+//                             linger as separate VMAs.
+//   - `metadata_thp:auto`   — back jemalloc metadata with transparent huge
+//                             pages when available, reducing both metadata
+//                             VMAs and TLB pressure.
+//   - `abort_conf:false`    — never abort if a future jemalloc rejects an
+//                             unknown option here; warn and continue.
+//
+// Resolution order inside jemalloc (see jemalloc/INSTALL.md): build-time
+// `--with-malloc-conf` ⟶ this static symbol ⟶ `_RJEM_MALLOC_CONF` env var.
+// Users can still override at runtime by setting `_RJEM_MALLOC_CONF`.
+//
+// Symbol-name detail: tikv-jemalloc-sys 0.6 builds jemalloc with
+// `--with-jemalloc-prefix=_rjem_`, so the C symbol jemalloc actually reads is
+// `_rjem_malloc_conf`. We follow the canonical idiom from
+// `tikv-jemalloc-sys/tests/malloc_conf_set.rs` (a `union` cast to land at
+// `&'static c_char` in const context).
+#[cfg(feature = "jemalloc")]
+const JEMALLOC_MALLOC_CONF: &[u8] =
+    b"narenas:8,dirty_decay_ms:1000,muzzy_decay_ms:0,metadata_thp:auto,abort_conf:false\0";
+
+#[cfg(feature = "jemalloc")]
+#[allow(non_upper_case_globals)]
+#[export_name = "_rjem_malloc_conf"]
+pub static malloc_conf: Option<&'static std::ffi::c_char> = Some(unsafe {
+    // SAFETY: jemalloc reads this symbol as `const char *`, which on every
+    // supported target is layout-compatible with `&u8`. The union below is
+    // the const-context-friendly way to spell the cast — taking a reference
+    // to the first byte of a 'static byte literal is valid in const, while
+    // a raw-pointer cast is not.
+    union U {
+        bytes: &'static u8,
+        c: &'static std::ffi::c_char,
+    }
+    U {
+        bytes: &JEMALLOC_MALLOC_CONF[0],
+    }
+    .c
+});
 
 #[cfg(feature = "system-alloc")]
 #[global_allocator]

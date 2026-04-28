@@ -1326,8 +1326,19 @@ struct StreamingDepthEmitter<'a> {
     // ---- Short-interval merging ----
     /// Intervals shorter than this (bp) are absorbed into adjacent neighbors. 0 = disabled.
     min_interval_len: i64,
-    /// Buffer for the current contiguous depth region; flushed at each gap boundary.
+    /// Buffer for windowed output (only used when `window_size.is_some()`).
+    /// The windowed path retains buffered semantics so cross-window merging stays
+    /// equivalent to the pre-streaming implementation. Non-windowed paths bypass
+    /// this entirely and stream through `pending` (or directly when no merge is
+    /// requested), so this stays empty in the hot Phase 1/2 case.
     seq_intervals: Vec<SparseDepthInterval>,
+    /// Two-element sliding window for `min_interval_len > 0` streaming.
+    ///
+    /// State machine (see `merge_into_pending`): equivalent to the two-pass
+    /// `merge_short_intervals` algorithm, but holds only the currently-growing
+    /// interval rather than the full per-region Vec. Peak memory drops from
+    /// `O(K × N_samples)` to `O(N_samples)`.
+    pending: Option<SparseDepthInterval>,
 
     // ---- Windowing ----
     window_size: Option<i64>,
@@ -1335,12 +1346,117 @@ struct StreamingDepthEmitter<'a> {
 
 impl<'a> StreamingDepthEmitter<'a> {
     /// Process one interval from the sweep line through the full pipeline.
+    ///
+    /// Three paths:
+    ///   1. Windowed (`window_size.is_some()`): split at window boundaries, buffer
+    ///      in `seq_intervals` for cross-window `merge_short_intervals` at flush.
+    ///      This preserves the pre-streaming windowed semantics.
+    ///   2. Non-windowed, no short-interval merging (`min_interval_len <= 0`):
+    ///      true streaming — emit immediately, drop the interval and its samples
+    ///      Vec right away. This is the hot Phase 1 path; previous behavior was
+    ///      to accumulate the full chromosome's intervals before flushing.
+    ///   3. Non-windowed with merging (`min_interval_len > 0`): two-element
+    ///      sliding window via `pending`. Equivalent to the two-pass
+    ///      `merge_short_intervals` algorithm but with O(1) buffered intervals.
     fn emit(&mut self, interval: SparseDepthInterval) {
         if let Some(ws) = self.window_size {
             self.split_and_forward(interval, ws);
+        } else if self.min_interval_len <= 0 {
+            self.emit_final(interval);
         } else {
-            self.seq_intervals.push(interval);
+            self.merge_into_pending(interval);
         }
+    }
+
+    /// Sliding-window equivalent of `merge_short_intervals` for the streaming path.
+    ///
+    /// State machine derivation:
+    ///
+    ///   - Original Pass 1 (left-to-right): a short `new` is absorbed into its left
+    ///     neighbor if one exists; otherwise it is pushed (becomes a "leading short").
+    ///     A long `new` is always pushed.
+    ///
+    ///   - Original Pass 2: any leading items shorter than the first item that is
+    ///     itself ≥ `min_len` are absorbed into that first long item.
+    ///
+    /// Streaming reformulation (only `pending` is held):
+    ///
+    ///   * `new` is short → right-extend `pending` (Pass 1 left-absorb).
+    ///   * `new` is long and `pending` is already long (length ≥ min_len) → emit
+    ///     `pending`, then `pending = new` (no Pass-2 absorption needed).
+    ///   * `new` is long and `pending` is still short → left-absorb `pending` into
+    ///     `new` (Pass-2 leading-shorts-into-first-long), then `pending = new`.
+    ///
+    /// At gap/seq end, `flush_seq_intervals` emits whatever `pending` holds.
+    fn merge_into_pending(&mut self, new: SparseDepthInterval) {
+        let new_is_short = (new.end - new.start) < self.min_interval_len;
+        match self.pending.take() {
+            None => {
+                self.pending = Some(new);
+            }
+            Some(mut pending) => {
+                if new_is_short {
+                    Self::absorb_right(&mut pending, new);
+                    self.pending = Some(pending);
+                } else if (pending.end - pending.start) >= self.min_interval_len {
+                    self.emit_final(pending);
+                    self.pending = Some(new);
+                } else {
+                    let mut absorbed = new;
+                    Self::absorb_left(pending, &mut absorbed);
+                    self.pending = Some(absorbed);
+                }
+            }
+        }
+    }
+
+    /// Right-extend `left` by absorbing `right`: end advances to `right.end`,
+    /// pangenome bases sum, and `right`'s samples are unioned into `left`'s
+    /// (per-sample query coordinates expand to the union of overlapping ranges).
+    fn absorb_right(left: &mut SparseDepthInterval, right: SparseDepthInterval) {
+        left.end = right.end;
+        left.pangenome_bases += right.pangenome_bases;
+        let mut sample_idx: FxHashMap<u16, usize> = left
+            .samples
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.0, i))
+            .collect();
+        for sp in right.samples {
+            if let Some(&i) = sample_idx.get(&sp.0) {
+                left.samples[i].2 = left.samples[i].2.min(sp.2);
+                left.samples[i].3 = left.samples[i].3.max(sp.3);
+            } else {
+                sample_idx.insert(sp.0, left.samples.len());
+                left.samples.push(sp);
+            }
+        }
+        left.samples.sort_by_key(|s| s.0);
+    }
+
+    /// Left-extend `right` by absorbing `left`: start retreats to `left.start`,
+    /// pangenome bases sum, and `left`'s samples are unioned into `right`'s.
+    /// Mirrors the Pass-2 leading-shorts-into-first-long path of
+    /// `merge_short_intervals`.
+    fn absorb_left(left: SparseDepthInterval, right: &mut SparseDepthInterval) {
+        right.start = left.start;
+        right.pangenome_bases += left.pangenome_bases;
+        let mut sample_idx: FxHashMap<u16, usize> = right
+            .samples
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.0, i))
+            .collect();
+        for sp in left.samples {
+            if let Some(&i) = sample_idx.get(&sp.0) {
+                right.samples[i].2 = right.samples[i].2.min(sp.2);
+                right.samples[i].3 = right.samples[i].3.max(sp.3);
+            } else {
+                sample_idx.insert(sp.0, right.samples.len());
+                right.samples.push(sp);
+            }
+        }
+        right.samples.sort_by_key(|s| s.0);
     }
 
     /// Split an interval at window boundaries and forward each piece.
@@ -1458,16 +1574,28 @@ impl<'a> StreamingDepthEmitter<'a> {
     }
 
     /// Flush buffered intervals for the current contiguous depth region.
-    /// Applies min_interval_len merging before emitting, so short intervals
-    /// caused by transient alignment dropouts are absorbed into their neighbors.
+    ///
+    /// Two independent buffers may carry state across this call:
+    ///   - `seq_intervals` (windowed path only): drained through
+    ///     `merge_short_intervals` to preserve cross-window merging semantics.
+    ///   - `pending` (non-windowed `min_interval_len > 0` streaming path):
+    ///     emitted as-is. If `pending` is still shorter than `min_interval_len`
+    ///     at flush time, no long interval ever followed in this gap, so it is
+    ///     emitted unchanged — matching `merge_short_intervals`'s "boundary is
+    ///     None → keep all leading shorts as-is" branch.
+    ///
+    /// Callers invoke this between Phase 2 gaps so leading shorts of one gap
+    /// never absorb into the trailing tail of the previous (non-contiguous) gap.
     fn flush_seq_intervals(&mut self) {
-        if self.seq_intervals.is_empty() {
-            return;
+        if !self.seq_intervals.is_empty() {
+            let intervals = std::mem::take(&mut self.seq_intervals);
+            let merged = merge_short_intervals(intervals, self.min_interval_len);
+            for interval in merged {
+                self.emit_final(interval);
+            }
         }
-        let intervals = std::mem::take(&mut self.seq_intervals);
-        let merged = merge_short_intervals(intervals, self.min_interval_len);
-        for interval in merged {
-            self.emit_final(interval);
+        if let Some(p) = self.pending.take() {
+            self.emit_final(p);
         }
     }
 
@@ -1768,6 +1896,47 @@ impl ConcurrentProcessedTracker {
             lock.add(s, e);
         }
         unprocessed
+    }
+
+    /// Bool-only variant of [`claim_unprocessed`].
+    ///
+    /// Returns `true` iff any portion of `[start, end)` was previously
+    /// unprocessed; in either case, the entire range is marked processed
+    /// afterwards. The post-state is identical to `claim_unprocessed`'s
+    /// (`IntervalSet::add` is idempotent), but no `Vec<(i64, i64)>` is ever
+    /// allocated.
+    ///
+    /// Use at hot-loop call sites that only need the empty/non-empty bit
+    /// (e.g., `process_anchor_region_raw_streaming` calls this once per query
+    /// alignment — at CHM13 / 580-sample scale that is tens of millions of
+    /// invocations and the original Vec allocation showed up as significant
+    /// allocator pressure under jemalloc profiling).
+    fn claim_any_unprocessed(&self, seq_id: u32, start: i64, end: i64) -> bool {
+        if start >= end {
+            return false;
+        }
+        let mut lock = self.processed[seq_id as usize].lock();
+        let span = end - start;
+        let any_unprocessed = if lock.is_empty() {
+            true
+        } else {
+            // IntervalSet maintains disjoint, sorted, merged intervals, so
+            // summing clipped overlap lengths gives the exact covered area.
+            let mut covered: i64 = 0;
+            for (s, e) in lock.iter_overlapping(start, end) {
+                let cs = s.max(start);
+                let ce = e.min(end);
+                if ce > cs {
+                    covered += ce - cs;
+                    if covered >= span {
+                        break;
+                    }
+                }
+            }
+            covered < span
+        };
+        lock.add(start, end);
+        any_unprocessed
     }
 }
 
@@ -2862,8 +3031,7 @@ fn process_anchor_region_raw(
             aln.is_reverse,
         ));
 
-        let claimed = global_used.claim_unprocessed(aln.query_id, cq_start, cq_end);
-        if !claimed.is_empty() {
+        if global_used.claim_any_unprocessed(aln.query_id, cq_start, cq_end) {
             discovered_regions.push((aln.query_id, cq_start, cq_end));
         }
     }
@@ -3491,8 +3659,7 @@ fn process_anchor_region_raw_streaming(
         // and tells us which sub-ranges this anchor newly owns. We only push to
         // discovered_regions when this anchor won the claim race — preventing the
         // tracker from double-counting anchor ownership.
-        let claimed = global_used.claim_unprocessed(aln.query_id, cq_start, cq_end);
-        if !claimed.is_empty() {
+        if global_used.claim_any_unprocessed(aln.query_id, cq_start, cq_end) {
             discovered_regions.push((aln.query_id, cq_start, cq_end));
         }
     }
@@ -3638,10 +3805,13 @@ pub fn compute_depth_global(
     // needed for the pre-scan — leave the main-phase cache setting untouched.
     info!("Pre-scanning alignment degrees...");
     let degrees = compute_alignment_degrees(impg, &compact_lengths, &seq_included);
-    // Belt-and-suspenders: clear any stale entries left from earlier phases of
-    // this invocation (should be empty here, since load_sub_index_transient
-    // never populates the shared cache).
+    // Pre-scan uses load_sub_index_uncached (does NOT populate
+    // transient_header_cache), so the cache should already be empty here. Clear
+    // both caches defensively in case a future code change reintroduces caching
+    // upstream — keeping mmap pressure off vm.max_map_count is critical when
+    // running with hundreds of thousands of per-file indices.
     impg.clear_sub_index_cache();
+    impg.clear_transient_header_cache();
     let max_degree = degrees.iter().copied().max().unwrap_or(0);
     let included_count = seq_included.iter().filter(|&&v| v).count();
     info!(
@@ -4013,45 +4183,82 @@ pub fn compute_depth_global(
             }
 
             impg.clear_sub_index_cache();
+            // Release the per-file `Arc<Impg>` headers that Phase 1's
+            // batch BFS / chunked queries pinned in the transient cache.
+            // At `--index-mode per-file` with hundreds of thousands of
+            // alignment files this is what keeps Phase 2 from inheriting
+            // a cache that has already crowded `vm.max_map_count`.
+            impg.clear_transient_header_cache();
             pb_phase1.finish_and_clear();
         } else {
-            // Non-transitive mode: sequence-level parallelism.
-            // Hub sequences are few but each is fast (direct query + sweep-line).
+            // Non-transitive mode: chunk-level parallelism.
+            //
+            // Previous design ran one task per hub sequence and called
+            // `query_raw_intervals_transient(seq_id)` to materialize *all* raw
+            // alignments for the chromosome in a single Vec. For CHM13-scale
+            // (~250 Mb chr1, 580 samples, 580 per-file indices) that single
+            // raw_alns Vec can reach 0.3–1 GB, the sweep-line `events` Vec is 2×
+            // that, and the streaming emitter's `seq_intervals` (when min_interval_len
+            // = 0 it was never streamed) added 10s of GB more. With par_iter at
+            // worker-count concurrency, the process OOMed before Phase 1 finished.
+            //
+            // New design: split each chromosome into 5 MB chunks (matching the
+            // transitive path's `TRANSITIVE_CHUNK_SIZE`) and parallelize chunks
+            // instead of sequences. Each chunk uses `query_raw_overlapping_transient`
+            // for a bounded range query, so per-task peak is O(chunk_alignments)
+            // and total memory peak across workers is `threads × O(chunk)`.
+            //
+            // Chunk boundaries are independent of alignment boundaries — claim_unprocessed
+            // on the query side is atomic across chunks, so no double-counting.
+            // The per-chunk emitter resets `pending`, so when min_interval_len > 0
+            // a leading-short at a chunk seam is not merged across the seam; this
+            // is acceptable at 5 MB granularity for transient-dropout absorption.
+            let phase1_chunks: Vec<(u32, i64, i64)> = phase1_seqs
+                .iter()
+                .flat_map(|&seq_id| {
+                    let seq_len = compact_lengths.get_length(seq_id);
+                    let mut chunks = Vec::new();
+                    if seq_len > 0 {
+                        let mut start = 0i64;
+                        while start < seq_len {
+                            let end = (start + TRANSITIVE_CHUNK_SIZE).min(seq_len);
+                            chunks.push((seq_id, start, end));
+                            start = end;
+                        }
+                    }
+                    chunks
+                })
+                .collect();
+
             info!(
-                "Phase 1: {} hub sequences, sequence-level parallelism",
-                phase1_seqs.len()
+                "Phase 1: {} hub sequences split into {} {}-MB chunks, chunk-level parallelism",
+                phase1_seqs.len(),
+                phase1_chunks.len(),
+                TRANSITIVE_CHUNK_SIZE / 1_000_000,
             );
 
-            let pb_phase1 = ProgressBar::new(phase1_seqs.len() as u64);
+            let pb_phase1 = ProgressBar::new(phase1_chunks.len() as u64);
             pb_phase1.set_style(
                 ProgressStyle::default_bar()
-                    .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} seqs ({eta}) | Phase 1: hub sequences")
+                    .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} chunks ({eta}) | Phase 1: hub sequences")
                     .unwrap()
                     .progress_chars("#>-")
             );
 
             let phase1_count = AtomicUsize::new(0);
 
-            phase1_seqs
+            phase1_chunks
                 .par_iter()
-                .try_for_each(|&seq_id| -> io::Result<()> {
-                    let seq_len = compact_lengths.get_length(seq_id);
-                    if seq_len <= 0 {
-                        let count = phase1_count.fetch_add(1, Ordering::Relaxed) + 1;
-                        pb_phase1.set_position(count as u64);
-                        return Ok(());
-                    }
-
+                .try_for_each(|&(seq_id, chunk_start, chunk_end)| -> io::Result<()> {
                     let sample_id = compact_lengths.get_sample_id(seq_id);
 
-                    // Transient load: MUST NOT populate MultiImpg::sub_indices. With
-                    // per-file indexing at ≥10⁴ files, every call to the cached
-                    // `query_raw_intervals` would pin one Arc<Impg> (and its cached
-                    // trees) per file visited, growing without bound across 59k+ hub
-                    // iterations until the process commit limit is hit. The transient
-                    // variant loads each sub-index through `load_sub_index_transient`
-                    // and drops it after walking its trees.
-                    let mut raw_alns = impg.query_raw_intervals_transient(seq_id);
+                    // Range query bounded by the chunk: peak per-task memory is
+                    // O(chunk_alignments) instead of O(chromosome_alignments).
+                    let mut raw_alns = impg.query_raw_overlapping_transient(
+                        seq_id,
+                        chunk_start,
+                        chunk_end,
+                    );
                     if min_seq_length > 0 {
                         raw_alns.retain(|aln| {
                             seq_included
@@ -4062,10 +4269,6 @@ pub fn compute_depth_global(
                     }
                     raw_alns.sort_unstable_by_key(|aln| aln.target_start);
 
-                    // Streaming path: process sweep-line intervals one at a time,
-                    // format and flush incrementally instead of collecting all
-                    // intervals into a Vec. Reduces peak memory from
-                    // O(K × N_samples) to O(N_samples) per interval.
                     let seq_name = impg.seq_index().get_name(seq_id).unwrap_or("?");
                     let should_output = if ref_only {
                         ref_sample_id == Some(sample_id)
@@ -4097,6 +4300,7 @@ pub fn compute_depth_global(
                         sample_index: &sample_index,
                         min_interval_len,
                         seq_intervals: Vec::new(),
+                        pending: None,
                         window_size: if user_window_size.is_some() {
                             Some(window_size)
                         } else {
@@ -4110,8 +4314,8 @@ pub fn compute_depth_global(
                         num_samples,
                         seq_id,
                         sample_id,
-                        0,
-                        seq_len,
+                        chunk_start,
+                        chunk_end,
                         &global_used,
                         &mut |interval| emitter.emit(interval),
                     );
@@ -4125,6 +4329,11 @@ pub fn compute_depth_global(
                     Ok(())
                 })?;
 
+            // Same rationale as the transitive branch above: drop both the
+            // sub-index BFS cache and the transient per-file header cache
+            // before Phase 2 starts widening the working set further.
+            impg.clear_sub_index_cache();
+            impg.clear_transient_header_cache();
             pb_phase1.finish_and_clear();
         }
 
@@ -4144,51 +4353,107 @@ pub fn compute_depth_global(
     }
 
     // =========================================================================
-    // Phase 2: Process remaining sequences (sequence-level parallelism)
+    // Phase 2: Process remaining sequences.
+    //
+    // Two distinct execution shapes:
+    //
+    //   Non-transitive (default): chunk-level parallelism, mirroring Phase 1.
+    //     Per-task peak memory is bounded by O(chunk_alignments) instead of
+    //     O(scaffold_alignments). This matters for pangenomes whose Phase 2
+    //     pool contains long contigs/scaffolds (50–200 Mb is normal at
+    //     CHM13/HPRC scale); the previous per-seq par_iter at ~80 threads
+    //     could pin tens of GB of `raw_alns_cached` Vecs simultaneously.
+    //
+    //   Transitive (`-x`): seq-level parallelism is retained because the
+    //     transitive path internally chunks at TRANSITIVE_CHUNK_SIZE and
+    //     manages its own sub-index cache. Restructuring it would require
+    //     also rewriting the BFS state plumbing — out of scope here.
     // =========================================================================
     let phase2_label = if phase1_seqs.is_empty() {
         ""
     } else {
         "Phase 2: "
     };
-    let pb_depth = ProgressBar::new(total_sequences as u64);
-    pb_depth.set_style(
-        ProgressStyle::default_bar()
-            .template(&format!(
-                "{{spinner:.green}} [{{elapsed_precise}}] [{{wide_bar:.cyan/blue}}] {{pos}}/{{len}} seqs ({{eta}}) | {}remaining sequences",
-                phase2_label
-            ))
-            .unwrap()
-            .progress_chars("#>-")
-    );
-    pb_depth.set_position(processed_count.load(Ordering::Relaxed) as u64);
 
-    phase2_seqs
-        .par_iter()
-        .try_for_each(|&seq_id| -> io::Result<()> {
+    if !is_transitive {
+        // Precompute (seq_id, chunk_start, chunk_end) tuples by scanning the
+        // current unprocessed gaps for every Phase 2 sequence and slicing each
+        // gap at TRANSITIVE_CHUNK_SIZE. Phase 1 has already finished, so the
+        // tracker state is stable when this runs.
+        //
+        // Two-pass build (count then fill) so the Vec is allocated exactly
+        // once at its final capacity. With pangenome-scale workloads this
+        // collect can return tens of millions of chunks (≥56M observed at
+        // 581-sample VGP scale); the doubling growth pattern from a default
+        // `flat_map().collect()` would create a transient ~2× peak right at
+        // the Phase-1 → Phase-2 boundary, which on hosts already pressed up
+        // against `vm.max_map_count` from the transient header cache was
+        // enough to trip the allocator.
+        let mut phase2_chunk_count_pre: usize = 0;
+        for &seq_id in &phase2_seqs {
             let seq_len = compact_lengths.get_length(seq_id);
             if seq_len <= 0 {
-                let count = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
-                pb_depth.set_position(count as u64);
-                return Ok(());
+                continue;
             }
-
-            let unprocessed = tracker.get_unprocessed(seq_id, 0, seq_len);
-            if unprocessed.is_empty() {
-                let count = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
-                pb_depth.set_position(count as u64);
-                return Ok(());
+            for (region_start, region_end) in tracker.get_unprocessed(seq_id, 0, seq_len) {
+                let gap = region_end - region_start;
+                if gap > 0 {
+                    // ceil(gap / chunk_size)
+                    phase2_chunk_count_pre +=
+                        ((gap + TRANSITIVE_CHUNK_SIZE - 1) / TRANSITIVE_CHUNK_SIZE) as usize;
+                }
             }
+        }
 
-            let sample_id = compact_lengths.get_sample_id(seq_id);
+        let mut phase2_chunks: Vec<(u32, i64, i64)> =
+            Vec::with_capacity(phase2_chunk_count_pre);
+        for &seq_id in &phase2_seqs {
+            let seq_len = compact_lengths.get_length(seq_id);
+            if seq_len <= 0 {
+                continue;
+            }
+            for (region_start, region_end) in tracker.get_unprocessed(seq_id, 0, seq_len) {
+                let mut start = region_start;
+                while start < region_end {
+                    let end = (start + TRANSITIVE_CHUNK_SIZE).min(region_end);
+                    phase2_chunks.push((seq_id, start, end));
+                    start = end;
+                }
+            }
+        }
+        debug_assert_eq!(phase2_chunks.len(), phase2_chunk_count_pre);
 
-            // Non-transitive: load raw intervals once per sequence (not per gap).
-            // Uses the transient variant for the same reason Phase 1 does — avoid
-            // pinning sub-indices across Phase 2 sequences, which would otherwise
-            // monotonically grow to `num_alignment_files × sub_index_size` and OOM
-            // at per-file scale ≥10⁴.
-            let raw_alns_cached = if !is_transitive {
-                let mut raw_alns = impg.query_raw_intervals_transient(seq_id);
+        info!(
+            "Phase 2: {} sequences split into {} {}-MB chunks, chunk-level parallelism",
+            phase2_seqs.len(),
+            phase2_chunks.len(),
+            TRANSITIVE_CHUNK_SIZE / 1_000_000,
+        );
+
+        let pb_depth = ProgressBar::new(phase2_chunks.len() as u64);
+        pb_depth.set_style(
+            ProgressStyle::default_bar()
+                .template(&format!(
+                    "{{spinner:.green}} [{{elapsed_precise}}] [{{wide_bar:.cyan/blue}}] {{pos}}/{{len}} chunks ({{eta}}) | {}remaining sequences",
+                    phase2_label
+                ))
+                .unwrap()
+                .progress_chars("#>-")
+        );
+        let phase2_chunk_count = AtomicUsize::new(0);
+
+        phase2_chunks
+            .par_iter()
+            .try_for_each(|&(seq_id, chunk_start, chunk_end)| -> io::Result<()> {
+                let sample_id = compact_lengths.get_sample_id(seq_id);
+
+                // Range-bounded transient query: per-chunk peak ~ O(chunk_alns)
+                // instead of the full per-seq Vec the pre-chunking design used.
+                let mut raw_alns = impg.query_raw_overlapping_transient(
+                    seq_id,
+                    chunk_start,
+                    chunk_end,
+                );
                 if min_seq_length > 0 {
                     raw_alns.retain(|aln| {
                         seq_included
@@ -4198,58 +4463,106 @@ pub fn compute_depth_global(
                     });
                 }
                 raw_alns.sort_unstable_by_key(|aln| aln.target_start);
-                Some(raw_alns)
-            } else {
-                None
-            };
 
-            // Streaming emitter for this sequence — shared across all gaps.
-            // Created once to avoid repeated allocation of stats accumulators.
-            let seq_name = impg.seq_index().get_name(seq_id).unwrap_or("?");
-            let should_output = if ref_only {
-                ref_sample_id == Some(sample_id)
-            } else {
-                true
-            };
+                let seq_name = impg.seq_index().get_name(seq_id).unwrap_or("?");
+                let should_output = if ref_only {
+                    ref_sample_id == Some(sample_id)
+                } else {
+                    true
+                };
 
-            let mut emitter = StreamingDepthEmitter {
-                buf: Vec::new(),
-                writer: &writer,
-                seq_name,
-                anchor_sample_id: sample_id,
-                num_samples,
-                seq_index: impg.seq_index(),
-                row_counter: &row_counter,
-                intervals_counter: &intervals_counter,
-                should_output,
-                stats_mode,
-                local_stats: if stats_accumulator.is_some() {
-                    Some(DepthStats::new())
-                } else {
-                    None
-                },
-                local_combined: if stats_combined_acc.is_some() {
-                    Some(DepthStatsWithSamples::new())
-                } else {
-                    None
-                },
-                sample_index: &sample_index,
-                min_interval_len,
-                seq_intervals: Vec::new(),
-                window_size: if user_window_size.is_some() {
-                    Some(window_size)
-                } else {
-                    None
-                },
-            };
+                let mut emitter = StreamingDepthEmitter {
+                    buf: Vec::new(),
+                    writer: &writer,
+                    seq_name,
+                    anchor_sample_id: sample_id,
+                    num_samples,
+                    seq_index: impg.seq_index(),
+                    row_counter: &row_counter,
+                    intervals_counter: &intervals_counter,
+                    should_output,
+                    stats_mode,
+                    local_stats: if stats_accumulator.is_some() {
+                        Some(DepthStats::new())
+                    } else {
+                        None
+                    },
+                    local_combined: if stats_combined_acc.is_some() {
+                        Some(DepthStatsWithSamples::new())
+                    } else {
+                        None
+                    },
+                    sample_index: &sample_index,
+                    min_interval_len,
+                    seq_intervals: Vec::new(),
+                    pending: None,
+                    window_size: if user_window_size.is_some() {
+                        Some(window_size)
+                    } else {
+                        None
+                    },
+                };
 
-            let mut buf: Vec<u8> = Vec::new();
-            for (region_start, region_end) in unprocessed {
-                if is_transitive {
+                let discovered = process_anchor_region_raw_streaming(
+                    &raw_alns,
+                    &compact_lengths,
+                    num_samples,
+                    seq_id,
+                    sample_id,
+                    chunk_start,
+                    chunk_end,
+                    &global_used,
+                    &mut |interval| emitter.emit(interval),
+                );
+                emitter.flush()?;
+                tracker.mark_processed_batch(&discovered);
+                emitter.merge_stats_into(&stats_accumulator, &stats_combined_acc);
+
+                let count = phase2_chunk_count.fetch_add(1, Ordering::Relaxed) + 1;
+                pb_depth.set_position(count as u64);
+                Ok(())
+            })?;
+
+        pb_depth.finish_and_clear();
+        // Update overall processed counter so any downstream readers see the
+        // full Phase 1 + Phase 2 sequence count.
+        processed_count.store(phase1_seqs.len() + phase2_seqs.len(), Ordering::Relaxed);
+    } else {
+        let pb_depth = ProgressBar::new(total_sequences as u64);
+        pb_depth.set_style(
+            ProgressStyle::default_bar()
+                .template(&format!(
+                    "{{spinner:.green}} [{{elapsed_precise}}] [{{wide_bar:.cyan/blue}}] {{pos}}/{{len}} seqs ({{eta}}) | {}remaining sequences",
+                    phase2_label
+                ))
+                .unwrap()
+                .progress_chars("#>-")
+        );
+        pb_depth.set_position(processed_count.load(Ordering::Relaxed) as u64);
+
+        phase2_seqs
+            .par_iter()
+            .try_for_each(|&seq_id| -> io::Result<()> {
+                let seq_len = compact_lengths.get_length(seq_id);
+                if seq_len <= 0 {
+                    let count = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    pb_depth.set_position(count as u64);
+                    return Ok(());
+                }
+
+                let unprocessed = tracker.get_unprocessed(seq_id, 0, seq_len);
+                if unprocessed.is_empty() {
+                    let count = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    pb_depth.set_position(count as u64);
+                    return Ok(());
+                }
+
+                let sample_id = compact_lengths.get_sample_id(seq_id);
+
+                let mut buf: Vec<u8> = Vec::new();
+                for (region_start, region_end) in unprocessed {
                     let gap_len = region_end - region_start;
 
-                    // Transitive path: still uses the buffered write_results path.
-                    // Streaming optimization for transitive mode is a separate effort.
                     let region_results = if gap_len < config.min_transitive_len {
                         let mut raw_alns = impg.query_raw_overlapping_transient(
                             seq_id,
@@ -4318,7 +4631,6 @@ pub fn compute_depth_global(
                         vec![result]
                     };
 
-                    // Format output into thread-local buffer, then write atomically
                     buf.clear();
                     write_results(region_results, &mut buf)?;
                     if !buf.is_empty() {
@@ -4326,54 +4638,23 @@ pub fn compute_depth_global(
                             w.lock().write_all(&buf)?;
                         }
                     }
-                } else {
-                    // Non-transitive streaming path: emit intervals one at a time
-                    let discovered = process_anchor_region_raw_streaming(
-                        raw_alns_cached.as_ref().unwrap(),
-                        &compact_lengths,
-                        num_samples,
-                        seq_id,
-                        sample_id,
-                        region_start,
-                        region_end,
-                        &global_used,
-                        &mut |interval| emitter.emit(interval),
-                    );
-                    // Flush merge state between gaps (each gap is independent)
-                    emitter.flush_seq_intervals();
-                    tracker.mark_processed_batch(&discovered);
                 }
-            }
 
-            // Flush remaining output buffer and merge stats
-            emitter.flush()?;
-            emitter.merge_stats_into(&stats_accumulator, &stats_combined_acc);
+                let count = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
+                pb_depth.set_position(count as u64);
 
-            // Phase 2 non-transitive path uses the transient query variants above
-            // (`query_raw_intervals_transient` / `query_raw_overlapping_transient`),
-            // which do not write MultiImpg::sub_indices or Impg::trees. No
-            // per-sequence clear is needed because nothing is cached in the first
-            // place. The transitive path below still relies on cached sub-indices
-            // (and will continue to) — see the post-loop clear for that case.
-            //
-            // History note: a prior design held sub-indices cached across Phase 2
-            // sequences on the rationale that peak memory was "bounded by
-            // num_alignment_files × sub_index_size". That bound is ~hundreds of GB
-            // at per-file indexing with ≥10⁴ files and is not acceptable on real
-            // hardware; hence the switch to the transient variants here.
-            let count = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
-            pb_depth.set_position(count as u64);
+                Ok(())
+            })?;
 
-            Ok(())
-        })?;
+        pb_depth.finish_and_clear();
+    }
 
     // Clear sub-index cache once after Phase 2 transitive processing.
     // Non-transitive already uses transient queries and has nothing to clear.
+    // (The progress bar was already finished within each Phase 2 branch.)
     if is_transitive {
         impg.clear_sub_index_cache();
     }
-
-    pb_depth.finish_and_clear();
 
     // Handle FAI sequences not in alignment index (depth=1 for unaligned sequences)
     if let Some(ref fai) = fai_seq_lengths {
@@ -5702,5 +5983,286 @@ mod tests {
             project_hop0_coords(None, 500, 600, region_start, region_end),
             (region_start, region_start)
         );
+    }
+
+    // ====================================================================
+    // Streaming `pending` state-machine equivalence to merge_short_intervals.
+    //
+    // The non-windowed Phase 1/2 streaming path replaced the buffered
+    // `seq_intervals` Vec + `merge_short_intervals` post-pass with a
+    // single-element `pending` slot updated incrementally. These tests assert
+    // that the streaming reformulation produces output byte-identical to the
+    // original two-pass algorithm for every interval shape that matters.
+    // ====================================================================
+
+    fn make_iv(start: i64, end: i64, samples: &[u16]) -> SparseDepthInterval {
+        let samples_vec: Vec<SamplePosition> = samples
+            .iter()
+            .enumerate()
+            .map(|(i, &sid)| (sid, i as u32, start, end))
+            .collect();
+        SparseDepthInterval {
+            start,
+            end,
+            samples: samples_vec,
+            pangenome_bases: end - start,
+        }
+    }
+
+    /// Simulate `StreamingDepthEmitter::merge_into_pending` over a Vec, then
+    /// flush. Mirrors the production path exactly so the comparison is honest.
+    fn stream_merge(intervals: Vec<SparseDepthInterval>, min_len: i64) -> Vec<SparseDepthInterval> {
+        if min_len <= 0 {
+            // Streaming-no-merge path: emitter calls emit_final directly.
+            return intervals;
+        }
+        let mut out: Vec<SparseDepthInterval> = Vec::new();
+        let mut pending: Option<SparseDepthInterval> = None;
+        for new in intervals {
+            let new_is_short = (new.end - new.start) < min_len;
+            match pending.take() {
+                None => pending = Some(new),
+                Some(mut p) => {
+                    if new_is_short {
+                        StreamingDepthEmitter::absorb_right(&mut p, new);
+                        pending = Some(p);
+                    } else if (p.end - p.start) >= min_len {
+                        out.push(p);
+                        pending = Some(new);
+                    } else {
+                        let mut absorbed = new;
+                        StreamingDepthEmitter::absorb_left(p, &mut absorbed);
+                        pending = Some(absorbed);
+                    }
+                }
+            }
+        }
+        if let Some(p) = pending {
+            out.push(p);
+        }
+        out
+    }
+
+    /// Compare two interval Vecs on the fields the streaming pipeline writes
+    /// to output: start, end, sample IDs (set), and pangenome_bases.
+    fn assert_intervals_equivalent(a: &[SparseDepthInterval], b: &[SparseDepthInterval]) {
+        assert_eq!(a.len(), b.len(), "interval count mismatch");
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(x.start, y.start, "start mismatch at index {}", i);
+            assert_eq!(x.end, y.end, "end mismatch at index {}", i);
+            assert_eq!(
+                x.pangenome_bases, y.pangenome_bases,
+                "pangenome_bases mismatch at index {}",
+                i
+            );
+            let mut xs: Vec<u16> = x.samples.iter().map(|s| s.0).collect();
+            let mut ys: Vec<u16> = y.samples.iter().map(|s| s.0).collect();
+            xs.sort_unstable();
+            ys.sort_unstable();
+            assert_eq!(xs, ys, "sample-id set mismatch at index {}", i);
+        }
+    }
+
+    // ====================================================================
+    // claim_any_unprocessed bool fast-path equivalence to claim_unprocessed.
+    //
+    // Both methods must end in the identical IntervalSet post-state, and
+    // the bool result must equal `!claim_unprocessed(...).is_empty()` for
+    // every input. Tested over a deterministic random sequence of claims so
+    // we exercise the empty-set, fully-covered, partially-covered, and
+    // touching-neighbor branches.
+    // ====================================================================
+    #[test]
+    fn test_claim_any_unprocessed_matches_claim_unprocessed() {
+        let mut rng_state: u64 = 0xC1A1_BEEF_FACE_F00D;
+        let mut next = || {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng_state
+        };
+
+        for _trial in 0..50 {
+            let baseline = ConcurrentProcessedTracker::new(1);
+            let probe = ConcurrentProcessedTracker::new(1);
+
+            for _ in 0..200 {
+                let s = (next() % 100_000) as i64;
+                let len = (next() % 5_000 + 1) as i64;
+                let e = s + len;
+
+                let baseline_vec = baseline.claim_unprocessed(0, s, e);
+                let probe_bool = probe.claim_any_unprocessed(0, s, e);
+
+                assert_eq!(
+                    !baseline_vec.is_empty(),
+                    probe_bool,
+                    "bool divergence at [{},{}): baseline returned {:?}",
+                    s, e, baseline_vec
+                );
+
+                // Compare full post-state intervals to confirm both trackers
+                // ended up storing the same set after the operation.
+                let baseline_state: Vec<(i64, i64)> = baseline.processed[0]
+                    .lock()
+                    .intervals()
+                    .collect();
+                let probe_state: Vec<(i64, i64)> = probe.processed[0]
+                    .lock()
+                    .intervals()
+                    .collect();
+                assert_eq!(
+                    baseline_state, probe_state,
+                    "post-state divergence after claim [{},{})",
+                    s, e
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_stream_merge_min_len_zero_passthrough() {
+        let ivs = vec![
+            make_iv(0, 100, &[1, 2]),
+            make_iv(100, 200, &[3]),
+            make_iv(200, 250, &[4]),
+        ];
+        let baseline = merge_short_intervals(ivs.clone(), 0);
+        let streamed = stream_merge(ivs, 0);
+        assert_intervals_equivalent(&baseline, &streamed);
+    }
+
+    #[test]
+    fn test_stream_merge_leading_shorts_into_first_long() {
+        // s1, s2, L3 — pass 2 absorbs leading shorts into the first long.
+        let ivs = vec![
+            make_iv(0, 10, &[1]),
+            make_iv(10, 20, &[2]),
+            make_iv(20, 200, &[3]),
+        ];
+        let baseline = merge_short_intervals(ivs.clone(), 100);
+        let streamed = stream_merge(ivs, 100);
+        assert_intervals_equivalent(&baseline, &streamed);
+    }
+
+    #[test]
+    fn test_stream_merge_short_after_long_absorbs_left() {
+        // L1, s2, L3 — pass 1 absorbs s2 into L1.
+        let ivs = vec![
+            make_iv(0, 200, &[1]),
+            make_iv(200, 210, &[2]),
+            make_iv(210, 400, &[3]),
+        ];
+        let baseline = merge_short_intervals(ivs.clone(), 100);
+        let streamed = stream_merge(ivs, 100);
+        assert_intervals_equivalent(&baseline, &streamed);
+    }
+
+    #[test]
+    fn test_stream_merge_all_shorts_kept_as_is() {
+        // No long ever arrives — pass-2 boundary is None, intervals collapse
+        // into one merged blob in pass 1 (consecutive shorts absorb into prev).
+        let ivs = vec![
+            make_iv(0, 10, &[1]),
+            make_iv(10, 20, &[2]),
+            make_iv(20, 30, &[3]),
+        ];
+        let baseline = merge_short_intervals(ivs.clone(), 100);
+        let streamed = stream_merge(ivs, 100);
+        assert_intervals_equivalent(&baseline, &streamed);
+    }
+
+    #[test]
+    fn test_stream_merge_leading_shorts_overflow_min_len() {
+        // s1=80 + s2=80 → pass-1 merges to length 160 ≥ min_len=100.
+        // Pass 2 sees first "long" at index 0, no absorption. The streaming
+        // reformulation must NOT over-absorb the first long that follows.
+        let ivs = vec![
+            make_iv(0, 80, &[1]),
+            make_iv(80, 160, &[2]),
+            make_iv(160, 360, &[3]),
+        ];
+        let baseline = merge_short_intervals(ivs.clone(), 100);
+        let streamed = stream_merge(ivs, 100);
+        assert_intervals_equivalent(&baseline, &streamed);
+        // Sanity: this case really hit the [merged-shorts, long] split.
+        assert_eq!(baseline.len(), 2);
+    }
+
+    #[test]
+    fn test_stream_merge_alternating_shorts_and_longs() {
+        let ivs = vec![
+            make_iv(0, 5, &[1]),
+            make_iv(5, 200, &[2]),
+            make_iv(200, 210, &[3]),
+            make_iv(210, 400, &[4]),
+            make_iv(400, 405, &[5]),
+            make_iv(405, 600, &[6]),
+        ];
+        let baseline = merge_short_intervals(ivs.clone(), 100);
+        let streamed = stream_merge(ivs, 100);
+        assert_intervals_equivalent(&baseline, &streamed);
+    }
+
+    #[test]
+    fn test_stream_merge_trailing_shorts_absorb_into_last_long() {
+        // L1, s2, s3 — pass 1: s2 → L1, then s3 → L1 (the running prev).
+        let ivs = vec![
+            make_iv(0, 300, &[1]),
+            make_iv(300, 310, &[2]),
+            make_iv(310, 320, &[3]),
+        ];
+        let baseline = merge_short_intervals(ivs.clone(), 100);
+        let streamed = stream_merge(ivs, 100);
+        assert_intervals_equivalent(&baseline, &streamed);
+    }
+
+    #[test]
+    fn test_stream_merge_single_interval() {
+        let short_only = vec![make_iv(0, 10, &[1])];
+        assert_intervals_equivalent(
+            &merge_short_intervals(short_only.clone(), 100),
+            &stream_merge(short_only, 100),
+        );
+
+        let long_only = vec![make_iv(0, 200, &[1])];
+        assert_intervals_equivalent(
+            &merge_short_intervals(long_only.clone(), 100),
+            &stream_merge(long_only, 100),
+        );
+    }
+
+    #[test]
+    fn test_stream_merge_fuzz_equivalence() {
+        // Deterministic LCG so the test is reproducible without bringing in
+        // `rand` as a dev-dep.
+        let mut rng_state: u64 = 0xDEAD_BEEF_CAFE_F00D;
+        let mut next = || {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng_state
+        };
+
+        for _trial in 0..200 {
+            let n = (next() % 30 + 1) as usize;
+            let mut ivs = Vec::with_capacity(n);
+            let mut pos: i64 = 0;
+            for _ in 0..n {
+                // Mix of short (1-30 bp) and long (50-500 bp) to exercise
+                // the leading-shorts overflow case at varying min_len.
+                let len = if next() % 2 == 0 {
+                    (next() % 30 + 1) as i64
+                } else {
+                    (next() % 451 + 50) as i64
+                };
+                let nsamples = (next() % 4 + 1) as u16;
+                let samples: Vec<u16> = (0..nsamples).collect();
+                ivs.push(make_iv(pos, pos + len, &samples));
+                pos += len;
+            }
+
+            for &min_len in &[0i64, 1, 50, 100, 250] {
+                let baseline = merge_short_intervals(ivs.clone(), min_len);
+                let streamed = stream_merge(ivs.clone(), min_len);
+                assert_intervals_equivalent(&baseline, &streamed);
+            }
+        }
     }
 }
