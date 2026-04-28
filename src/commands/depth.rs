@@ -1034,6 +1034,22 @@ impl IntervalSet {
     }
 }
 
+/// Map a target-side offset to query-side offset using integer mul-div with
+/// round-half-up semantics. Replaces `(off as f64 * (q_len/t_len)).round() as i64`.
+///
+/// Safety: requires `t_len > 0`. Caller's responsibility to pre-check; we do NOT
+/// branch here for hot-path reasons. With `t_len <= 3e8` and `q_len <= 3e8`, the
+/// product fits i64 (max ~9e16 << i64::MAX ~9.2e18). `saturating_mul` guards
+/// against pathological overflow without changing results in normal ranges.
+#[inline(always)]
+fn proj_offset(off: i64, q_len: i64, t_len: i64) -> i64 {
+    debug_assert!(t_len > 0);
+    debug_assert!(off >= 0);
+    debug_assert!(q_len >= 0);
+    let prod = off.saturating_mul(q_len);
+    (prod + (t_len >> 1)) / t_len
+}
+
 /// Map a target coordinate range to query coordinates using linear interpolation.
 /// This provides smooth coordinate transitions between adjacent windows.
 ///
@@ -1065,15 +1081,13 @@ fn map_target_to_query_linear(
     let start_offset = window_target_start_clamped - aln_target_start;
     let end_offset = window_target_end_clamped - aln_target_start;
 
-    let ratio = query_len as f64 / target_len as f64;
-
     if is_reverse {
-        let q_end = aln_query_end - (start_offset as f64 * ratio).round() as i64;
-        let q_start = aln_query_end - (end_offset as f64 * ratio).round() as i64;
+        let q_end = aln_query_end - proj_offset(start_offset, query_len, target_len);
+        let q_start = aln_query_end - proj_offset(end_offset, query_len, target_len);
         (q_start.min(q_end), q_start.max(q_end))
     } else {
-        let q_start = aln_query_start + (start_offset as f64 * ratio).round() as i64;
-        let q_end = aln_query_start + (end_offset as f64 * ratio).round() as i64;
+        let q_start = aln_query_start + proj_offset(start_offset, query_len, target_len);
+        let q_end = aln_query_start + proj_offset(end_offset, query_len, target_len);
         (q_start.min(q_end), q_start.max(q_end))
     }
 }
@@ -1095,18 +1109,17 @@ fn inverse_map_query_to_target(
     if query_len == 0 {
         return (aln_target_start, aln_target_end);
     }
-    let ratio = target_len as f64 / query_len as f64;
     if is_reverse {
         let end_off = aln_query_end - q_start;
         let start_off = aln_query_end - q_end;
-        let t_start = aln_target_start + (start_off as f64 * ratio).round() as i64;
-        let t_end = aln_target_start + (end_off as f64 * ratio).round() as i64;
+        let t_start = aln_target_start + proj_offset(start_off, target_len, query_len);
+        let t_end = aln_target_start + proj_offset(end_off, target_len, query_len);
         (t_start.min(t_end).max(aln_target_start), t_start.max(t_end).min(aln_target_end))
     } else {
         let start_off = q_start - aln_query_start;
         let end_off = q_end - aln_query_start;
-        let t_start = aln_target_start + (start_off as f64 * ratio).round() as i64;
-        let t_end = aln_target_start + (end_off as f64 * ratio).round() as i64;
+        let t_start = aln_target_start + proj_offset(start_off, target_len, query_len);
+        let t_end = aln_target_start + proj_offset(end_off, target_len, query_len);
         (t_start.min(t_end).max(aln_target_start), t_start.max(t_end).min(aln_target_end))
     }
 }
@@ -1169,10 +1182,8 @@ fn project_hop0_coords(
             if seq_len <= 0 || anc_len <= 0 {
                 continue;
             }
-            let frac_s = (clip_s - seq_start) as f64 / seq_len as f64;
-            let frac_e = (clip_e - seq_start) as f64 / seq_len as f64;
-            let proj_s = anc_start + (frac_s * anc_len as f64).round() as i64;
-            let proj_e = anc_start + (frac_e * anc_len as f64).round() as i64;
+            let proj_s = anc_start + proj_offset(clip_s - seq_start, anc_len, seq_len);
+            let proj_e = anc_start + proj_offset(clip_e - seq_start, anc_len, seq_len);
             let lo = proj_s.min(proj_e);
             let hi = proj_s.max(proj_e);
             if lo < proj_min {
@@ -1491,21 +1502,19 @@ impl<'a> StreamingDepthEmitter<'a> {
                         return (sid, qid, qs, qe);
                     }
                     let q_len = qe - qs;
-                    let frac_start = (pos - interval.start) as f64 / interval_len as f64;
-                    let frac_end = (chunk_end - interval.start) as f64 / interval_len as f64;
-                    let new_qs = qs + (frac_start * q_len as f64).round() as i64;
-                    let new_qe = qs + (frac_end * q_len as f64).round() as i64;
+                    let off_s = pos - interval.start;
+                    let off_e = chunk_end - interval.start;
+                    let new_qs = qs + proj_offset(off_s, q_len, interval_len);
+                    let new_qe = qs + proj_offset(off_e, q_len, interval_len);
                     (sid, qid, new_qs, new_qe)
                 })
                 .collect();
 
-            let chunk_frac = if interval_len > 0 {
-                (chunk_end - pos) as f64 / interval_len as f64
+            let chunk_pangenome_bases = if interval_len > 0 {
+                proj_offset(chunk_end - pos, interval.pangenome_bases, interval_len)
             } else {
-                1.0
+                interval.pangenome_bases
             };
-            let chunk_pangenome_bases =
-                (interval.pangenome_bases as f64 * chunk_frac).round() as i64;
 
             self.seq_intervals.push(SparseDepthInterval {
                 start: pos,
@@ -1672,22 +1681,20 @@ fn split_intervals_by_window(
                         return (sid, qid, qs, qe);
                     }
                     let q_len = qe - qs;
-                    let frac_start = (pos - interval.start) as f64 / interval_len as f64;
-                    let frac_end = (chunk_end - interval.start) as f64 / interval_len as f64;
-                    let new_qs = qs + (frac_start * q_len as f64).round() as i64;
-                    let new_qe = qs + (frac_end * q_len as f64).round() as i64;
+                    let off_s = pos - interval.start;
+                    let off_e = chunk_end - interval.start;
+                    let new_qs = qs + proj_offset(off_s, q_len, interval_len);
+                    let new_qe = qs + proj_offset(off_e, q_len, interval_len);
                     (sid, qid, new_qs, new_qe)
                 })
                 .collect();
 
             // Proportionally split pangenome_bases
-            let chunk_frac = if interval_len > 0 {
-                (chunk_end - pos) as f64 / interval_len as f64
+            let chunk_pangenome_bases = if interval_len > 0 {
+                proj_offset(chunk_end - pos, interval.pangenome_bases, interval_len)
             } else {
-                1.0
+                interval.pangenome_bases
             };
-            let chunk_pangenome_bases =
-                (interval.pangenome_bases as f64 * chunk_frac).round() as i64;
 
             result.push(SparseDepthInterval {
                 start: pos,
@@ -2152,24 +2159,21 @@ impl BfsChunkState {
 
             let target_len_aln = aln_target_end - aln_target_start;
             let query_len_aln = aln.query_end - aln.query_start;
-            let ratio = if target_len_aln > 0 {
-                query_len_aln as f64 / target_len_aln as f64
-            } else {
-                1.0
-            };
 
-            let (clipped_query_start, clipped_query_end) = if aln.is_reverse {
-                let cqe = aln.query_end
-                    - ((clipped_target_start - aln_target_start) as f64 * ratio).round() as i64;
-                let cqs = aln.query_end
-                    - ((clipped_target_end - aln_target_start) as f64 * ratio).round() as i64;
-                (cqs.min(cqe), cqs.max(cqe))
+            let (clipped_query_start, clipped_query_end) = if target_len_aln > 0 {
+                let off_s = clipped_target_start - aln_target_start;
+                let off_e = clipped_target_end - aln_target_start;
+                if aln.is_reverse {
+                    let cqe = aln.query_end - proj_offset(off_s, query_len_aln, target_len_aln);
+                    let cqs = aln.query_end - proj_offset(off_e, query_len_aln, target_len_aln);
+                    (cqs.min(cqe), cqs.max(cqe))
+                } else {
+                    let cqs = aln.query_start + proj_offset(off_s, query_len_aln, target_len_aln);
+                    let cqe = aln.query_start + proj_offset(off_e, query_len_aln, target_len_aln);
+                    (cqs.min(cqe), cqs.max(cqe))
+                }
             } else {
-                let cqs = aln.query_start
-                    + ((clipped_target_start - aln_target_start) as f64 * ratio).round() as i64;
-                let cqe = aln.query_start
-                    + ((clipped_target_end - aln_target_start) as f64 * ratio).round() as i64;
-                (cqs.min(cqe), cqs.max(cqe))
+                (aln.query_start, aln.query_end)
             };
 
             self.results.push(DepthBfsHit {
@@ -2560,24 +2564,21 @@ fn depth_transitive_bfs(
             // Linear interpolation to compute query coordinates
             let target_len_aln = aln_target_end - aln_target_start;
             let query_len_aln = aln.query_end - aln.query_start;
-            let ratio = if target_len_aln > 0 {
-                query_len_aln as f64 / target_len_aln as f64
-            } else {
-                1.0
-            };
 
-            let (clipped_query_start, clipped_query_end) = if aln.is_reverse {
-                let cqe = aln.query_end
-                    - ((clipped_target_start - aln_target_start) as f64 * ratio).round() as i64;
-                let cqs = aln.query_end
-                    - ((clipped_target_end - aln_target_start) as f64 * ratio).round() as i64;
-                (cqs.min(cqe), cqs.max(cqe))
+            let (clipped_query_start, clipped_query_end) = if target_len_aln > 0 {
+                let off_s = clipped_target_start - aln_target_start;
+                let off_e = clipped_target_end - aln_target_start;
+                if aln.is_reverse {
+                    let cqe = aln.query_end - proj_offset(off_s, query_len_aln, target_len_aln);
+                    let cqs = aln.query_end - proj_offset(off_e, query_len_aln, target_len_aln);
+                    (cqs.min(cqe), cqs.max(cqe))
+                } else {
+                    let cqs = aln.query_start + proj_offset(off_s, query_len_aln, target_len_aln);
+                    let cqe = aln.query_start + proj_offset(off_e, query_len_aln, target_len_aln);
+                    (cqs.min(cqe), cqs.max(cqe))
+                }
             } else {
-                let cqs = aln.query_start
-                    + ((clipped_target_start - aln_target_start) as f64 * ratio).round() as i64;
-                let cqe = aln.query_start
-                    + ((clipped_target_end - aln_target_start) as f64 * ratio).round() as i64;
-                (cqs.min(cqe), cqs.max(cqe))
+                (aln.query_start, aln.query_end)
             };
 
             // Record this hit (clipped coordinates for depth calculation)
@@ -2946,24 +2947,20 @@ fn process_anchor_region(
         // Proportionally adjust query coordinates for clipped target
         let target_len = target_end - target_start;
         let query_len = query_end - query_start;
-        let ratio = if target_len > 0 {
-            query_len as f64 / target_len as f64
+        let (cq_start, cq_end) = if target_len > 0 {
+            let off_s = clipped_target_start - target_start;
+            let off_e = clipped_target_end - target_start;
+            if is_reverse {
+                let cqe = query_end - proj_offset(off_s, query_len, target_len);
+                let cqs = query_end - proj_offset(off_e, query_len, target_len);
+                (cqs.min(cqe), cqs.max(cqe))
+            } else {
+                let cqs = query_start + proj_offset(off_s, query_len, target_len);
+                let cqe = query_start + proj_offset(off_e, query_len, target_len);
+                (cqs.min(cqe), cqs.max(cqe))
+            }
         } else {
-            1.0
-        };
-
-        let (cq_start, cq_end) = if is_reverse {
-            let cqe =
-                query_end - ((clipped_target_start - target_start) as f64 * ratio).round() as i64;
-            let cqs =
-                query_end - ((clipped_target_end - target_start) as f64 * ratio).round() as i64;
-            (cqs.min(cqe), cqs.max(cqe))
-        } else {
-            let cqs =
-                query_start + ((clipped_target_start - target_start) as f64 * ratio).round() as i64;
-            let cqe =
-                query_start + ((clipped_target_end - target_start) as f64 * ratio).round() as i64;
-            (cqs.min(cqe), cqs.max(cqe))
+            (query_start, query_end)
         };
 
         alignments.push(CompactAlignmentInfo::new(
@@ -3052,46 +3049,48 @@ fn process_anchor_region_raw(
         let query_start = aln.query_start as i64;
         let query_end = aln.query_end as i64;
 
-        // Clip target to region
-        let clipped_target_start = target_start.max(region_start);
-        let clipped_target_end = target_end.min(region_end);
-
-        // Proportional query coordinate clipping (linear interpolation)
+        // Stage 2 J: do NOT pre-clip target/query for storage. The sweep-line
+        // clips per-emit-interval, performing a single projection + single
+        // rounding (instead of two compounded roundings). We compute the
+        // clipped query range here ONLY for the ownership claim below.
+        let clipped_t_start = target_start.max(region_start);
+        let clipped_t_end = target_end.min(region_end);
         let target_len = target_end - target_start;
         let query_len = query_end - query_start;
-        let ratio = if target_len > 0 {
-            query_len as f64 / target_len as f64
+        let (cq_start, cq_end) = if target_len > 0 {
+            let off_s = clipped_t_start - target_start;
+            let off_e = clipped_t_end - target_start;
+            if aln.is_reverse {
+                let qe = query_end - proj_offset(off_s, query_len, target_len);
+                let qs = query_end - proj_offset(off_e, query_len, target_len);
+                (qs.min(qe), qs.max(qe))
+            } else {
+                let qs = query_start + proj_offset(off_s, query_len, target_len);
+                let qe = query_start + proj_offset(off_e, query_len, target_len);
+                (qs.min(qe), qs.max(qe))
+            }
         } else {
-            1.0
-        };
-
-        // Compute clipped query range
-        let (cq_start, cq_end) = if aln.is_reverse {
-            let cqe =
-                query_end - ((clipped_target_start - target_start) as f64 * ratio).round() as i64;
-            let cqs =
-                query_end - ((clipped_target_end - target_start) as f64 * ratio).round() as i64;
-            (cqs.min(cqe), cqs.max(cqe))
-        } else {
-            let cqs =
-                query_start + ((clipped_target_start - target_start) as f64 * ratio).round() as i64;
-            let cqe =
-                query_start + ((clipped_target_end - target_start) as f64 * ratio).round() as i64;
-            (cqs.min(cqe), cqs.max(cqe))
+            (query_start, query_end)
         };
 
         // Always add the alignment to the sweep-line for correct depth counting.
         // See the streaming variant for the full rationale — gating the sweep on
         // claim_unprocessed causes samples that genuinely cover the anchor region
         // to be omitted when their query range was claimed by a prior anchor.
+        //
+        // Stage 2 J: store ORIGINAL alignment coords (not pre-clipped). Sweep-line
+        // events at aln.target_start / aln.target_end may fall outside
+        // [region_start, region_end), but the sweep already clips per-emit interval,
+        // so out-of-region events trigger no emit while still toggling sample-active
+        // state correctly across the region boundary.
         let aln_idx = alignments.len();
         alignments.push(CompactAlignmentInfo::new(
             query_sample_id,
             aln.query_id,
-            cq_start,
-            cq_end,
-            clipped_target_start,
-            clipped_target_end,
+            query_start,
+            query_end,
+            target_start,
+            target_end,
             aln.is_reverse,
         ));
 
@@ -3704,29 +3703,28 @@ fn process_anchor_region_raw_streaming(
 
         let query_start = aln.query_start as i64;
         let query_end = aln.query_end as i64;
-        let clipped_target_start = target_start.max(region_start);
-        let clipped_target_end = target_end.min(region_end);
+
+        // Stage 2 J: clipped query coords used ONLY for the ownership claim;
+        // alignment is stored with original coords so sweep-line performs a
+        // single projection + single rounding per emit.
+        let clipped_t_start = target_start.max(region_start);
+        let clipped_t_end = target_end.min(region_end);
         let target_len = target_end - target_start;
         let query_len = query_end - query_start;
-        let ratio = if target_len > 0 {
-            query_len as f64 / target_len as f64
+        let (cq_start, cq_end) = if target_len > 0 {
+            let off_s = clipped_t_start - target_start;
+            let off_e = clipped_t_end - target_start;
+            if aln.is_reverse {
+                let qe = query_end - proj_offset(off_s, query_len, target_len);
+                let qs = query_end - proj_offset(off_e, query_len, target_len);
+                (qs.min(qe), qs.max(qe))
+            } else {
+                let qs = query_start + proj_offset(off_s, query_len, target_len);
+                let qe = query_start + proj_offset(off_e, query_len, target_len);
+                (qs.min(qe), qs.max(qe))
+            }
         } else {
-            1.0
-        };
-
-        // Compute clipped query range
-        let (cq_start, cq_end) = if aln.is_reverse {
-            let cqe =
-                query_end - ((clipped_target_start - target_start) as f64 * ratio).round() as i64;
-            let cqs =
-                query_end - ((clipped_target_end - target_start) as f64 * ratio).round() as i64;
-            (cqs.min(cqe), cqs.max(cqe))
-        } else {
-            let cqs = query_start
-                + ((clipped_target_start - target_start) as f64 * ratio).round() as i64;
-            let cqe = query_start
-                + ((clipped_target_end - target_start) as f64 * ratio).round() as i64;
-            (cqs.min(cqe), cqs.max(cqe))
+            (query_start, query_end)
         };
 
         // Always add the alignment to the sweep-line for correct depth counting.
@@ -3735,14 +3733,19 @@ fn process_anchor_region_raw_streaming(
         // Using claim_unprocessed to gate the sweep causes samples that genuinely
         // cover the anchor region to be omitted when their query range was claimed
         // by a prior anchor, producing a silent undercount.
+        //
+        // Stage 2 J: store ORIGINAL alignment coords (not pre-clipped). Out-of-region
+        // events toggle sample-active state but produce no emit (sweep clips per
+        // emit interval), so the correct samples are active across [region_start,
+        // region_end) without compounded clipping rounding error.
         let aln_idx = alignments.len();
         alignments.push(CompactAlignmentInfo::new(
             query_sample_id,
             aln.query_id,
-            cq_start,
-            cq_end,
-            clipped_target_start,
-            clipped_target_end,
+            query_start,
+            query_end,
+            target_start,
+            target_end,
             aln.is_reverse,
         ));
 
@@ -5044,15 +5047,13 @@ fn map_coords_linear(
     let start_offset = window_target_start.max(aln_target_start) - aln_target_start;
     let end_offset = window_target_end.min(aln_target_end) - aln_target_start;
 
-    let ratio = query_len as f64 / target_len as f64;
-
     if is_reverse {
-        let q_end = aln_query_end - (start_offset as f64 * ratio).round() as i64;
-        let q_start = aln_query_end - (end_offset as f64 * ratio).round() as i64;
+        let q_end = aln_query_end - proj_offset(start_offset, query_len, target_len);
+        let q_start = aln_query_end - proj_offset(end_offset, query_len, target_len);
         (q_start.min(q_end), q_start.max(q_end))
     } else {
-        let q_start = aln_query_start + (start_offset as f64 * ratio).round() as i64;
-        let q_end = aln_query_start + (end_offset as f64 * ratio).round() as i64;
+        let q_start = aln_query_start + proj_offset(start_offset, query_len, target_len);
+        let q_end = aln_query_start + proj_offset(end_offset, query_len, target_len);
         (q_start.min(q_end), q_start.max(q_end))
     }
 }
@@ -5430,24 +5431,20 @@ pub fn query_region_depth(
             // Proportional query coordinate clipping (linear interpolation)
             let target_len = aln_target_end - aln_target_start;
             let query_len = aln_query_end - aln_query_start;
-            let ratio = if target_len > 0 {
-                query_len as f64 / target_len as f64
+            let (clipped_query_start, clipped_query_end) = if target_len > 0 {
+                let off_s = clipped_target_start - aln_target_start;
+                let off_e = clipped_target_end - aln_target_start;
+                if aln.is_reverse {
+                    let cqe = aln_query_end - proj_offset(off_s, query_len, target_len);
+                    let cqs = aln_query_end - proj_offset(off_e, query_len, target_len);
+                    (cqs, cqe)
+                } else {
+                    let cqs = aln_query_start + proj_offset(off_s, query_len, target_len);
+                    let cqe = aln_query_start + proj_offset(off_e, query_len, target_len);
+                    (cqs, cqe)
+                }
             } else {
-                1.0
-            };
-
-            let (clipped_query_start, clipped_query_end) = if aln.is_reverse {
-                let cqe = aln_query_end
-                    - ((clipped_target_start - aln_target_start) as f64 * ratio).round() as i64;
-                let cqs = aln_query_end
-                    - ((clipped_target_end - aln_target_start) as f64 * ratio).round() as i64;
-                (cqs, cqe)
-            } else {
-                let cqs = aln_query_start
-                    + ((clipped_target_start - aln_target_start) as f64 * ratio).round() as i64;
-                let cqe = aln_query_start
-                    + ((clipped_target_end - aln_target_start) as f64 * ratio).round() as i64;
-                (cqs, cqe)
+                (aln_query_start, aln_query_end)
             };
 
             alignments.push(AlignmentInfoMulti {
@@ -5497,11 +5494,10 @@ pub fn query_region_depth(
                 let our_len = ref_end - ref_start;
                 let other_len = other_t_end - other_t_start;
                 let (clipped_other_start, clipped_other_end) = if our_len > 0 {
-                    let ratio = other_len as f64 / our_len as f64;
-                    let cs = other_t_start
-                        + ((clipped_ref_start - ref_start) as f64 * ratio).round() as i64;
-                    let ce = other_t_start
-                        + ((clipped_ref_end - ref_start) as f64 * ratio).round() as i64;
+                    let off_s = clipped_ref_start - ref_start;
+                    let off_e = clipped_ref_end - ref_start;
+                    let cs = other_t_start + proj_offset(off_s, other_len, our_len);
+                    let ce = other_t_start + proj_offset(off_e, other_len, our_len);
                     (cs.min(ce), cs.max(ce))
                 } else {
                     (other_t_start, other_t_end)
