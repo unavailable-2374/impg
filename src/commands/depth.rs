@@ -493,14 +493,30 @@ impl RegionDepthResult {
         self.depth = self.sample_positions.len();
     }
 
-    /// Format sample positions as semicolon-separated strings
+    /// Format sample positions as semicolon-separated strings.
+    ///
+    /// Positions within a sample's cell are sorted by `(seq_name, start, end)`
+    /// to give a deterministic, sweep-emission-order-independent output.
+    /// Stage 4 unified the region sweep onto compact `u16` sample IDs / `u32`
+    /// seq IDs, which means the in-cell order produced directly by the sweep
+    /// now depends on `query_id` rather than the lexicographic `query_name`
+    /// order the previous String-based path happened to produce. Sorting at
+    /// the formatter restores byte-identical TSV output for downstream tools
+    /// that pattern-match on column text — at the cost of one stable sort
+    /// per cell, which is negligible compared to the sweep itself.
     pub fn format_sample_positions(&self, sample: &str) -> String {
         match self.sample_positions.get(sample) {
-            Some(positions) if !positions.is_empty() => positions
-                .iter()
-                .map(|(seq, start, end)| format!("{}:{}-{}", seq, start, end))
-                .collect::<Vec<_>>()
-                .join(";"),
+            Some(positions) if !positions.is_empty() => {
+                let mut sorted: Vec<&(String, i64, i64)> = positions.iter().collect();
+                sorted.sort_unstable_by(|a, b| {
+                    a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2))
+                });
+                sorted
+                    .iter()
+                    .map(|(seq, start, end)| format!("{}:{}-{}", seq, start, end))
+                    .collect::<Vec<_>>()
+                    .join(";")
+            }
             _ => "NA".to_string(),
         }
     }
@@ -5199,92 +5215,79 @@ pub fn compute_depth_global(
 // Region query mode and sweep-line helpers
 // ============================================================================
 
-/// Alignment info for sweep-line processing (tracks all alignments per sample)
-#[derive(Debug, Clone)]
-struct AlignmentInfoMulti {
-    sample: String,
-    query_name: String,
-    query_start: i64,
-    query_end: i64,
-    target_start: i64,
-    target_end: i64,
-    is_reverse: bool,
-}
-
-/// Event for sweep-line algorithm (used in new depth functions)
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DepthEventMulti {
-    position: i64,
-    is_start: bool,
-    sample: String,
-    alignment_idx: usize,
-}
-
-impl Ord for DepthEventMulti {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.position
-            .cmp(&other.position)
-            .then_with(|| other.is_start.cmp(&self.is_start)) // Starts before ends at same position
-            .then_with(|| self.sample.cmp(&other.sample))
-    }
-}
-
-impl PartialOrd for DepthEventMulti {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-/// Sweep-line algorithm to compute depth windows (tracking all alignments per sample)
-fn compute_sweep_line_depth_multi(
+/// Sweep-line over `CompactAlignmentInfo` (region-mode variant).
+///
+/// Unifies the region-query sweep with the global `sweep_line_depth` path: both
+/// consume the same compact alignment representation and reuse `proj_offset` /
+/// `map_target_to_query_linear` for coordinate mapping.
+///
+/// The region variant differs from `sweep_line_depth` in two ways:
+///   1. Per-sample column output requires emitting **all** active alignments
+///      per sample in a window (joined with `;`), not just the highest-overlap
+///      alignment. `RegionDepthResult::add_sample_position` dedupes coincident
+///      tuples, matching the pre-Stage-4 behavior.
+///   2. The output is `RegionDepthResult` (string-keyed for the writer's column
+///      layout) instead of `SparseDepthInterval`. Sample/seq IDs are translated
+///      to names exactly once per active sample per window via the supplied
+///      `SampleIndex` and the impg `SequenceIndex`.
+///
+/// Position tuples within a row are sorted by sample name in the caller's
+/// output formatter (cf. `write_region_depth_output`); inside each sample's
+/// position list the order matches alignment-insertion order, identical to the
+/// pre-Stage-4 String-based path.
+fn compute_region_sweep_compact(
     anchor_seq: &str,
-    _seq_len: i64,
-    alignments: &[AlignmentInfoMulti],
+    alignments: &[CompactAlignmentInfo],
+    num_samples: usize,
+    sample_index: &SampleIndex,
+    seq_index: &crate::seqidx::SequenceIndex,
     config: &DepthConfig,
 ) -> Vec<RegionDepthResult> {
     if alignments.is_empty() {
         return Vec::new();
     }
 
-    // Create events
-    let mut events: Vec<DepthEventMulti> = Vec::new();
+    // Build sweep-line events (compact: u16 sample IDs + alignment idx).
+    let mut events: Vec<CompactDepthEvent> = Vec::with_capacity(alignments.len() * 2);
     for (idx, aln) in alignments.iter().enumerate() {
-        events.push(DepthEventMulti {
+        events.push(CompactDepthEvent {
             position: aln.target_start,
             is_start: true,
-            sample: aln.sample.clone(),
+            sample_id: aln.sample_id,
             alignment_idx: idx,
         });
-        events.push(DepthEventMulti {
+        events.push(CompactDepthEvent {
             position: aln.target_end,
             is_start: false,
-            sample: aln.sample.clone(),
+            sample_id: aln.sample_id,
             alignment_idx: idx,
         });
     }
-    events.sort();
+    events.sort_by_key(|e| e.packed_sort_key());
 
-    // Sweep-line
+    // Sweep-line: track active alignments per sample (Vec<idx> indexed by sample_id).
     let mut results: Vec<RegionDepthResult> = Vec::new();
-    let mut active_alignments: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+    let mut active_bitmap = SampleBitmap::new(num_samples);
+    let mut active_alns: Vec<Vec<usize>> = vec![Vec::new(); num_samples];
     let mut prev_pos: Option<i64> = None;
 
     for event in events {
         if let Some(prev) = prev_pos {
-            if event.position > prev {
-                // Create window from prev to event.position
+            if event.position > prev && active_bitmap.depth() > 0 {
                 let mut result =
                     RegionDepthResult::new(anchor_seq.to_string(), prev, event.position);
 
-                // Collect all active samples and their alignments
-                for (sample, aln_indices) in &active_alignments {
-                    if aln_indices.is_empty() {
+                // Iterate active samples in u16 order (deterministic).
+                for sample_id in active_bitmap.active_samples() {
+                    let alns = &active_alns[sample_id as usize];
+                    if alns.is_empty() {
                         continue;
                     }
-                    for &idx in aln_indices {
+                    let sample_name = sample_index.get_name(sample_id).unwrap_or("?");
+                    for &idx in alns {
                         let aln = &alignments[idx];
-                        // Map target coords to query coords (linear interpolation)
-                        let (q_start, q_end) = map_coords_linear(
+                        let (q_start, q_end) = map_target_to_query_linear(
+                            &[],
                             aln.target_start,
                             aln.target_end,
                             aln.query_start,
@@ -5293,7 +5296,8 @@ fn compute_sweep_line_depth_multi(
                             event.position,
                             aln.is_reverse,
                         );
-                        result.add_sample_position(sample, &aln.query_name, q_start, q_end);
+                        let seq_name = seq_index.get_name(aln.query_id).unwrap_or("?");
+                        result.add_sample_position(sample_name, seq_name, q_start, q_end);
                     }
                 }
 
@@ -5306,13 +5310,13 @@ fn compute_sweep_line_depth_multi(
 
         // Update active alignments
         if event.is_start {
-            active_alignments
-                .entry(event.sample.clone())
-                .or_default()
-                .push(event.alignment_idx);
+            active_bitmap.add(event.sample_id);
+            active_alns[event.sample_id as usize].push(event.alignment_idx);
         } else {
-            if let Some(alns) = active_alignments.get_mut(&event.sample) {
-                alns.retain(|&idx| idx != event.alignment_idx);
+            active_bitmap.remove(event.sample_id);
+            let v = &mut active_alns[event.sample_id as usize];
+            if let Some(pos) = v.iter().position(|&idx| idx == event.alignment_idx) {
+                v.swap_remove(pos);
             }
         }
 
@@ -5325,37 +5329,6 @@ fn compute_sweep_line_depth_multi(
     }
 
     results
-}
-
-/// Linear interpolation for coordinate mapping
-fn map_coords_linear(
-    aln_target_start: i64,
-    aln_target_end: i64,
-    aln_query_start: i64,
-    aln_query_end: i64,
-    window_target_start: i64,
-    window_target_end: i64,
-    is_reverse: bool,
-) -> (i64, i64) {
-    let target_len = aln_target_end - aln_target_start;
-    let query_len = aln_query_end - aln_query_start;
-
-    if target_len == 0 {
-        return (aln_query_start, aln_query_end);
-    }
-
-    let start_offset = window_target_start.max(aln_target_start) - aln_target_start;
-    let end_offset = window_target_end.min(aln_target_end) - aln_target_start;
-
-    if is_reverse {
-        let q_end = aln_query_end - proj_offset(start_offset, query_len, target_len);
-        let q_start = aln_query_end - proj_offset(end_offset, query_len, target_len);
-        (q_start.min(q_end), q_start.max(q_end))
-    } else {
-        let q_start = aln_query_start + proj_offset(start_offset, query_len, target_len);
-        let q_end = aln_query_start + proj_offset(end_offset, query_len, target_len);
-        (q_start.min(q_end), q_start.max(q_end))
-    }
 }
 
 /// Merge adjacent results with same depth
@@ -5423,10 +5396,44 @@ pub fn query_region_depth(
         )
     })?;
 
-    let target_sample = extract_sample(target_seq, separator);
+    // Build compact sample/seq lookup once for this region. Maps query_seq_id ->
+    // sample_id (u16) at intake instead of per-alignment String clones.
+    let compact_lengths = CompactSequenceLengths::from_impg(impg, separator);
+    let sample_idx = compact_lengths.sample_index();
+    let num_samples = sample_idx.len();
 
-    // Collect all alignments for this region
-    let mut alignments: Vec<AlignmentInfoMulti> = Vec::new();
+    // Anchor sample id (used for self-alignment filtering).
+    let target_sample_str = extract_sample(target_seq, separator);
+    let anchor_sample_id = sample_idx.get_id(&target_sample_str).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "Anchor sample '{}' not found after compact-index build",
+                target_sample_str
+            ),
+        )
+    })?;
+
+    // Resolve the SampleFilter to a BitVec mask once (filter -> u16-id set).
+    // `include_all == true` short-circuits the per-alignment lookup.
+    let (include_all, sample_mask): (bool, BitVec) = match sample_filter {
+        Some(f) if f.is_active() => {
+            let mut mask: BitVec = bitvec![0; num_samples];
+            for name in f.get_samples() {
+                if let Some(sid) = sample_idx.get_id(name) {
+                    mask.set(sid as usize, true);
+                }
+            }
+            (false, mask)
+        }
+        _ => (true, BitVec::new()),
+    };
+    let sample_allowed = |sid: u16| -> bool {
+        include_all || sample_mask.get(sid as usize).map_or(false, |b| *b)
+    };
+
+    // Collect all alignments for this region (compact: u16 sample, u32 seq).
+    let mut alignments: Vec<CompactAlignmentInfo> = Vec::new();
 
     let is_transitive = config.transitive || config.transitive_dfs;
 
@@ -5502,20 +5509,13 @@ pub fn query_region_depth(
             let target_interval = &overlap.2;
 
             let query_id = query_interval.metadata;
-            let query_name = match impg.seq_index().get_name(query_id) {
-                Some(name) => name,
-                None => continue,
-            };
-            let sample = extract_sample(query_name, separator);
+            let query_sample_id = compact_lengths.get_sample_id(query_id);
 
-            if sample == target_sample {
+            if is_self_alignment(query_sample_id, anchor_sample_id, query_id, target_interval.metadata) {
                 continue;
             }
-
-            if let Some(filter) = sample_filter {
-                if !filter.includes(&sample) {
-                    continue;
-                }
+            if !sample_allowed(query_sample_id) {
+                continue;
             }
 
             let is_reverse = query_interval.first > query_interval.last;
@@ -5537,8 +5537,8 @@ pub fn query_region_depth(
                     region_end,
                 );
                 depth_trace!(
-                    "HOP2 stage=region_use_bfs sample={} q_id={} t_id={} t={}-{} a={}-{}",
-                    sample, query_id, target_interval.metadata,
+                    "HOP2 stage=region_use_bfs sample_id={} q_id={} t_id={} t={}-{} a={}-{}",
+                    query_sample_id, query_id, target_interval.metadata,
                     t_start, t_end, p.0, p.1
                 );
                 p
@@ -5548,15 +5548,15 @@ pub fn query_region_depth(
                 continue;
             }
 
-            alignments.push(AlignmentInfoMulti {
-                sample,
-                query_name: query_name.to_string(),
-                query_start: q_start,
-                query_end: q_end,
-                target_start: a_start,
-                target_end: a_end,
+            alignments.push(CompactAlignmentInfo::new(
+                query_sample_id,
+                query_id,
+                q_start,
+                q_end,
+                a_start,
+                a_end,
                 is_reverse,
-            });
+            ));
         }
     } else if is_transitive {
         // Default transitive: raw-interval BFS with linear interpolation
@@ -5599,20 +5599,13 @@ pub fn query_region_depth(
 
         // Pass 2: Process all hits for depth
         for hit in &hits {
-            let query_name = match impg.seq_index().get_name(hit.query_id) {
-                Some(name) => name,
-                None => continue,
-            };
-            let sample = extract_sample(query_name, separator);
+            let query_sample_id = compact_lengths.get_sample_id(hit.query_id);
 
-            if sample == target_sample {
+            if is_self_alignment(query_sample_id, anchor_sample_id, hit.query_id, hit.target_id) {
                 continue;
             }
-
-            if let Some(filter) = sample_filter {
-                if !filter.includes(&sample) {
-                    continue;
-                }
+            if !sample_allowed(query_sample_id) {
+                continue;
             }
 
             let q_start = hit.query_start.min(hit.query_end) as i64;
@@ -5633,8 +5626,8 @@ pub fn query_region_depth(
                     region_end,
                 );
                 depth_trace!(
-                    "HOP2 stage=region_raw_bfs sample={} q_id={} t_id={} t={}-{} a={}-{}",
-                    sample, hit.query_id, hit.target_id,
+                    "HOP2 stage=region_raw_bfs sample_id={} q_id={} t_id={} t={}-{} a={}-{}",
+                    query_sample_id, hit.query_id, hit.target_id,
                     t_start, t_end, p.0, p.1
                 );
                 p
@@ -5644,15 +5637,15 @@ pub fn query_region_depth(
                 continue;
             }
 
-            alignments.push(AlignmentInfoMulti {
-                sample,
-                query_name: query_name.to_string(),
-                query_start: q_start,
-                query_end: q_end,
-                target_start: a_start,
-                target_end: a_end,
-                is_reverse: hit.is_reverse,
-            });
+            alignments.push(CompactAlignmentInfo::new(
+                query_sample_id,
+                hit.query_id,
+                q_start,
+                q_end,
+                a_start,
+                a_end,
+                hit.is_reverse,
+            ));
         }
     } else if config.use_cigar_bfs {
         // Non-transitive with --use-BFS: CIGAR-precise query
@@ -5670,16 +5663,11 @@ pub fn query_region_depth(
             let query_interval = &overlap.0;
             let target_interval = &overlap.2;
 
-            let query_name = match impg.seq_index().get_name(query_interval.metadata) {
-                Some(name) => name,
-                None => continue,
-            };
-            let sample = extract_sample(query_name, separator);
+            let query_id = query_interval.metadata;
+            let query_sample_id = compact_lengths.get_sample_id(query_id);
 
-            if let Some(filter) = sample_filter {
-                if !filter.includes(&sample) {
-                    continue;
-                }
+            if !sample_allowed(query_sample_id) {
+                continue;
             }
 
             let is_reverse = query_interval.first > query_interval.last;
@@ -5688,15 +5676,15 @@ pub fn query_region_depth(
             let t_start = target_interval.first.min(target_interval.last) as i64;
             let t_end = target_interval.first.max(target_interval.last) as i64;
 
-            alignments.push(AlignmentInfoMulti {
-                sample,
-                query_name: query_name.to_string(),
+            alignments.push(CompactAlignmentInfo::new(
+                query_sample_id,
+                query_id,
                 query_start,
                 query_end,
-                target_start: t_start,
-                target_end: t_end,
+                t_start,
+                t_end,
                 is_reverse,
-            });
+            ));
         }
     } else {
         // Default non-transitive: raw intervals + linear interpolation
@@ -5707,16 +5695,10 @@ pub fn query_region_depth(
         let region_end = target_end;
 
         for aln in &raw_alns {
-            let query_name = match impg.seq_index().get_name(aln.query_id) {
-                Some(name) => name,
-                None => continue,
-            };
-            let sample = extract_sample(query_name, separator);
+            let query_sample_id = compact_lengths.get_sample_id(aln.query_id);
 
-            if let Some(filter) = sample_filter {
-                if !filter.includes(&sample) {
-                    continue;
-                }
+            if !sample_allowed(query_sample_id) {
+                continue;
             }
 
             let aln_target_start = aln.target_start as i64;
@@ -5747,15 +5729,15 @@ pub fn query_region_depth(
                 (aln_query_start, aln_query_end)
             };
 
-            alignments.push(AlignmentInfoMulti {
-                sample,
-                query_name: query_name.to_string(),
-                query_start: clipped_query_start.min(clipped_query_end),
-                query_end: clipped_query_start.max(clipped_query_end),
-                target_start: clipped_target_start,
-                target_end: clipped_target_end,
-                is_reverse: aln.is_reverse,
-            });
+            alignments.push(CompactAlignmentInfo::new(
+                query_sample_id,
+                aln.query_id,
+                clipped_query_start.min(clipped_query_end),
+                clipped_query_start.max(clipped_query_end),
+                clipped_target_start,
+                clipped_target_end,
+                aln.is_reverse,
+            ));
         }
     }
 
@@ -5771,62 +5753,56 @@ pub fn query_region_depth(
                 continue;
             }
 
-            if let Some(other_name) = impg.seq_index().get_name(other_id) {
-                let sample = extract_sample(other_name, separator);
+            let other_sample_id = compact_lengths.get_sample_id(other_id);
 
-                // Skip self
-                if sample == target_sample {
-                    continue;
-                }
-
-                // Apply sample filter
-                if let Some(filter) = sample_filter {
-                    if !filter.includes(&sample) {
-                        continue;
-                    }
-                }
-
-                // Clip our-sequence coordinates to the queried region
-                let clipped_ref_start = ref_start.max(target_start);
-                let clipped_ref_end = ref_end.min(target_end);
-
-                // Proportionally clip the other sequence's coordinates
-                let our_len = ref_end - ref_start;
-                let other_len = other_t_end - other_t_start;
-                let (clipped_other_start, clipped_other_end) = if our_len > 0 {
-                    let off_s = clipped_ref_start - ref_start;
-                    let off_e = clipped_ref_end - ref_start;
-                    let cs = other_t_start + proj_offset(off_s, other_len, our_len);
-                    let ce = other_t_start + proj_offset(off_e, other_len, our_len);
-                    (cs.min(ce), cs.max(ce))
-                } else {
-                    (other_t_start, other_t_end)
-                };
-
-                alignments.push(AlignmentInfoMulti {
-                    sample,
-                    query_name: other_name.to_string(),
-                    query_start: clipped_other_start,
-                    query_end: clipped_other_end,
-                    target_start: clipped_ref_start,
-                    target_end: clipped_ref_end,
-                    is_reverse: false,
-                });
+            // Skip self
+            if is_self_alignment(other_sample_id, anchor_sample_id, other_id, target_id) {
+                continue;
             }
+            if !sample_allowed(other_sample_id) {
+                continue;
+            }
+
+            // Clip our-sequence coordinates to the queried region
+            let clipped_ref_start = ref_start.max(target_start);
+            let clipped_ref_end = ref_end.min(target_end);
+
+            // Proportionally clip the other sequence's coordinates
+            let our_len = ref_end - ref_start;
+            let other_len = other_t_end - other_t_start;
+            let (clipped_other_start, clipped_other_end) = if our_len > 0 {
+                let off_s = clipped_ref_start - ref_start;
+                let off_e = clipped_ref_end - ref_start;
+                let cs = other_t_start + proj_offset(off_s, other_len, our_len);
+                let ce = other_t_start + proj_offset(off_e, other_len, our_len);
+                (cs.min(ce), cs.max(ce))
+            } else {
+                (other_t_start, other_t_end)
+            };
+
+            alignments.push(CompactAlignmentInfo::new(
+                other_sample_id,
+                other_id,
+                clipped_other_start,
+                clipped_other_end,
+                clipped_ref_start,
+                clipped_ref_end,
+                false,
+            ));
         }
     }
 
     // Add self (target sample) if in filter
-    if sample_filter.map_or(true, |f| f.includes(&target_sample)) {
-        alignments.push(AlignmentInfoMulti {
-            sample: target_sample,
-            query_name: target_seq.to_string(),
-            query_start: target_start as i64,
-            query_end: target_end as i64,
-            target_start: target_start as i64,
-            target_end: target_end as i64,
-            is_reverse: false,
-        });
+    if sample_allowed(anchor_sample_id) {
+        alignments.push(CompactAlignmentInfo::new(
+            anchor_sample_id,
+            target_id,
+            target_start,
+            target_end,
+            target_start,
+            target_end,
+            false,
+        ));
     }
 
     // Deduplicate alignments before sweep-line. Two sources of duplicates:
@@ -5840,9 +5816,11 @@ pub fn query_region_depth(
     // `impg query` collapses these via `merge_query_adjusted_intervals` at
     // output time; depth's sweep-line, by contrast, would emit `pos;pos` in
     // the per-sample column. Dedup the alignment vec in place to match.
+    // Sort key uses u32 query_id (compact) instead of the previous String name —
+    // ordering still uniquely keys identical alignments.
     alignments.sort_by(|a, b| {
-        a.query_name
-            .cmp(&b.query_name)
+        a.query_id
+            .cmp(&b.query_id)
             .then(a.query_start.cmp(&b.query_start))
             .then(a.query_end.cmp(&b.query_end))
             .then(a.target_start.cmp(&b.target_start))
@@ -5850,7 +5828,7 @@ pub fn query_region_depth(
             .then(a.is_reverse.cmp(&b.is_reverse))
     });
     alignments.dedup_by(|a, b| {
-        a.query_name == b.query_name
+        a.query_id == b.query_id
             && a.query_start == b.query_start
             && a.query_end == b.query_end
             && a.target_start == b.target_start
@@ -5858,14 +5836,13 @@ pub fn query_region_depth(
             && a.is_reverse == b.is_reverse
     });
 
-    // Compute depth windows using sweep-line
-    let seq_len = impg.seq_index().get_len_from_id(target_id).unwrap_or(0) as i64;
+    // Compute depth windows using the unified compact sweep-line.
     #[cfg(feature = "depth-trace")]
     {
-        let unique: std::collections::BTreeSet<&str> =
-            alignments.iter().map(|a| a.sample.as_str()).collect();
+        let unique: std::collections::BTreeSet<u16> =
+            alignments.iter().map(|a| a.sample_id).collect();
         depth_trace!(
-            "SWEEP stage=region target_seq={} target_range={}-{} alignments={} unique_samples={} samples={:?}",
+            "SWEEP stage=region target_seq={} target_range={}-{} alignments={} unique_samples={} sample_ids={:?}",
             target_seq,
             target_start,
             target_end,
@@ -5874,7 +5851,14 @@ pub fn query_region_depth(
             unique
         );
     }
-    let results = compute_sweep_line_depth_multi(target_seq, seq_len, &alignments, config);
+    let results = compute_region_sweep_compact(
+        target_seq,
+        &alignments,
+        num_samples,
+        sample_idx,
+        impg.seq_index(),
+        config,
+    );
 
     // Filter results to only include the query region
     let filtered_results: Vec<RegionDepthResult> = results
