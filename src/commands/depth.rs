@@ -10,6 +10,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeMap;
 use std::io::{self, BufWriter, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender};
+use std::thread::JoinHandle;
 
 // ============================================================================
 // `depth-trace` cargo feature — diagnostic eprintln! probes for triaging
@@ -1330,7 +1332,7 @@ impl SparseDepthInterval {
 struct StreamingDepthEmitter<'a> {
     // ---- Output buffer with periodic flushing ----
     buf: Vec<u8>,
-    writer: &'a Option<Mutex<BufWriter<Box<dyn Write + Send>>>>,
+    writer: &'a Option<DepthWriter>,
 
     // ---- Formatting context ----
     seq_name: &'a str,
@@ -1584,12 +1586,17 @@ impl<'a> StreamingDepthEmitter<'a> {
             let _ = writeln!(self.buf);
             self.intervals_counter.fetch_add(1, Ordering::Relaxed);
 
-            // Periodic flush to bound per-thread buffer memory
+            // Periodic flush to bound per-thread buffer memory.
+            // Hand ownership of the buffer to the writer thread (move, not
+            // copy) and start a fresh Vec so the worker keeps zero-copy
+            // ownership semantics on the next flush.
             if self.buf.len() >= STREAMING_FLUSH_THRESHOLD {
                 if let Some(ref w) = self.writer {
-                    let _ = w.lock().write_all(&self.buf);
+                    let buf = std::mem::take(&mut self.buf);
+                    let _ = w.send(buf);
+                } else {
+                    self.buf.clear();
                 }
-                self.buf.clear();
             }
         }
         // interval is DROPPED here — Vec<SamplePosition> freed immediately
@@ -1626,9 +1633,11 @@ impl<'a> StreamingDepthEmitter<'a> {
         self.flush_seq_intervals();
         if !self.buf.is_empty() {
             if let Some(ref w) = self.writer {
-                w.lock().write_all(&self.buf)?;
+                let buf = std::mem::take(&mut self.buf);
+                w.send(buf)?;
+            } else {
+                self.buf.clear();
             }
-            self.buf.clear();
         }
         Ok(())
     }
@@ -2008,20 +2017,216 @@ impl ConcurrentProcessedTracker {
 // Global depth computation - connected-component traversal
 // ============================================================================
 
+/// Sidecar cache for the alignment-degree pre-scan.
+///
+/// `compute_sample_degrees` walks every per-file index header on every
+/// invocation; for ≥10⁵-file (per-file index) workloads at 580+ samples this
+/// is the dominant Phase-0 cost on repeat runs. Persisting the result to a
+/// bin file next to the input alignment list lets repeat runs against the
+/// same input load degrees from disk in well under a second instead of
+/// re-walking every sub-index.
+///
+/// **Invalidation key** combines:
+/// - hash of every alignment file path + its mtime (seconds) + size, so any
+///   on-disk change forces a rebuild;
+/// - hash of `seq_included` (the inclusion bitmap), since a different
+///   `--min-seq-length` produces a different result;
+/// - `min_seq_length` itself (defensive — equivalent to `seq_included` hash
+///   for the canonical caller, but keeps the key meaningful if the caller
+///   ever derives `seq_included` from something other than length).
+///
+/// The cache is intentionally per-input rather than per-output: multiple
+/// `impg depth` invocations with different `--output-prefix` against the
+/// same alignment list should all share the same cached degrees.
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+struct DegreesCache {
+    /// Schema version — bump when the on-disk layout changes incompatibly.
+    schema_version: u32,
+    /// Combined invalidation hash (see DegreesCache docs).
+    invalidation_hash: u64,
+    /// Number of unified sequences at cache time. Validated post-load.
+    num_sequences: u32,
+    /// Per-sequence degree (indexed by unified seq_id), length =
+    /// `num_sequences`.
+    degrees: Vec<u16>,
+}
+
+const DEGREES_CACHE_SCHEMA_VERSION: u32 = 1;
+
+/// Compute the invalidation hash from alignment file mtime/size tuples,
+/// `seq_included`, and `min_seq_length`. Returns None if any alignment file
+/// metadata cannot be read (cache cannot be reliably keyed → bypass).
+fn compute_degrees_invalidation_hash(
+    alignment_files: &[String],
+    seq_included: &[bool],
+    min_seq_length: i64,
+) -> Option<u64> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    if alignment_files.is_empty() {
+        return None;
+    }
+
+    let mut hasher = DefaultHasher::new();
+    DEGREES_CACHE_SCHEMA_VERSION.hash(&mut hasher);
+    alignment_files.len().hash(&mut hasher);
+    for path in alignment_files {
+        path.hash(&mut hasher);
+        let meta = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => return None,
+        };
+        meta.len().hash(&mut hasher);
+        // mtime in seconds — we accept second-level granularity; sub-second
+        // edits within the same second are uncommon for alignment input.
+        if let Ok(modified) = meta.modified() {
+            if let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH) {
+                dur.as_secs().hash(&mut hasher);
+            }
+        }
+    }
+    seq_included.len().hash(&mut hasher);
+    // Hash the seq_included bitmap as packed u64 chunks for compactness.
+    let mut chunk: u64 = 0;
+    let mut bit: u32 = 0;
+    for &v in seq_included {
+        if v {
+            chunk |= 1u64 << bit;
+        }
+        bit += 1;
+        if bit == 64 {
+            chunk.hash(&mut hasher);
+            chunk = 0;
+            bit = 0;
+        }
+    }
+    if bit > 0 {
+        chunk.hash(&mut hasher);
+    }
+    min_seq_length.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+/// Choose where to store the degrees sidecar.
+///
+/// Strategy: place it next to the first alignment file (a stable, input-
+/// derived location that survives across runs without polluting `~/.cache`).
+/// The filename incorporates the invalidation hash so concurrent runs against
+/// different `seq_included` / `min_seq_length` configurations don't trample
+/// each other.
+fn degrees_cache_path(alignment_files: &[String], hash: u64) -> Option<std::path::PathBuf> {
+    use std::path::Path;
+    let first = alignment_files.first()?;
+    let parent = Path::new(first).parent().unwrap_or(Path::new("."));
+    Some(parent.join(format!("impg_depth_degrees_{:016x}.bin", hash)))
+}
+
+/// Try to load a previously-saved degrees cache.
+fn try_load_degrees_cache(
+    cache_path: &std::path::Path,
+    expected_hash: u64,
+    expected_num_sequences: u32,
+) -> Option<Vec<u16>> {
+    let file = std::fs::File::open(cache_path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let cache: DegreesCache =
+        bincode::serde::decode_from_std_read(&mut reader, bincode::config::standard()).ok()?;
+    if cache.schema_version != DEGREES_CACHE_SCHEMA_VERSION {
+        return None;
+    }
+    if cache.invalidation_hash != expected_hash {
+        return None;
+    }
+    if cache.num_sequences != expected_num_sequences {
+        return None;
+    }
+    if cache.degrees.len() != expected_num_sequences as usize {
+        return None;
+    }
+    Some(cache.degrees)
+}
+
+/// Save degrees to the sidecar file atomically (write to temp file then
+/// rename). Returns Ok even if the rename succeeds; logs but does not
+/// surface write errors to the caller (cache is best-effort).
+fn save_degrees_cache(
+    cache_path: &std::path::Path,
+    invalidation_hash: u64,
+    degrees: &[u16],
+) -> io::Result<()> {
+    let cache = DegreesCache {
+        schema_version: DEGREES_CACHE_SCHEMA_VERSION,
+        invalidation_hash,
+        num_sequences: degrees.len() as u32,
+        degrees: degrees.to_vec(),
+    };
+    let tmp_path = cache_path.with_extension("bin.tmp");
+    {
+        let file = std::fs::File::create(&tmp_path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        bincode::serde::encode_into_std_write(&cache, &mut writer, bincode::config::standard())
+            .map_err(|e| io::Error::other(format!("bincode encode: {}", e)))?;
+        writer.flush()?;
+    }
+    std::fs::rename(&tmp_path, cache_path)?;
+    Ok(())
+}
+
 /// Pre-scan: compute alignment degree for each included sequence.
 /// Degree = number of unique OTHER samples with direct alignments to this sequence.
 /// Used to automatically identify hub sequences for Phase 1 when --ref is not specified.
+///
+/// On repeat runs against the same alignment input + `seq_included`
+/// configuration, loads the result from a sidecar bin file (next to the
+/// first alignment file). On any cache miss / hash mismatch / IO error, falls
+/// back to a full pre-scan and writes a fresh sidecar.
 fn compute_alignment_degrees(
     impg: &(impl ImpgIndex + Sync),
     compact_lengths: &CompactSequenceLengths,
     seq_included: &[bool],
+    min_seq_length: i64,
 ) -> Vec<u16> {
-    // Dispatches to the `ImpgIndex::compute_sample_degrees` trait method.
-    // - Single `Impg`: uses the default parallel-by-target impl (fine: one file, one cache).
-    // - `MultiImpg`: uses a file-parallel override that loads each sub-index transiently
-    //   and drops it immediately, bounding peak retained sub-indices to the rayon worker
-    //   count. This is required to avoid OOM on per-file indexing with 100k+ files.
-    impg.compute_sample_degrees(seq_included, compact_lengths.seq_to_sample_slice())
+    let alignment_files = impg.alignment_files();
+    let cache_key = compute_degrees_invalidation_hash(alignment_files, seq_included, min_seq_length);
+    let cache_path = cache_key.and_then(|h| degrees_cache_path(alignment_files, h));
+
+    if let (Some(hash), Some(path)) = (cache_key, cache_path.as_ref()) {
+        if let Some(cached) =
+            try_load_degrees_cache(path, hash, seq_included.len() as u32)
+        {
+            info!(
+                "Loaded alignment degrees from sidecar cache: {} ({} entries)",
+                path.display(),
+                cached.len()
+            );
+            return cached;
+        }
+    }
+
+    // Cache miss / disabled → full pre-scan via the trait method.
+    // - Single `Impg`: default parallel-by-target impl (fine: one file, one cache).
+    // - `MultiImpg`: file-parallel override loading each sub-index transiently
+    //   and dropping it immediately, bounding peak retained sub-indices to the
+    //   rayon worker count.
+    let degrees =
+        impg.compute_sample_degrees(seq_included, compact_lengths.seq_to_sample_slice());
+
+    // Best-effort sidecar save. Failure is logged but not propagated — the
+    // cache is purely an optimisation.
+    if let (Some(hash), Some(path)) = (cache_key, cache_path) {
+        if let Err(e) = save_degrees_cache(&path, hash, &degrees) {
+            log::warn!(
+                "Failed to write degrees sidecar cache to {}: {}",
+                path.display(),
+                e
+            );
+        } else {
+            debug!("Saved alignment degrees sidecar cache: {}", path.display());
+        }
+    }
+
+    degrees
 }
 
 /// Build sequence processing order: sorted by degree descending, then length descending.
@@ -3794,9 +3999,95 @@ fn process_anchor_region_raw_streaming(
 const TRANSITIVE_CHUNK_SIZE: i64 = 5_000_000;
 
 /// Flush threshold for streaming depth output buffers (4 MB).
-/// Each thread accumulates TSV text up to this limit before acquiring the
-/// writer lock, balancing memory usage against lock contention.
+/// Each thread accumulates TSV text up to this limit before sending the
+/// buffer over the writer channel, balancing memory usage against per-send
+/// channel overhead.
 const STREAMING_FLUSH_THRESHOLD: usize = 4 * 1024 * 1024;
+
+/// Bounded MPSC channel capacity for the dedicated TSV writer thread.
+///
+/// 256 buffers × ~4 MB worker buffers ≈ 1 GB worst-case backpressure ceiling.
+/// Workers block on `send` when the channel is full, providing natural
+/// throttling without losing any rows.
+const WRITER_CHANNEL_CAPACITY: usize = 256;
+
+/// Dedicated writer thread + bounded MPSC channel for TSV output.
+///
+/// Replaces the previous `Mutex<BufWriter>` design: at high thread counts the
+/// shared mutex serialised every `write_all` call across all workers, even
+/// though each worker had already done the formatting on its own 4 MB buffer.
+/// Now workers `send(buf)` (blocks if the bounded channel is full) and the
+/// dedicated thread drains the channel into the underlying writer in order.
+///
+/// **Invariant**: the writer thread MUST be joined via `finish()` at end of
+/// run. Dropping `tx` flushes the channel; the writer thread then exits, and
+/// `finish()` propagates any IO error from the writer thread back to the
+/// caller. Without this join the program may exit before the underlying file
+/// is fully drained, producing a truncated TSV.
+struct DepthWriter {
+    tx: SyncSender<Vec<u8>>,
+    handle: JoinHandle<io::Result<()>>,
+}
+
+impl DepthWriter {
+    /// Spawn the writer thread and write the TSV header on its behalf.
+    fn new(output_prefix: Option<&str>) -> io::Result<Self> {
+        // Choose the underlying sink. Use a large BufWriter capacity (8 MiB
+        // for files, 1 MiB for stdout) so the writer thread amortises syscalls.
+        let inner: Box<dyn Write + Send> = if let Some(prefix) = output_prefix {
+            let path = format!("{}.depth.tsv", prefix);
+            Box::new(BufWriter::with_capacity(
+                8 * 1024 * 1024,
+                std::fs::File::create(&path)?,
+            ))
+        } else {
+            Box::new(BufWriter::with_capacity(
+                1024 * 1024,
+                std::io::stdout(),
+            ))
+        };
+
+        let (tx, rx) = sync_channel::<Vec<u8>>(WRITER_CHANNEL_CAPACITY);
+        let handle = std::thread::Builder::new()
+            .name("depth-writer".to_string())
+            .spawn(move || -> io::Result<()> {
+                let mut w = inner;
+                writeln!(w, "#id\tlength\tdepth\tpositions")?;
+                while let Ok(buf) = rx.recv() {
+                    w.write_all(&buf)?;
+                }
+                w.flush()?;
+                Ok(())
+            })?;
+
+        Ok(DepthWriter { tx, handle })
+    }
+
+    /// Send a fully-formatted TSV chunk to the writer thread. Blocks if the
+    /// bounded channel is full (natural backpressure).
+    fn send(&self, buf: Vec<u8>) -> io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        self.tx.send(buf).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("depth writer channel closed: {}", e),
+            )
+        })
+    }
+
+    /// Drop the sender (signals the writer to flush + exit) and join the
+    /// writer thread. Propagates any IO error from the thread.
+    fn finish(self) -> io::Result<()> {
+        let DepthWriter { tx, handle } = self;
+        drop(tx);
+        match handle.join() {
+            Ok(res) => res,
+            Err(_) => Err(io::Error::other("depth writer thread panicked")),
+        }
+    }
+}
 
 /// Reference-free global depth computation.
 ///
@@ -3923,7 +4214,8 @@ pub fn compute_depth_global(
     // total number of per-file indices. The old tree-cache toggle is no longer
     // needed for the pre-scan — leave the main-phase cache setting untouched.
     info!("Pre-scanning alignment degrees...");
-    let degrees = compute_alignment_degrees(impg, &compact_lengths, &seq_included);
+    let degrees =
+        compute_alignment_degrees(impg, &compact_lengths, &seq_included, min_seq_length);
     // Pre-scan uses load_sub_index_uncached (does NOT populate
     // transient_header_cache), so the cache should already be empty here. Clear
     // both caches defensively in case a future code change reintroduces caching
@@ -3951,19 +4243,15 @@ pub fn compute_depth_global(
         sequence_order.len()
     );
 
-    // Prepare output: TSV writer for normal mode, stats accumulators for --stats add-on
-    let writer: Option<Mutex<BufWriter<Box<dyn Write + Send>>>> = if !stats_mode {
-        let inner_writer: Box<dyn Write + Send> = if let Some(prefix) = output_prefix {
-            let path = format!("{}.depth.tsv", prefix);
-            Box::new(BufWriter::new(std::fs::File::create(&path)?))
-        } else {
-            Box::new(BufWriter::new(std::io::stdout()))
-        };
-        let mut w = BufWriter::new(inner_writer);
-
-        // Write header: #id length depth positions
-        writeln!(w, "#id\tlength\tdepth\tpositions")?;
-        Some(Mutex::new(w))
+    // Prepare output: TSV writer for normal mode, stats accumulators for --stats add-on.
+    //
+    // Uses a dedicated writer thread + bounded MPSC channel rather than the
+    // previous `Mutex<BufWriter>`; at high thread counts the global mutex was
+    // serialising every TSV chunk write, even though each worker had already
+    // formatted its 4 MB buffer locally. The writer thread also writes the TSV
+    // header before draining the channel.
+    let writer: Option<DepthWriter> = if !stats_mode {
+        Some(DepthWriter::new(output_prefix)?)
     } else {
         None
     };
@@ -4240,7 +4528,7 @@ pub fn compute_depth_global(
                         write_results(vec![result], &mut buf)?;
                         if !buf.is_empty() {
                             if let Some(ref w) = writer {
-                                w.lock().write_all(&buf)?;
+                                w.send(std::mem::take(&mut buf))?;
                             }
                         }
                         let count = phase1_count.fetch_add(1, Ordering::Relaxed) + 1;
@@ -4291,7 +4579,7 @@ pub fn compute_depth_global(
                             write_results(vec![result], &mut buf)?;
                             if !buf.is_empty() {
                                 if let Some(ref w) = writer {
-                                    w.lock().write_all(&buf)?;
+                                    w.send(std::mem::take(&mut buf))?;
                                 }
                             }
                             let count = phase1_count.fetch_add(1, Ordering::Relaxed) + 1;
@@ -4754,7 +5042,13 @@ pub fn compute_depth_global(
                     write_results(region_results, &mut buf)?;
                     if !buf.is_empty() {
                         if let Some(ref w) = writer {
-                            w.lock().write_all(&buf)?;
+                            // Hand ownership to the writer thread; allocate a
+                            // fresh Vec for the next iteration. The buffers
+                            // are typically large (tens of KB to a few MB) so
+                            // the alloc churn is dwarfed by the I/O serialised
+                            // off the worker.
+                            w.send(std::mem::take(&mut buf))?;
+                            buf = Vec::new();
                         }
                     }
                 }
@@ -4814,7 +5108,6 @@ pub fn compute_depth_global(
                 }
             } else if let Some(ref w) = writer {
                 let rid = row_counter.fetch_add(1, Ordering::Relaxed) + 1;
-                let mut w = w.lock();
 
                 // Output as depth=1 for entire sequence. Match the normal row
                 // format: id, length, depth, positions (semicolon-separated);
@@ -4823,7 +5116,13 @@ pub fn compute_depth_global(
                 let _ = num_samples;
                 let _ = sample_index;
                 let _ = sample_name;
-                writeln!(w, "{}\t{}\t1\t{}:0-{}", rid, seq_len, seq_name, seq_len)?;
+                let mut buf: Vec<u8> = Vec::with_capacity(64);
+                writeln!(
+                    &mut buf,
+                    "{}\t{}\t1\t{}:0-{}",
+                    rid, seq_len, seq_name, seq_len
+                )?;
+                w.send(buf)?;
             }
         }
     }
@@ -4879,10 +5178,11 @@ pub fn compute_depth_global(
             );
         }
     } else {
-        // Normal mode: flush TSV writer
+        // Normal mode: drop the channel sender and join the dedicated writer
+        // thread. CRITICAL: without this join, the program may exit before
+        // the writer drains its queue, producing a truncated TSV file.
         if let Some(w) = writer {
-            let mut w = w.into_inner();
-            w.flush()?;
+            w.finish()?;
         }
 
         let total_intervals = row_counter.load(Ordering::Relaxed);

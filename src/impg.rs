@@ -2974,6 +2974,10 @@ impl ImpgIndex for Impg {
         &self.sequence_files
     }
 
+    fn alignment_files(&self) -> &[String] {
+        &self.alignment_files
+    }
+
     fn query_reverse_for_depth(&self, query_id: u32) -> Vec<(i64, i64, i64, i64, u32)> {
         Impg::query_reverse_for_depth(self, query_id)
     }

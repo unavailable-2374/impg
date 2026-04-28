@@ -123,6 +123,10 @@ pub trait ImpgIndex: Send + Sync {
     /// Get the sequence files (FASTA/AGC) associated with this index.
     fn sequence_files(&self) -> &[String];
 
+    /// Get the alignment files (PAF/.1aln) associated with this index.
+    /// Used for caching by paths (e.g., the depth-degrees sidecar cache).
+    fn alignment_files(&self) -> &[String];
+
     /// Query alignments where the specified sequence is the QUERY (reverse direction).
     /// Returns: Vec of (our_q_start, our_q_end, other_t_start, other_t_end, other_seq_id)
     /// - our_q_start/our_q_end: coordinates on our sequence (appears as query in the alignment)
@@ -553,6 +557,13 @@ impl ImpgIndex for ImpgWrapper {
         match self {
             ImpgWrapper::Single(impg) => impg.sequence_files(),
             ImpgWrapper::Multi(multi) => multi.sequence_files(),
+        }
+    }
+
+    fn alignment_files(&self) -> &[String] {
+        match self {
+            ImpgWrapper::Single(impg) => impg.alignment_files(),
+            ImpgWrapper::Multi(multi) => multi.alignment_files(),
         }
     }
 
