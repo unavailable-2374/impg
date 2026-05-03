@@ -1,5 +1,6 @@
 pub mod align;
 pub mod depth;
+pub mod depth_checkpoint;
 pub mod graph;
 pub mod lace;
 pub mod partition;
