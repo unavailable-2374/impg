@@ -8,10 +8,17 @@ use parking_lot::Mutex;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeMap;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::thread::JoinHandle;
+
+use crate::commands::depth_checkpoint::{
+    compute_invalidation_hash, encode_chunk_id_phase1, encode_chunk_id_phase2,
+    encode_work_record, encode_worklog_header, replay_work_log, truncate_to,
+    DepthCheckpoint, HashInputs, ResumeState, CHUNK_ID_BOUNDARY, CHUNK_ID_FAI_DONE, TSV_SUFFIX,
+    WORKLOG_SUFFIX,
+};
 
 // ============================================================================
 // `depth-trace` cargo feature — diagnostic eprintln! probes for triaging
@@ -4027,12 +4034,13 @@ const STREAMING_FLUSH_THRESHOLD: usize = 4 * 1024 * 1024;
 /// throttling without losing any rows.
 const WRITER_CHANNEL_CAPACITY: usize = 256;
 
-/// Dedicated writer thread + bounded MPSC channel for TSV output.
+/// Dedicated writer thread + bounded MPSC channel for TSV (and, when
+/// resumable, work-log) output.
 ///
 /// Replaces the previous `Mutex<BufWriter>` design: at high thread counts the
 /// shared mutex serialised every `write_all` call across all workers, even
 /// though each worker had already done the formatting on its own 4 MB buffer.
-/// Now workers `send(buf)` (blocks if the bounded channel is full) and the
+/// Now workers `send_*(...)` (blocks if the bounded channel is full) and the
 /// dedicated thread drains the channel into the underlying writer in order.
 ///
 /// **Invariant**: the writer thread MUST be joined via `finish()` at end of
@@ -4040,52 +4048,228 @@ const WRITER_CHANNEL_CAPACITY: usize = 256;
 /// `finish()` propagates any IO error from the writer thread back to the
 /// caller. Without this join the program may exit before the underlying file
 /// is fully drained, producing a truncated TSV.
+///
+/// When checkpoint/resume is enabled the writer additionally drives a
+/// `<prefix>.depth.work.bin` append-only log. The writer is the only thread
+/// touching either file, so a per-chunk `WriterMsg::Chunk { tsv, work }` is
+/// applied atomically: TSV bytes and the matching work-log record advance
+/// together, and a subsequent `Barrier` returns the post-flush stream
+/// positions of *both* files. That coupling is what lets the ckpt offset
+/// pair stay consistent — anything past the captured offsets gets truncated
+/// on resume regardless of whether it was a half-flushed TSV row or a
+/// half-flushed work-log record.
+enum WriterMsg {
+    /// Plain TSV bytes with no matching work-log record. Used for the
+    /// non-resume path and for boundary writes that don't correspond to a
+    /// chunk.
+    TsvOnly(Vec<u8>),
+    /// Atomic per-chunk write. Both halves are pushed in lockstep.
+    Chunk { tsv: Vec<u8>, work: Vec<u8> },
+    /// Drain queued messages, flush + `sync_data` both files, return the
+    /// (tsv_offset, work_offset) pair to the requester.
+    Barrier(SyncSender<io::Result<(u64, u64)>>),
+}
+
+/// TSV destination: a file we can `sync_data` + query stream position on, or
+/// stdout (no checkpointing — barrier returns dummies).
+enum TsvSink {
+    File(BufWriter<std::fs::File>),
+    Stdout(BufWriter<std::io::Stdout>),
+}
+
+impl TsvSink {
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        match self {
+            Self::File(w) => w.write_all(buf),
+            Self::Stdout(w) => w.write_all(buf),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::File(w) => w.flush(),
+            Self::Stdout(w) => w.flush(),
+        }
+    }
+    /// Returns the post-flush byte offset on a real file; 0 for stdout.
+    fn flush_and_sync(&mut self) -> io::Result<u64> {
+        match self {
+            Self::File(w) => {
+                w.flush()?;
+                w.get_ref().sync_data()?;
+                // BufWriter<File> implements Seek (via inner), but only after
+                // a flush; we just flushed.
+                w.stream_position()
+            }
+            Self::Stdout(w) => {
+                w.flush()?;
+                Ok(0)
+            }
+        }
+    }
+}
+
 struct DepthWriter {
-    tx: SyncSender<Vec<u8>>,
+    tx: SyncSender<WriterMsg>,
     handle: JoinHandle<io::Result<()>>,
+    /// True iff a work-log file backs this writer; gates `send_chunk_bundle`
+    /// and meaningful barriers.
+    has_work_log: bool,
+}
+
+/// Options for opening the writer; controls header-write and work-log paths.
+struct WriterOpts<'a> {
+    /// Output prefix; when None, TSV goes to stdout and resume is disabled.
+    output_prefix: Option<&'a str>,
+    /// Append to existing TSV (resume path) instead of truncating.
+    append_tsv: bool,
+    /// Append to existing work-log (resume path) instead of truncating.
+    append_worklog: bool,
+    /// If true, allocate and drive a work-log alongside the TSV. Implies
+    /// `output_prefix.is_some()`.
+    with_work_log: bool,
+    /// Skip writing the TSV header. Set on resume so we don't duplicate it
+    /// after truncating the file to `tsv_byte_offset`.
+    skip_header: bool,
 }
 
 impl DepthWriter {
-    /// Spawn the writer thread and write the TSV header on its behalf.
-    fn new(output_prefix: Option<&str>) -> io::Result<Self> {
-        // Choose the underlying sink. Use a large BufWriter capacity (8 MiB
-        // for files, 1 MiB for stdout) so the writer thread amortises syscalls.
-        let inner: Box<dyn Write + Send> = if let Some(prefix) = output_prefix {
-            let path = format!("{}.depth.tsv", prefix);
-            Box::new(BufWriter::with_capacity(
-                8 * 1024 * 1024,
-                std::fs::File::create(&path)?,
-            ))
+    fn open(opts: WriterOpts<'_>) -> io::Result<Self> {
+        let WriterOpts {
+            output_prefix,
+            append_tsv,
+            append_worklog,
+            with_work_log,
+            skip_header,
+        } = opts;
+
+        if with_work_log && output_prefix.is_none() {
+            return Err(io::Error::other(
+                "work-log requires --output-prefix (cannot resume to stdout)",
+            ));
+        }
+
+        // Open TSV sink.
+        //
+        // Resume mode opens the existing file in `write` mode (no `truncate`,
+        // no `O_APPEND`) and seeks to EOF so subsequent writes extend it.
+        // We deliberately do *not* set the OS-level append flag: combined
+        // with explicit `seek` it adds ambiguity on networked filesystems
+        // and the single-writer-thread invariant already gives us linear
+        // append semantics.
+        let mut tsv = if let Some(prefix) = output_prefix {
+            let path = format!("{}{}", prefix, TSV_SUFFIX);
+            let mut f = std::fs::OpenOptions::new();
+            f.write(true).create(true);
+            if !append_tsv {
+                f.truncate(true);
+            }
+            let file = f.open(&path)?;
+            let mut bw = BufWriter::with_capacity(8 * 1024 * 1024, file);
+            if append_tsv {
+                bw.seek(SeekFrom::End(0))?;
+            }
+            TsvSink::File(bw)
         } else {
-            Box::new(BufWriter::with_capacity(
-                1024 * 1024,
-                std::io::stdout(),
-            ))
+            TsvSink::Stdout(BufWriter::with_capacity(1024 * 1024, std::io::stdout()))
         };
 
-        let (tx, rx) = sync_channel::<Vec<u8>>(WRITER_CHANNEL_CAPACITY);
+        // Optionally open work-log. Same rationale for skipping `O_APPEND`.
+        let mut work: Option<BufWriter<std::fs::File>> = if with_work_log {
+            let prefix = output_prefix.expect("with_work_log implies output_prefix");
+            let path = format!("{}{}", prefix, WORKLOG_SUFFIX);
+            let mut f = std::fs::OpenOptions::new();
+            f.write(true).create(true).read(true);
+            if !append_worklog {
+                f.truncate(true);
+            }
+            let file = f.open(&path)?;
+            let mut bw = BufWriter::with_capacity(2 * 1024 * 1024, file);
+            if append_worklog {
+                bw.seek(SeekFrom::End(0))?;
+            }
+            Some(bw)
+        } else {
+            None
+        };
+
+        let has_work_log = work.is_some();
+
+        // Header logic: TSV header on fresh files only. Work-log header on
+        // fresh files; on append we trust the existing one.
+        if !skip_header {
+            tsv.write_all(b"#id\tlength\tdepth\tpositions\n")?;
+        }
+        if let Some(w) = work.as_mut() {
+            if !append_worklog {
+                w.write_all(&encode_worklog_header())?;
+            }
+        }
+
+        let (tx, rx) = sync_channel::<WriterMsg>(WRITER_CHANNEL_CAPACITY);
         let handle = std::thread::Builder::new()
             .name("depth-writer".to_string())
             .spawn(move || -> io::Result<()> {
-                let mut w = inner;
-                writeln!(w, "#id\tlength\tdepth\tpositions")?;
-                while let Ok(buf) = rx.recv() {
-                    w.write_all(&buf)?;
+                let mut tsv = tsv;
+                let mut work = work;
+                while let Ok(msg) = rx.recv() {
+                    match msg {
+                        WriterMsg::TsvOnly(buf) => {
+                            tsv.write_all(&buf)?;
+                        }
+                        WriterMsg::Chunk { tsv: tbuf, work: wbuf } => {
+                            // TSV first, then work-log. Both are append-only;
+                            // ordering between the two files doesn't matter for
+                            // correctness, but doing them back-to-back keeps
+                            // the per-chunk advance together when a barrier
+                            // captures offsets.
+                            if !tbuf.is_empty() {
+                                tsv.write_all(&tbuf)?;
+                            }
+                            if let Some(w) = work.as_mut() {
+                                if !wbuf.is_empty() {
+                                    w.write_all(&wbuf)?;
+                                }
+                            }
+                        }
+                        WriterMsg::Barrier(reply) => {
+                            let result: io::Result<(u64, u64)> = (|| {
+                                let tsv_off = tsv.flush_and_sync()?;
+                                let work_off = if let Some(w) = work.as_mut() {
+                                    w.flush()?;
+                                    w.get_ref().sync_data()?;
+                                    w.stream_position()?
+                                } else {
+                                    0u64
+                                };
+                                Ok((tsv_off, work_off))
+                            })();
+                            // Best-effort send; if the receiver is gone the
+                            // requester crashed — let the writer keep going
+                            // until the channel closes for real.
+                            let _ = reply.send(result);
+                        }
+                    }
                 }
-                w.flush()?;
+                tsv.flush()?;
+                if let Some(w) = work.as_mut() {
+                    w.flush()?;
+                }
                 Ok(())
             })?;
 
-        Ok(DepthWriter { tx, handle })
+        Ok(DepthWriter {
+            tx,
+            handle,
+            has_work_log,
+        })
     }
 
-    /// Send a fully-formatted TSV chunk to the writer thread. Blocks if the
-    /// bounded channel is full (natural backpressure).
+    /// Send TSV bytes only. Backward-compatible with the pre-resume API.
     fn send(&self, buf: Vec<u8>) -> io::Result<()> {
         if buf.is_empty() {
             return Ok(());
         }
-        self.tx.send(buf).map_err(|e| {
+        self.tx.send(WriterMsg::TsvOnly(buf)).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 format!("depth writer channel closed: {}", e),
@@ -4093,15 +4277,191 @@ impl DepthWriter {
         })
     }
 
+    /// Atomic per-chunk write: TSV bytes + matching work-log record. Use this
+    /// in CIGAR Phase 1/2 hot loops when checkpoint/resume is enabled. When
+    /// the writer was opened without a work-log this falls back to a TSV-only
+    /// send and the `work` buffer is discarded (the caller has decided not to
+    /// checkpoint).
+    fn send_chunk_bundle(&self, tsv: Vec<u8>, work: Vec<u8>) -> io::Result<()> {
+        if !self.has_work_log {
+            return self.send(tsv);
+        }
+        if tsv.is_empty() && work.is_empty() {
+            return Ok(());
+        }
+        self.tx
+            .send(WriterMsg::Chunk { tsv, work })
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    format!("depth writer channel closed: {}", e),
+                )
+            })
+    }
+
+    /// Issue a barrier and wait for the writer thread to flush + `sync_data`
+    /// both backing files. Returns `(tsv_byte_offset, work_byte_offset)` post
+    /// flush. Stdout-mode TSV always returns 0.
+    fn barrier_and_offsets(&self) -> io::Result<(u64, u64)> {
+        let (reply_tx, reply_rx) = sync_channel::<io::Result<(u64, u64)>>(1);
+        self.tx.send(WriterMsg::Barrier(reply_tx)).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("depth writer channel closed: {}", e),
+            )
+        })?;
+        match reply_rx.recv() {
+            Ok(res) => res,
+            Err(_) => Err(io::Error::other(
+                "depth writer thread dropped barrier reply channel",
+            )),
+        }
+    }
+
     /// Drop the sender (signals the writer to flush + exit) and join the
     /// writer thread. Propagates any IO error from the thread.
     fn finish(self) -> io::Result<()> {
-        let DepthWriter { tx, handle } = self;
+        let DepthWriter { tx, handle, .. } = self;
         drop(tx);
         match handle.join() {
             Ok(res) => res,
             Err(_) => Err(io::Error::other("depth writer thread panicked")),
         }
+    }
+}
+
+/// Number of completed chunks between two automatic ckpt commits.
+///
+/// Phase 1/2 chunks are 5 MB of sequence each; CIGAR BFS through the
+/// alignment network typically runs each chunk in the seconds–minutes range.
+/// At 64 chunks per commit we're committing on the order of every few
+/// minutes, which strikes the balance between (a) ckpt-write IO amortising
+/// to noise and (b) bounded re-work after a crash.
+const CHECKPOINT_CHUNK_INTERVAL: usize = 64;
+
+/// Drives periodic ckpt commits without requiring a dedicated thread.
+///
+/// One worker out of the rayon par_iter wins the `try_lock` whenever the
+/// shared chunk counter rolls past a multiple of `CHECKPOINT_CHUNK_INTERVAL`,
+/// issues a writer barrier, captures the post-flush byte offsets and current
+/// counter snapshot, and persists a fresh ckpt via `save_atomic`. Other
+/// workers continue pumping chunk bundles into the writer channel.
+///
+/// When `state` is `None` (resume disabled or a stats-mode run) every method
+/// is a no-op so call sites can stay branchless.
+struct CheckpointController<'a> {
+    state: Option<CheckpointState<'a>>,
+}
+
+struct CheckpointState<'a> {
+    prefix: &'a str,
+    invalidation_hash: u64,
+    interval: usize,
+    counter: AtomicUsize,
+    commit_lock: Mutex<()>,
+    row_counter: &'a AtomicUsize,
+    intervals_counter: &'a AtomicUsize,
+    writer: &'a DepthWriter,
+}
+
+impl<'a> CheckpointController<'a> {
+    fn disabled() -> Self {
+        Self { state: None }
+    }
+
+    fn new(
+        prefix: &'a str,
+        invalidation_hash: u64,
+        writer: &'a DepthWriter,
+        row_counter: &'a AtomicUsize,
+        intervals_counter: &'a AtomicUsize,
+    ) -> Self {
+        // Tests can set `IMPG_CHECKPOINT_INTERVAL_OVERRIDE` to a small number
+        // (e.g. 1) so a tiny synthetic dataset still exercises the periodic
+        // commit path. Production runs use the constant default.
+        let interval = std::env::var("IMPG_CHECKPOINT_INTERVAL_OVERRIDE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(CHECKPOINT_CHUNK_INTERVAL);
+        Self {
+            state: Some(CheckpointState {
+                prefix,
+                invalidation_hash,
+                interval,
+                counter: AtomicUsize::new(0),
+                commit_lock: Mutex::new(()),
+                row_counter,
+                intervals_counter,
+                writer,
+            }),
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.state.is_some()
+    }
+
+    /// Called by every worker after each completed chunk. Increments the
+    /// shared counter and triggers an opportunistic commit when the
+    /// configured interval is reached. Only one worker per crossing actually
+    /// runs the commit (the rest fall through on `try_lock`).
+    fn note_chunk_done(&self) -> io::Result<()> {
+        let Some(s) = self.state.as_ref() else {
+            return Ok(());
+        };
+        let n = s.counter.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % s.interval == 0 {
+            if let Some(_g) = s.commit_lock.try_lock() {
+                self.commit_inner(s)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Force a commit (waits for the lock if another worker is currently
+    /// committing). Used at phase boundaries and at the end of the run.
+    fn force_commit(&self) -> io::Result<()> {
+        let Some(s) = self.state.as_ref() else {
+            return Ok(());
+        };
+        let _g = s.commit_lock.lock();
+        self.commit_inner(s)
+    }
+
+    fn commit_inner(&self, s: &CheckpointState<'_>) -> io::Result<()> {
+        let (tsv_off, work_off) = s.writer.barrier_and_offsets()?;
+        let ck = DepthCheckpoint {
+            schema_version: crate::commands::depth_checkpoint::CKPT_SCHEMA_VERSION,
+            invalidation_hash: s.invalidation_hash,
+            tsv_byte_offset: tsv_off,
+            work_byte_offset: work_off,
+            row_counter: s.row_counter.load(Ordering::Relaxed) as u64,
+            intervals_counter: s.intervals_counter.load(Ordering::Relaxed) as u64,
+        };
+        ck.save_atomic(s.prefix)?;
+        debug!(
+            "ckpt committed: tsv={} work={} row={} intervals={}",
+            ck.tsv_byte_offset,
+            ck.work_byte_offset,
+            ck.row_counter,
+            ck.intervals_counter,
+        );
+        // Test hook: when set, abort the process immediately after a successful
+        // commit. The next run with `--resume` should pick up exactly here.
+        // Production runs never set this env var.
+        if std::env::var_os("IMPG_TEST_EXIT_AFTER_COMMIT").is_some() {
+            // The writer thread, channel buffers and any pending Phase 1/2
+            // messages are intentionally abandoned — that's the whole point
+            // of the simulated crash.
+            eprintln!(
+                "[impg test hook] IMPG_TEST_EXIT_AFTER_COMMIT set; aborting after \
+                 ckpt commit (tsv={}, work={})",
+                ck.tsv_byte_offset, ck.work_byte_offset,
+            );
+            std::process::exit(99);
+        }
+        Ok(())
     }
 }
 
@@ -4124,6 +4484,7 @@ impl DepthWriter {
 /// - Hub-first ordering: high-connectivity sequences anchor first (auto-detected or via --ref)
 /// - --ref: ref-anchored mode, guarantees ref sample's coordinate system for covered regions
 /// - --ref-only: ref-only mode, output filtered to ref sample's anchored regions only
+#[allow(clippy::too_many_arguments)]
 pub fn compute_depth_global(
     impg: &impl ImpgIndex,
     config: &DepthConfig,
@@ -4137,7 +4498,111 @@ pub fn compute_depth_global(
     min_seq_length: i64,
     stats_mode: bool,
     stats_combined: bool,
+    resume: bool,
+    alignment_files: &[String],
 ) -> io::Result<()> {
+    // ------------------------------------------------------------------
+    // Checkpoint / resume bootstrap.
+    //
+    // `resume` is the sole user-facing toggle:
+    //   - false: legacy behavior. Writer is TSV-only; no ckpt or work-log.
+    //   - true:  CIGAR-precise BFS path only (validated upstream). On a fresh
+    //            run we still write `<prefix>.depth.work.bin` + `<prefix>
+    //            .depth.ckpt` so the *next* invocation can resume. On a
+    //            subsequent run the work-log is replayed to rebuild
+    //            `tracker` / `global_used` and any chunk_id present in the
+    //            replayed records is short-circuited.
+    //
+    // The caller (main.rs) has already rejected combinations we don't
+    // support (--stats, raw-BFS, stdout output, region query mode). The
+    // assertions below are a defence-in-depth check.
+    // ------------------------------------------------------------------
+    if resume {
+        if !config.use_cigar_bfs {
+            return Err(io::Error::other(
+                "internal: --resume reached compute_depth_global without --use-BFS",
+            ));
+        }
+        if !(config.transitive || config.transitive_dfs) {
+            return Err(io::Error::other(
+                "internal: --resume requires transitive depth (-x or --transitive-dfs)",
+            ));
+        }
+        if stats_mode || stats_combined {
+            return Err(io::Error::other(
+                "internal: --resume is not yet supported with --stats",
+            ));
+        }
+        if output_prefix.is_none() {
+            return Err(io::Error::other(
+                "internal: --resume requires an --output-prefix",
+            ));
+        }
+    }
+
+    // Compute invalidation hash early so we can compare against any existing
+    // ckpt before consuming wall time on a stale state.
+    let invalidation_hash = compute_invalidation_hash(
+        alignment_files,
+        &HashInputs {
+            ref_sample,
+            ref_only,
+            min_seq_length,
+            min_interval_len,
+            window_size,
+            merge_adjacent: config.merge_adjacent,
+            stats_mode,
+            stats_combined,
+            separator,
+            fai_list,
+            use_cigar_bfs: config.use_cigar_bfs,
+            transitive: config.transitive,
+            transitive_dfs: config.transitive_dfs,
+            max_depth: config.max_depth,
+            min_transitive_len: config.min_transitive_len,
+            min_distance_between_ranges: config.min_distance_between_ranges,
+        },
+    );
+
+    let resume_state: Option<ResumeState> = if resume {
+        // Safe to unwrap: validated above.
+        let prefix = output_prefix.unwrap();
+        match DepthCheckpoint::try_load(prefix)? {
+            Some(ck) => {
+                if ck.invalidation_hash != invalidation_hash {
+                    return Err(io::Error::other(format!(
+                        "checkpoint at {prefix}.depth.ckpt was produced with a different \
+                         configuration or alignment fingerprint (hash {} != {}); refusing to \
+                         resume. Delete the .ckpt + .work.bin files to start fresh.",
+                        ck.invalidation_hash, invalidation_hash,
+                    )));
+                }
+                info!(
+                    "Resuming depth: ckpt @ tsv={} bytes, work={} bytes, row_counter={}",
+                    ck.tsv_byte_offset, ck.work_byte_offset, ck.row_counter
+                );
+
+                // Truncate live files to ckpt offsets. After this point any
+                // post-commit dirty bytes are physically gone; the writer
+                // thread (when we start it) will append cleanly.
+                let tsv_path: std::path::PathBuf =
+                    format!("{}{}", prefix, TSV_SUFFIX).into();
+                let work_path: std::path::PathBuf =
+                    format!("{}{}", prefix, WORKLOG_SUFFIX).into();
+                truncate_to(&tsv_path, ck.tsv_byte_offset)?;
+                truncate_to(&work_path, ck.work_byte_offset)?;
+                Some(ResumeState {
+                    ckpt: ck,
+                    completed_chunks: std::collections::HashSet::new(),
+                })
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    // ------------------------------------------------------------------
     let is_transitive = config.transitive || config.transitive_dfs;
     let user_window_size = window_size;
     let window_size = window_size.unwrap_or(DEFAULT_WINDOW_SIZE);
@@ -4267,7 +4732,20 @@ pub fn compute_depth_global(
     // formatted its 4 MB buffer locally. The writer thread also writes the TSV
     // header before draining the channel.
     let writer: Option<DepthWriter> = if !stats_mode {
-        Some(DepthWriter::new(output_prefix)?)
+        // Resume mode: open both files in append mode and skip the TSV
+        // header (already present from the previous run, possibly truncated
+        // mid-row by the resume entry path — but the truncation is to the
+        // last committed offset which is past the header by definition).
+        // Non-resume but `--resume` set: open the work-log fresh and write
+        // both headers. Plain run: legacy behaviour (TSV-only, fresh).
+        let opts = WriterOpts {
+            output_prefix,
+            append_tsv: resume_state.is_some(),
+            append_worklog: resume_state.is_some(),
+            with_work_log: resume,
+            skip_header: resume_state.is_some(),
+        };
+        Some(DepthWriter::open(opts)?)
     } else {
         None
     };
@@ -4294,6 +4772,43 @@ pub fn compute_depth_global(
 
     let tracker = ConcurrentProcessedTracker::new(num_sequences);
     let global_used = std::sync::Arc::new(ConcurrentProcessedTracker::new(num_sequences));
+
+    // Replay the work-log into the trackers if we're resuming. We do this
+    // *after* num_sequences is known (so the IntervalSet vectors are sized)
+    // but *before* Phase 1 starts — both `tracker` and `global_used` need
+    // the union of every previously-committed `discovered_regions`.
+    //
+    // Replay also populates `completed_chunks`, the per-chunk_id skip set
+    // consulted by Phase 1 / Phase 2 workers.
+    let mut completed_chunks: std::collections::HashSet<u64> =
+        std::collections::HashSet::new();
+    if let Some(rs) = resume_state.as_ref() {
+        let prefix = output_prefix.unwrap();
+        let work_path: std::path::PathBuf = format!("{}{}", prefix, WORKLOG_SUFFIX).into();
+        let mut replayed_records: u64 = 0;
+        let mut replayed_regions: u64 = 0;
+        replay_work_log(&work_path, rs.ckpt.work_byte_offset, |rec| {
+            // Idempotent: IntervalSet::add is a no-op for already-covered
+            // ranges, so re-applying a record yields the same end state. We
+            // still de-dup chunk_ids in case the work-log somehow contains
+            // two entries for the same id (it shouldn't, but better to be
+            // strict on the skip set).
+            tracker.mark_processed_batch(&rec.regions);
+            global_used.mark_processed_batch(&rec.regions);
+            replayed_records += 1;
+            replayed_regions += rec.regions.len() as u64;
+            completed_chunks.insert(rec.chunk_id);
+            Ok(())
+        })?;
+        info!(
+            "Resume replay: {} chunks, {} regions reconstructed from {}",
+            replayed_records,
+            replayed_regions,
+            work_path.display()
+        );
+        // row_counter / intervals_counter are seeded from rs.ckpt at their
+        // declaration further down (we can't borrow them yet here).
+    }
 
     // =========================================================================
     // Two-phase parallel processing with hub-first guarantee.
@@ -4343,8 +4858,34 @@ pub fn compute_depth_global(
     };
 
     let processed_count = AtomicUsize::new(0);
-    let row_counter = AtomicUsize::new(0);
-    let intervals_counter = AtomicUsize::new(0);
+    let row_counter = AtomicUsize::new(
+        resume_state
+            .as_ref()
+            .map(|rs| rs.ckpt.row_counter as usize)
+            .unwrap_or(0),
+    );
+    let intervals_counter = AtomicUsize::new(
+        resume_state
+            .as_ref()
+            .map(|rs| rs.ckpt.intervals_counter as usize)
+            .unwrap_or(0),
+    );
+
+    // Build the checkpoint controller. `resume == true && writer.is_some()`
+    // is the only configuration that produces a live ckpt-saving path; in
+    // every other case the controller is a no-op and worker code stays
+    // branch-free.
+    let checkpoint_ctrl: CheckpointController = match (resume, writer.as_ref()) {
+        (true, Some(w)) => CheckpointController::new(
+            output_prefix.expect("--resume requires output_prefix"),
+            invalidation_hash,
+            w,
+            &row_counter,
+            &intervals_counter,
+        ),
+        _ => CheckpointController::disabled(),
+    };
+    let work_log_active = checkpoint_ctrl.enabled();
 
     // Helper closure: format and write results for a batch of AnchorRegionResults.
     // In stats mode: accumulates depth distribution + intervals into stats accumulators.
@@ -4523,35 +5064,71 @@ pub fn compute_depth_global(
             let phase1_count = AtomicUsize::new(0);
 
             if config.use_cigar_bfs {
-                // CIGAR path: keep existing per-chunk parallel approach
-                phase1_chunks.par_iter().try_for_each(
-                    |&(seq_id, sample_id, chunk_start, chunk_end)| -> io::Result<()> {
-                        let result = process_anchor_region(
-                            impg,
-                            config,
-                            &compact_lengths,
-                            num_samples,
-                            seq_id,
-                            sample_id,
-                            chunk_start,
-                            chunk_end,
-                            &seq_included,
-                            min_seq_length,
-                            &global_used,
-                        );
-                        tracker.mark_processed_batch(&result.discovered_regions);
-                        let mut buf: Vec<u8> = Vec::new();
-                        write_results(vec![result], &mut buf)?;
-                        if !buf.is_empty() {
-                            if let Some(ref w) = writer {
-                                w.send(std::mem::take(&mut buf))?;
+                // CIGAR path: keep existing per-chunk parallel approach.
+                //
+                // When checkpointing is active (`work_log_active`):
+                //   - Each chunk's chunk_id is the deterministic
+                //     `encode_chunk_id_phase1(idx)` of its position in the
+                //     sorted `phase1_chunks` Vec.
+                //   - Chunks already present in `completed_chunks` (recovered
+                //     from a previous run's work-log) are short-circuited
+                //     before any sub-index loading happens.
+                //   - The per-chunk TSV bytes and a serialized work-log
+                //     record are bundled atomically (`send_chunk_bundle`)
+                //     so the writer thread advances both files in lockstep
+                //     and the next ckpt commit captures consistent offsets.
+                phase1_chunks
+                    .par_iter()
+                    .enumerate()
+                    .try_for_each(
+                        |(idx, &(seq_id, sample_id, chunk_start, chunk_end))| -> io::Result<()> {
+                            let chunk_id = encode_chunk_id_phase1(idx);
+                            if work_log_active && completed_chunks.contains(&chunk_id) {
+                                let count = phase1_count.fetch_add(1, Ordering::Relaxed) + 1;
+                                pb_phase1.set_position(count as u64);
+                                return Ok(());
                             }
-                        }
-                        let count = phase1_count.fetch_add(1, Ordering::Relaxed) + 1;
-                        pb_phase1.set_position(count as u64);
-                        Ok(())
-                    },
-                )?;
+                            let result = process_anchor_region(
+                                impg,
+                                config,
+                                &compact_lengths,
+                                num_samples,
+                                seq_id,
+                                sample_id,
+                                chunk_start,
+                                chunk_end,
+                                &seq_included,
+                                min_seq_length,
+                                &global_used,
+                            );
+                            tracker.mark_processed_batch(&result.discovered_regions);
+                            let mut tsv_buf: Vec<u8> = Vec::new();
+                            // Capture discovered_regions before write_results
+                            // moves the result out — needed for the work-log
+                            // record so the next resume can rebuild the
+                            // tracker state without recomputing the BFS.
+                            let work_buf = if work_log_active {
+                                encode_work_record(chunk_id, &result.discovered_regions)
+                            } else {
+                                Vec::new()
+                            };
+                            write_results(vec![result], &mut tsv_buf)?;
+                            if let Some(ref w) = writer {
+                                if work_log_active {
+                                    w.send_chunk_bundle(
+                                        std::mem::take(&mut tsv_buf),
+                                        work_buf,
+                                    )?;
+                                } else if !tsv_buf.is_empty() {
+                                    w.send(std::mem::take(&mut tsv_buf))?;
+                                }
+                            }
+                            checkpoint_ctrl.note_chunk_done()?;
+                            let count = phase1_count.fetch_add(1, Ordering::Relaxed) + 1;
+                            pb_phase1.set_position(count as u64);
+                            Ok(())
+                        },
+                    )?;
             } else {
                 // Raw BFS path (default): batch BFS — sequential file loading,
                 // then parallel sweep-line.
@@ -4766,6 +5343,27 @@ pub fn compute_depth_global(
             let seq_len = compact_lengths.get_length(seq_id);
             tracker.mark_processed(seq_id, 0, seq_len);
             global_used.mark_processed(seq_id, 0, seq_len);
+        }
+
+        // When checkpointing is active emit a synthetic work-log record at
+        // the Phase 1 → Phase 2 boundary so a resume that loses Phase 1 in
+        // mid-stream still ends up with the boundary mark applied. The
+        // boundary record uses `CHUNK_ID_BOUNDARY` (= 0); workers consult
+        // `completed_chunks` at chunk granularity, so we can safely re-emit
+        // here only when the boundary has not yet been committed in a
+        // previous run.
+        if work_log_active && !completed_chunks.contains(&CHUNK_ID_BOUNDARY) {
+            let regions: Vec<(u32, i64, i64)> = phase1_seqs
+                .iter()
+                .map(|&seq_id| (seq_id, 0i64, compact_lengths.get_length(seq_id)))
+                .collect();
+            let work_buf = encode_work_record(CHUNK_ID_BOUNDARY, &regions);
+            if let Some(ref w) = writer {
+                w.send_chunk_bundle(Vec::new(), work_buf)?;
+            }
+            // Force-commit immediately so the boundary is durably crossed
+            // before Phase 2 starts producing chunks against it.
+            checkpoint_ctrl.force_commit()?;
         }
 
         processed_count.store(phase1_seqs.len(), Ordering::Relaxed);
@@ -5001,6 +5599,28 @@ pub fn compute_depth_global(
         );
         pb_depth.set_position(processed_count.load(Ordering::Relaxed) as u64);
 
+        // Helper: send one chunk's TSV bytes + work-log record (when
+        // checkpointing is active) and tick the checkpoint controller.
+        let emit_chunk =
+            |chunk_id: u64, result: AnchorRegionResult| -> io::Result<()> {
+                let mut tsv_buf: Vec<u8> = Vec::new();
+                let work_buf = if work_log_active {
+                    encode_work_record(chunk_id, &result.discovered_regions)
+                } else {
+                    Vec::new()
+                };
+                write_results(vec![result], &mut tsv_buf)?;
+                if let Some(ref w) = writer {
+                    if work_log_active {
+                        w.send_chunk_bundle(std::mem::take(&mut tsv_buf), work_buf)?;
+                    } else if !tsv_buf.is_empty() {
+                        w.send(std::mem::take(&mut tsv_buf))?;
+                    }
+                }
+                checkpoint_ctrl.note_chunk_done()?;
+                Ok(())
+            };
+
         phase2_seqs
             .par_iter()
             .try_for_each(|&seq_id| -> io::Result<()> {
@@ -5011,6 +5631,10 @@ pub fn compute_depth_global(
                     return Ok(());
                 }
 
+                // tracker.get_unprocessed is the natural skip mechanism for
+                // resume: any chunk previously committed against this seq
+                // shows up as a processed range, so its bytes are not in
+                // `unprocessed` here and we won't re-do the work.
                 let unprocessed = tracker.get_unprocessed(seq_id, 0, seq_len);
                 if unprocessed.is_empty() {
                     let count = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
@@ -5020,11 +5644,13 @@ pub fn compute_depth_global(
 
                 let sample_id = compact_lengths.get_sample_id(seq_id);
 
-                let mut buf: Vec<u8> = Vec::new();
                 for (region_start, region_end) in unprocessed {
                     let gap_len = region_end - region_start;
 
-                    let region_results = if gap_len < config.min_transitive_len {
+                    if gap_len < config.min_transitive_len {
+                        // Single-chunk raw fallback: short gaps below the
+                        // BFS gate would otherwise be dropped entirely.
+                        let chunk_id = encode_chunk_id_phase2(seq_id, region_start);
                         let mut raw_alns = impg.query_raw_overlapping_transient(
                             seq_id,
                             region_start,
@@ -5050,12 +5676,15 @@ pub fn compute_depth_global(
                             &global_used,
                         );
                         tracker.mark_processed_batch(&result.discovered_regions);
-                        vec![result]
+                        emit_chunk(chunk_id, result)?;
                     } else if gap_len > TRANSITIVE_CHUNK_SIZE {
-                        let mut results = Vec::new();
+                        // Multi-chunk: split the gap into TRANSITIVE_CHUNK_SIZE
+                        // slices so each `process_anchor_region` is its own
+                        // ckpt-able unit.
                         let mut pos = region_start;
                         while pos < region_end {
                             let chunk_end = (pos + TRANSITIVE_CHUNK_SIZE).min(region_end);
+                            let chunk_id = encode_chunk_id_phase2(seq_id, pos);
                             let result = process_anchor_region(
                                 impg,
                                 config,
@@ -5070,11 +5699,11 @@ pub fn compute_depth_global(
                                 &global_used,
                             );
                             tracker.mark_processed_batch(&result.discovered_regions);
-                            results.push(result);
+                            emit_chunk(chunk_id, result)?;
                             pos = chunk_end;
                         }
-                        results
                     } else {
+                        let chunk_id = encode_chunk_id_phase2(seq_id, region_start);
                         let result = process_anchor_region(
                             impg,
                             config,
@@ -5089,21 +5718,7 @@ pub fn compute_depth_global(
                             &global_used,
                         );
                         tracker.mark_processed_batch(&result.discovered_regions);
-                        vec![result]
-                    };
-
-                    buf.clear();
-                    write_results(region_results, &mut buf)?;
-                    if !buf.is_empty() {
-                        if let Some(ref w) = writer {
-                            // Hand ownership to the writer thread; allocate a
-                            // fresh Vec for the next iteration. The buffers
-                            // are typically large (tens of KB to a few MB) so
-                            // the alloc churn is dwarfed by the I/O serialised
-                            // off the worker.
-                            w.send(std::mem::take(&mut buf))?;
-                            buf = Vec::new();
-                        }
+                        emit_chunk(chunk_id, result)?;
                     }
                 }
 
@@ -5320,7 +5935,19 @@ pub fn compute_depth_global(
     }
 
     // Handle FAI sequences not in alignment index (depth=1 for unaligned sequences)
+    //
+    // Resume safety: when checkpointing is active and the FAI loop committed
+    // successfully on a previous run, the `CHUNK_ID_FAI_DONE` sentinel is in
+    // `completed_chunks` (re-built from the work-log). Skipping the loop
+    // here is what prevents duplicate FAI rows: the previously-flushed rows
+    // are already on disk past the resume-truncation offset, and re-running
+    // the loop would append them a second time.
+    let fai_already_done = work_log_active && completed_chunks.contains(&CHUNK_ID_FAI_DONE);
+    if fai_already_done && fai_seq_lengths.is_some() {
+        debug!("FAI emission already committed by a previous run; skipping");
+    }
     if let Some(ref fai) = fai_seq_lengths {
+        if !fai_already_done {
         let indexed_seqs: FxHashSet<&str> = (0..impg.seq_index().len() as u32)
             .filter_map(|id| impg.seq_index().get_name(id))
             .collect();
@@ -5375,6 +6002,19 @@ pub fn compute_depth_global(
                 w.send(buf)?;
             }
         }
+
+        // Mark the FAI loop done in the work-log with a sentinel record + a
+        // forced commit. Subsequent resumes will see the sentinel in
+        // `completed_chunks` and skip the FAI loop, preventing duplicate
+        // rows.
+        if work_log_active {
+            if let Some(ref w) = writer {
+                let work_buf = encode_work_record(CHUNK_ID_FAI_DONE, &[]);
+                w.send_chunk_bundle(Vec::new(), work_buf)?;
+            }
+            checkpoint_ctrl.force_commit()?;
+        }
+        } // end !fai_already_done
     }
 
     // Finalize output
@@ -5431,8 +6071,26 @@ pub fn compute_depth_global(
         // Normal mode: drop the channel sender and join the dedicated writer
         // thread. CRITICAL: without this join, the program may exit before
         // the writer drains its queue, producing a truncated TSV file.
+        //
+        // When checkpointing is active we issue one final ckpt commit before
+        // the writer is consumed (`finish()` drops the sender). The final
+        // ckpt is what tells a future `--resume` invocation that the run
+        // ended successfully — but to be doubly safe we also remove the
+        // ckpt + work-log on success so the next run starts from a clean
+        // slate.
+        if checkpoint_ctrl.enabled() {
+            checkpoint_ctrl.force_commit()?;
+        }
+        // The controller borrows `&writer` (alongside `&row_counter` etc.);
+        // we have to drop it *before* moving `writer` into `finish()`.
+        drop(checkpoint_ctrl);
         if let Some(w) = writer {
             w.finish()?;
+        }
+        if resume {
+            if let Some(prefix) = output_prefix {
+                DepthCheckpoint::cleanup_on_success(prefix);
+            }
         }
 
         let total_intervals = row_counter.load(Ordering::Relaxed);

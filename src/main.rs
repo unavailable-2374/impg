@@ -1486,6 +1486,20 @@ enum Args {
         #[clap(short = 'b', long, value_parser, conflicts_with_all = &["target_range", "stats"])]
         target_bed: Option<String>,
 
+        /// Enable checkpoint/resume for global CIGAR-precise BFS depth.
+        ///
+        /// Writes `<prefix>.depth.ckpt` and `<prefix>.depth.work.bin` next to
+        /// the TSV; if these exist on startup and the depth configuration /
+        /// alignment fingerprint matches, work resumes from the most recent
+        /// committed batch instead of starting over.
+        ///
+        /// Only supported with `--use-BFS` (CIGAR-precise BFS) on the global
+        /// `impg depth` pipeline (no `-r` / `-b` region queries, no
+        /// `--stats`). `--output-prefix` is required.
+        #[arg(help_heading = "Checkpoint / resume")]
+        #[clap(long, action)]
+        resume: bool,
+
         #[clap(flatten)]
         common: CommonOpts,
     },
@@ -2792,6 +2806,7 @@ fn run() -> io::Result<()> {
             min_interval_len,
             target_range,
             target_bed,
+            resume,
         } => {
             initialize_threads_and_log(&common);
 
@@ -2913,6 +2928,37 @@ fn run() -> io::Result<()> {
                      (only honored with -r / -b region queries). Continuing without sample filter."
                 );
             }
+            // --resume scope is intentionally narrow (see CLI doc).
+            // Reject early so the user gets a clear error before the index
+            // load eats minutes of wall clock.
+            if resume {
+                if !use_bfs {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--resume requires --use-BFS (CIGAR-precise BFS); \
+                         the raw-interval transitive path is not in scope",
+                    ));
+                }
+                if !transitive && !transitive_opts.transitive_dfs {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--resume requires transitive depth (-x or --transitive-dfs)",
+                    ));
+                }
+                if stats || combined_output {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--resume is not compatible with --stats / --combined-output \
+                         (statistics accumulators aren't checkpointed yet)",
+                    ));
+                }
+                if output_prefix.is_none() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--resume requires --output-prefix (cannot resume to stdout)",
+                    ));
+                }
+            }
             depth::compute_depth_global(
                 &impg,
                 &config,
@@ -2926,6 +2972,8 @@ fn run() -> io::Result<()> {
                 min_seq_length as i64,
                 stats,
                 combined_output,
+                resume,
+                alignment_files.as_slice(),
             )?;
         }
     }
