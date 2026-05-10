@@ -4,7 +4,7 @@ use crate::sequence_index::UnifiedSequenceIndex;
 use bitvec::prelude::*;
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{debug, info};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeMap;
@@ -14,10 +14,9 @@ use std::sync::mpsc::{sync_channel, SyncSender};
 use std::thread::JoinHandle;
 
 use crate::commands::depth_checkpoint::{
-    compute_invalidation_hash, encode_chunk_id_phase1, encode_chunk_id_phase2,
-    encode_work_record, encode_worklog_header, replay_work_log, truncate_to,
-    DepthCheckpoint, HashInputs, ResumeState, CHUNK_ID_BOUNDARY, CHUNK_ID_FAI_DONE, TSV_SUFFIX,
-    WORKLOG_SUFFIX,
+    compute_invalidation_hash, encode_chunk_id_phase1, encode_chunk_id_phase2, encode_work_record,
+    encode_worklog_header, replay_work_log, truncate_to, DepthCheckpoint, HashInputs, ResumeState,
+    CHUNK_ID_BOUNDARY, CHUNK_ID_FAI_DONE, TSV_SUFFIX, WORKLOG_SUFFIX,
 };
 
 // ============================================================================
@@ -442,7 +441,11 @@ impl DepthStatsWithSamples {
         }
 
         writer.flush()?;
-        info!("Wrote {} intervals to {} (combined output)", intervals.len(), path);
+        info!(
+            "Wrote {} intervals to {} (combined output)",
+            intervals.len(),
+            path
+        );
         Ok(())
     }
 }
@@ -515,9 +518,8 @@ impl RegionDepthResult {
         match self.sample_positions.get(sample) {
             Some(positions) if !positions.is_empty() => {
                 let mut sorted: Vec<&(String, i64, i64)> = positions.iter().collect();
-                sorted.sort_unstable_by(|a, b| {
-                    a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2))
-                });
+                sorted
+                    .sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
                 sorted
                     .iter()
                     .map(|(seq, start, end)| format!("{}:{}-{}", seq, start, end))
@@ -605,10 +607,7 @@ impl SequenceLengths {
 
                     let sample = extract_sample(&seq_name, separator);
                     lengths.insert(seq_name.clone(), seq_len);
-                    sample_to_seqs
-                        .entry(sample)
-                        .or_default()
-                        .push(seq_name);
+                    sample_to_seqs.entry(sample).or_default().push(seq_name);
                 }
             }
         }
@@ -943,11 +942,7 @@ impl IntervalSet {
 
         // Any interval whose start is in [start, end] is touching or overlapping.
         // Collect keys first to avoid iterator-invalidation during removal.
-        let keys_to_merge: Vec<i64> = self
-            .intervals
-            .range(start..=end)
-            .map(|(&k, _)| k)
-            .collect();
+        let keys_to_merge: Vec<i64> = self.intervals.range(start..=end).map(|(&k, _)| k).collect();
         for k in keys_to_merge {
             let v = self.intervals.remove(&k).unwrap();
             merge_end = merge_end.max(v);
@@ -994,13 +989,15 @@ impl IntervalSet {
             .unwrap_or(i64::MIN);
         self.intervals
             .range(scan_from..range_end)
-            .filter_map(move |(&s, &e)| {
-                if e > range_start {
-                    Some((s, e))
-                } else {
-                    None
-                }
-            })
+            .filter_map(
+                move |(&s, &e)| {
+                    if e > range_start {
+                        Some((s, e))
+                    } else {
+                        None
+                    }
+                },
+            )
     }
 
     /// Subtract a single interval from this set.
@@ -1139,13 +1136,19 @@ fn inverse_map_query_to_target(
         let start_off = aln_query_end - q_end;
         let t_start = aln_target_start + proj_offset(start_off, target_len, query_len);
         let t_end = aln_target_start + proj_offset(end_off, target_len, query_len);
-        (t_start.min(t_end).max(aln_target_start), t_start.max(t_end).min(aln_target_end))
+        (
+            t_start.min(t_end).max(aln_target_start),
+            t_start.max(t_end).min(aln_target_end),
+        )
     } else {
         let start_off = q_start - aln_query_start;
         let end_off = q_end - aln_query_start;
         let t_start = aln_target_start + proj_offset(start_off, target_len, query_len);
         let t_end = aln_target_start + proj_offset(end_off, target_len, query_len);
-        (t_start.min(t_end).max(aln_target_start), t_start.max(t_end).min(aln_target_end))
+        (
+            t_start.min(t_end).max(aln_target_start),
+            t_start.max(t_end).min(aln_target_end),
+        )
     }
 }
 
@@ -1219,10 +1222,7 @@ fn project_hop0_coords(
             }
         }
         if proj_min < proj_max {
-            return (
-                proj_min.max(region_start),
-                proj_max.min(region_end),
-            );
+            return (proj_min.max(region_start), proj_max.min(region_end));
         }
     }
     // No segment overlaps the hit: drop it. Empty range routes to the caller's
@@ -1256,9 +1256,7 @@ impl CompactDepthEvent {
     #[inline]
     fn packed_sort_key(&self) -> u64 {
         debug_assert!(self.position >= 0 && self.position < (1i64 << 47));
-        ((self.position as u64) << 17)
-            | ((!self.is_start as u64) << 16)
-            | (self.sample_id as u64)
+        ((self.position as u64) << 17) | ((!self.is_start as u64) << 16) | (self.sample_id as u64)
     }
 }
 
@@ -1391,6 +1389,15 @@ struct StreamingDepthEmitter<'a> {
 
     // ---- Windowing ----
     window_size: Option<i64>,
+
+    // ---- Checkpoint coupling ----
+    /// When true, keep the trailing chunk-end bytes in `self.buf` after
+    /// `flush()` so the worker can bundle them with a work-log record via
+    /// `send_chunk_bundle`. Large mid-chunk auto-flushes are still allowed;
+    /// the checkpoint controller's chunk-freeze barrier prevents a checkpoint
+    /// from being committed while those bytes are missing their terminal
+    /// work-log record.
+    defer_buf_flush: bool,
 }
 
 impl<'a> StreamingDepthEmitter<'a> {
@@ -1551,8 +1558,6 @@ impl<'a> StreamingDepthEmitter<'a> {
         }
     }
 
-
-
     /// Terminal stage: format the interval (TSV or stats) and buffer the output.
     fn emit_final(&mut self, interval: SparseDepthInterval) {
         if !self.should_output {
@@ -1597,7 +1602,11 @@ impl<'a> StreamingDepthEmitter<'a> {
                 interval.depth()
             );
             // Anchor position first
-            let _ = write!(self.buf, "\t{}:{}-{}", self.seq_name, interval.start, interval.end);
+            let _ = write!(
+                self.buf,
+                "\t{}:{}-{}",
+                self.seq_name, interval.start, interval.end
+            );
             // Then other samples (non-anchor) sorted by sample_id
             for &(sid, query_id, q_start, q_end) in &interval.samples {
                 if sid != self.anchor_sample_id {
@@ -1610,9 +1619,27 @@ impl<'a> StreamingDepthEmitter<'a> {
             self.intervals_counter.fetch_add(1, Ordering::Relaxed);
 
             // Periodic flush to bound per-thread buffer memory.
+            //
             // Hand ownership of the buffer to the writer thread (move, not
             // copy) and start a fresh Vec so the worker keeps zero-copy
             // ownership semantics on the next flush.
+            //
+            // Resume-mode atomicity: this mid-chunk flush sends a
+            // `WriterMsg::TsvOnly` whose bytes are written ahead of their
+            // chunk's terminating work-log record. That is safe because the
+            // worker holds a `ChunkGuard` (CheckpointController read lock)
+            // for the full duration of the chunk, and ckpt commit takes the
+            // matching write lock — i.e. the barrier that captures
+            // `(tsv_off, work_off)` only ever fires when no chunk is in
+            // flight, so mid-chunk bytes either get their matching work-log
+            // record into the channel before the barrier (chunk completes)
+            // or get truncated on resume (partial chunk re-runs cleanly,
+            // tracker writes are idempotent).
+            //
+            // The `defer_buf_flush` flag is retained so `flush()` knows
+            // whether the *trailing* chunk-end bytes should be sent here or
+            // taken via `take_buf` and bundled with a work-log record by
+            // the caller.
             if self.buf.len() >= STREAMING_FLUSH_THRESHOLD {
                 if let Some(ref w) = self.writer {
                     let buf = std::mem::take(&mut self.buf);
@@ -1652,8 +1679,16 @@ impl<'a> StreamingDepthEmitter<'a> {
     }
 
     /// Flush everything: pending intervals, remaining buffer, return stats for merging.
+    ///
+    /// When `defer_buf_flush` is set, this only drains pending+seq_intervals
+    /// into `self.buf` and does NOT send the buffer — the worker is expected
+    /// to take it via [`take_buf`] and bundle it with the work-log record.
     fn flush(&mut self) -> io::Result<()> {
         self.flush_seq_intervals();
+        if self.defer_buf_flush {
+            // Caller will pick up `self.buf` itself. Don't auto-send.
+            return Ok(());
+        }
         if !self.buf.is_empty() {
             if let Some(ref w) = self.writer {
                 let buf = std::mem::take(&mut self.buf);
@@ -1663,6 +1698,13 @@ impl<'a> StreamingDepthEmitter<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Take the accumulated TSV byte buffer out of the emitter. Only meaningful
+    /// after `flush()` has drained pending intervals into `self.buf`. Used by
+    /// the resume path to bundle the chunk's TSV with a work-log record.
+    fn take_buf(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.buf)
     }
 
     /// Merge thread-local stats into global accumulators.
@@ -1997,12 +2039,7 @@ impl ConcurrentProcessedTracker {
     /// per-range semantics as the single-shot version. The output is appended
     /// to `out` in input order so callers can map results back to range indices.
     /// End state and per-range bool sequence are identical to N serial calls.
-    fn claim_any_unprocessed_batch(
-        &self,
-        seq_id: u32,
-        ranges: &[(i64, i64)],
-        out: &mut Vec<bool>,
-    ) {
+    fn claim_any_unprocessed_batch(&self, seq_id: u32, ranges: &[(i64, i64)], out: &mut Vec<bool>) {
         out.reserve(ranges.len());
         if ranges.is_empty() {
             return;
@@ -2211,13 +2248,12 @@ fn compute_alignment_degrees(
     min_seq_length: i64,
 ) -> Vec<u16> {
     let alignment_files = impg.alignment_files();
-    let cache_key = compute_degrees_invalidation_hash(alignment_files, seq_included, min_seq_length);
+    let cache_key =
+        compute_degrees_invalidation_hash(alignment_files, seq_included, min_seq_length);
     let cache_path = cache_key.and_then(|h| degrees_cache_path(alignment_files, h));
 
     if let (Some(hash), Some(path)) = (cache_key, cache_path.as_ref()) {
-        if let Some(cached) =
-            try_load_degrees_cache(path, hash, seq_included.len() as u32)
-        {
+        if let Some(cached) = try_load_degrees_cache(path, hash, seq_included.len() as u32) {
             info!(
                 "Loaded alignment degrees from sidecar cache: {} ({} entries)",
                 path.display(),
@@ -2232,8 +2268,7 @@ fn compute_alignment_degrees(
     // - `MultiImpg`: file-parallel override loading each sub-index transiently
     //   and dropping it immediately, bounding peak retained sub-indices to the
     //   rayon worker count.
-    let degrees =
-        impg.compute_sample_degrees(seq_included, compact_lengths.seq_to_sample_slice());
+    let degrees = impg.compute_sample_degrees(seq_included, compact_lengths.seq_to_sample_slice());
 
     // Best-effort sidecar save. Failure is logged but not propagated — the
     // cache is purely an optimisation.
@@ -2471,7 +2506,8 @@ impl BfsChunkState {
             }
             next_ranges.truncate(write + 1);
             for (seq_id, start, end) in next_ranges {
-                self.queue.push_back((seq_id, start, end, current_depth + 1));
+                self.queue
+                    .push_back((seq_id, start, end, current_depth + 1));
             }
         }
     }
@@ -2509,7 +2545,13 @@ fn batch_depth_bfs(
     let mut states: Vec<BfsChunkState> = chunks
         .iter()
         .map(|&(anchor_id, start, end)| {
-            BfsChunkState::new(anchor_id, start, end, seq_len_fn(anchor_id), min_transitive_len)
+            BfsChunkState::new(
+                anchor_id,
+                start,
+                end,
+                seq_len_fn(anchor_id),
+                min_transitive_len,
+            )
         })
         .collect();
 
@@ -2539,7 +2581,11 @@ fn batch_depth_bfs(
 
         // Build query list (one entry per pending BFS item)
         queries.clear();
-        queries.extend(pending.iter().map(|&(_, target_id, start, end, _)| (target_id, start, end)));
+        queries.extend(
+            pending
+                .iter()
+                .map(|&(_, target_id, start, end, _)| (target_id, start, end)),
+        );
 
         // Batch query: each alignment file is loaded at most once to serve
         // all queries that reference it, then immediately freed.
@@ -2768,7 +2814,8 @@ fn depth_transitive_bfs(
             continue;
         }
 
-        let raw_alns = impg.query_raw_overlapping_transient(current_target_id, current_start, current_end);
+        let raw_alns =
+            impg.query_raw_overlapping_transient(current_target_id, current_start, current_end);
 
         // Collect next-depth ranges to sort and merge before adding to queue
         let mut next_ranges: Vec<(u32, i64, i64)> = Vec::new();
@@ -2993,13 +3040,20 @@ fn process_anchor_region_transitive_raw(
         } else {
             let p = project_hop0_coords(
                 seq_anchor_coverage.get(&hit.target_id),
-                hit_t_start, hit_t_end,
-                region_start, region_end,
+                hit_t_start,
+                hit_t_end,
+                region_start,
+                region_end,
             );
             depth_trace!(
                 "HOP2 stage=transitive_raw sample={} q_id={} t_id={} t={}-{} a={}-{}",
-                query_sample_id, hit.query_id, hit.target_id,
-                hit_t_start, hit_t_end, p.0, p.1
+                query_sample_id,
+                hit.query_id,
+                hit.target_id,
+                hit_t_start,
+                hit_t_end,
+                p.0,
+                p.1
             );
             p
         };
@@ -3010,9 +3064,12 @@ fn process_anchor_region_transitive_raw(
         // Always add the hit to the sweep-line for correct depth counting. See
         // process_anchor_region_raw_streaming for the full rationale.
         let (ua_start, ua_end) = inverse_map_query_to_target(
-            full_a_start, full_a_end,
-            query_start, query_end,
-            query_start, query_end,
+            full_a_start,
+            full_a_end,
+            query_start,
+            query_end,
+            query_start,
+            query_end,
             hit.is_reverse,
         );
         if ua_start < ua_end {
@@ -3038,8 +3095,11 @@ fn process_anchor_region_transitive_raw(
         let unique: FxHashSet<u16> = alignments.iter().map(|a| a.sample_id).collect();
         depth_trace!(
             "SWEEP stage=transitive_raw anchor={} region={}-{} alignments={} unique_samples={}",
-            anchor_seq_id, region_start, region_end,
-            alignments.len(), unique.len()
+            anchor_seq_id,
+            region_start,
+            region_end,
+            alignments.len(),
+            unique.len()
         );
     }
     // Sweep-line to compute depth intervals
@@ -3231,8 +3291,7 @@ fn process_anchor_region_raw(
     let mut discovered_regions: Vec<(u32, i64, i64)> = Vec::with_capacity(raw_intervals.len() + 1);
     discovered_regions.push((anchor_seq_id, region_start, region_end));
 
-    let mut alignments: Vec<CompactAlignmentInfo> =
-        Vec::with_capacity(raw_intervals.len() + 1);
+    let mut alignments: Vec<CompactAlignmentInfo> = Vec::with_capacity(raw_intervals.len() + 1);
 
     // Self alignment (anchor covers itself)
     alignments.push(CompactAlignmentInfo::new(
@@ -3504,13 +3563,20 @@ fn process_anchor_region_transitive_cigar(
         } else {
             let p = project_hop0_coords(
                 seq_anchor_coverage.get(&target_interval.metadata),
-                hit_t_start, hit_t_end,
-                region_start, region_end,
+                hit_t_start,
+                hit_t_end,
+                region_start,
+                region_end,
             );
             depth_trace!(
                 "HOP2 stage=transitive_cigar sample={} q_id={} t_id={} t={}-{} a={}-{}",
-                query_sample_id, query_id, target_interval.metadata,
-                hit_t_start, hit_t_end, p.0, p.1
+                query_sample_id,
+                query_id,
+                target_interval.metadata,
+                hit_t_start,
+                hit_t_end,
+                p.0,
+                p.1
             );
             p
         };
@@ -3521,9 +3587,12 @@ fn process_anchor_region_transitive_cigar(
         // Always add the hit to the sweep-line for correct depth counting. See
         // process_anchor_region_raw_streaming for the full rationale.
         let (ua_start, ua_end) = inverse_map_query_to_target(
-            full_a_start, full_a_end,
-            query_start, query_end,
-            query_start, query_end,
+            full_a_start,
+            full_a_end,
+            query_start,
+            query_end,
+            query_start,
+            query_end,
             is_reverse,
         );
         if ua_start < ua_end {
@@ -3549,8 +3618,7 @@ fn process_anchor_region_transitive_cigar(
     // gaps at chunk boundaries due to indels. Raw extents ensure the full alignment
     // coverage is marked as processed, preventing Phase 2 from re-processing these
     // regions and producing duplicate output (e.g., CHM13 appearing in Phase 2 rows).
-    let raw_hop0 =
-        impg.query_raw_overlapping_transient(anchor_seq_id, region_start, region_end);
+    let raw_hop0 = impg.query_raw_overlapping_transient(anchor_seq_id, region_start, region_end);
     for aln in &raw_hop0 {
         if min_seq_length > 0
             && !seq_included
@@ -3577,8 +3645,11 @@ fn process_anchor_region_transitive_cigar(
         let unique: FxHashSet<u16> = alignments.iter().map(|a| a.sample_id).collect();
         depth_trace!(
             "SWEEP stage=transitive_cigar anchor={} region={}-{} alignments={} unique_samples={}",
-            anchor_seq_id, region_start, region_end,
-            alignments.len(), unique.len()
+            anchor_seq_id,
+            region_start,
+            region_end,
+            alignments.len(),
+            unique.len()
         );
     }
     // Sweep-line to compute depth intervals
@@ -3896,8 +3967,7 @@ fn process_anchor_region_raw_streaming(
     let mut discovered_regions: Vec<(u32, i64, i64)> = Vec::with_capacity(raw_intervals.len() + 1);
     discovered_regions.push((anchor_seq_id, region_start, region_end));
 
-    let mut alignments: Vec<CompactAlignmentInfo> =
-        Vec::with_capacity(raw_intervals.len() + 1);
+    let mut alignments: Vec<CompactAlignmentInfo> = Vec::with_capacity(raw_intervals.len() + 1);
     alignments.push(CompactAlignmentInfo::new(
         anchor_sample_id,
         anchor_seq_id,
@@ -4216,7 +4286,10 @@ impl DepthWriter {
                         WriterMsg::TsvOnly(buf) => {
                             tsv.write_all(&buf)?;
                         }
-                        WriterMsg::Chunk { tsv: tbuf, work: wbuf } => {
+                        WriterMsg::Chunk {
+                            tsv: tbuf,
+                            work: wbuf,
+                        } => {
                             // TSV first, then work-log. Both are append-only;
                             // ordering between the two files doesn't matter for
                             // correctness, but doing them back-to-back keeps
@@ -4289,14 +4362,12 @@ impl DepthWriter {
         if tsv.is_empty() && work.is_empty() {
             return Ok(());
         }
-        self.tx
-            .send(WriterMsg::Chunk { tsv, work })
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    format!("depth writer channel closed: {}", e),
-                )
-            })
+        self.tx.send(WriterMsg::Chunk { tsv, work }).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("depth writer channel closed: {}", e),
+            )
+        })
     }
 
     /// Issue a barrier and wait for the writer thread to flush + `sync_data`
@@ -4339,13 +4410,48 @@ impl DepthWriter {
 /// to noise and (b) bounded re-work after a crash.
 const CHECKPOINT_CHUNK_INTERVAL: usize = 64;
 
-/// Drives periodic ckpt commits without requiring a dedicated thread.
+/// Drives periodic ckpt commits and **chunk-freeze barriers** without
+/// requiring a dedicated thread.
 ///
 /// One worker out of the rayon par_iter wins the `try_lock` whenever the
 /// shared chunk counter rolls past a multiple of `CHECKPOINT_CHUNK_INTERVAL`,
 /// issues a writer barrier, captures the post-flush byte offsets and current
 /// counter snapshot, and persists a fresh ckpt via `save_atomic`. Other
 /// workers continue pumping chunk bundles into the writer channel.
+///
+/// **Atomicity model — chunk-freeze RwLock**:
+///
+/// `chunk_lock: RwLock<()>` guards the in-flight set of chunks. Workers
+/// acquire a *read* guard (`begin_chunk`) before they start producing
+/// mid-chunk TSV bytes via the streaming emitter, and drop it only after
+/// they have sent the chunk's terminating `send_chunk_bundle(remaining_buf,
+/// work_record)` so the work-log record is queued together with the trailing
+/// TSV bytes. The commit path takes a *write* guard before issuing the
+/// `WriterMsg::Barrier` that captures `(tsv_off, work_off)`.
+///
+/// `parking_lot::RwLock` is writer-priority: once a write request is
+/// pending, no new readers may acquire — so the commit waits for currently
+/// in-flight chunks to call `send_chunk_bundle` and drop their guards, but
+/// new chunks can't sneak past in the gap before the writer guard is held.
+///
+/// **Why this is enough**: when the writer guard is acquired,
+///   - every previously in-flight chunk has already sent its full
+///     `WriterMsg::Chunk { tsv: trailing, work: record }` into the bounded
+///     channel (the `send_chunk_bundle` call is what drops the read guard).
+///   - the writer thread processes channel messages in order; the
+///     subsequent `WriterMsg::Barrier` will only fire after every queued
+///     `Chunk`/`TsvOnly` has been written to the underlying file.
+///   - therefore the `(tsv_off, work_off)` returned by the barrier reflects
+///     a state where every TSV byte already on disk has a matching
+///     work-log record, i.e. the file is **chunk-aligned**.
+///
+/// On crash, `truncate_to(tsv_off, work_off)` strictly removes any partial
+/// chunk's bytes (because the post-commit channel content was either
+/// queued past the barrier or had no time to be flushed via `sync_data`),
+/// and the work-log replay rebuilds `tracker` / `global_used` from records
+/// whose corresponding TSV is now on disk. Re-running rejected chunks is
+/// idempotent (`mark_processed` / `mark_processed_batch` are no-ops on
+/// already-covered ranges).
 ///
 /// When `state` is `None` (resume disabled or a stats-mode run) every method
 /// is a no-op so call sites can stay branchless.
@@ -4359,6 +4465,11 @@ struct CheckpointState<'a> {
     interval: usize,
     counter: AtomicUsize,
     commit_lock: Mutex<()>,
+    /// Read = a worker has a chunk in flight (mid-chunk TSV bytes may be in
+    /// the writer channel without their work-log record yet).
+    /// Write = ckpt commit holds the file-level barrier; no chunk may be
+    /// in flight while the commit captures `(tsv_off, work_off)`.
+    chunk_lock: RwLock<()>,
     row_counter: &'a AtomicUsize,
     intervals_counter: &'a AtomicUsize,
     writer: &'a DepthWriter,
@@ -4391,6 +4502,7 @@ impl<'a> CheckpointController<'a> {
                 interval,
                 counter: AtomicUsize::new(0),
                 commit_lock: Mutex::new(()),
+                chunk_lock: RwLock::new(()),
                 row_counter,
                 intervals_counter,
                 writer,
@@ -4400,6 +4512,29 @@ impl<'a> CheckpointController<'a> {
 
     fn enabled(&self) -> bool {
         self.state.is_some()
+    }
+
+    fn checkpoint_batch_size(&self, default_size: usize) -> usize {
+        self.state
+            .as_ref()
+            .map(|s| s.interval.max(1))
+            .unwrap_or(default_size.max(1))
+    }
+
+    /// Acquire the chunk-in-flight read guard. Workers MUST hold this
+    /// guard for the full duration during which the streaming emitter may
+    /// emit mid-chunk TSV bytes (i.e. from before the first `emit` call
+    /// through the chunk-end `send_chunk_bundle`). The returned guard has
+    /// `'static` lifetime via the controller's borrow.
+    ///
+    /// When the controller is `disabled()`, returns a no-op guard.
+    fn begin_chunk(&self) -> ChunkGuard<'_> {
+        match self.state.as_ref() {
+            Some(s) => ChunkGuard {
+                _read: Some(s.chunk_lock.read()),
+            },
+            None => ChunkGuard { _read: None },
+        }
     }
 
     /// Called by every worker after each completed chunk. Increments the
@@ -4430,6 +4565,13 @@ impl<'a> CheckpointController<'a> {
     }
 
     fn commit_inner(&self, s: &CheckpointState<'_>) -> io::Result<()> {
+        // Chunk-freeze barrier: take the writer guard, blocking until every
+        // currently in-flight chunk has executed `send_chunk_bundle` (which
+        // is what drops their read guards). New workers can't acquire a
+        // read guard while this write request is pending — parking_lot
+        // RwLock is writer-priority — so by the time we hold the write
+        // guard, the channel contains only chunk-aligned messages.
+        let _freeze = s.chunk_lock.write();
         let (tsv_off, work_off) = s.writer.barrier_and_offsets()?;
         let ck = DepthCheckpoint {
             schema_version: crate::commands::depth_checkpoint::CKPT_SCHEMA_VERSION,
@@ -4442,10 +4584,7 @@ impl<'a> CheckpointController<'a> {
         ck.save_atomic(s.prefix)?;
         debug!(
             "ckpt committed: tsv={} work={} row={} intervals={}",
-            ck.tsv_byte_offset,
-            ck.work_byte_offset,
-            ck.row_counter,
-            ck.intervals_counter,
+            ck.tsv_byte_offset, ck.work_byte_offset, ck.row_counter, ck.intervals_counter,
         );
         // Test hook: when set, abort the process immediately after a successful
         // commit. The next run with `--resume` should pick up exactly here.
@@ -4463,6 +4602,15 @@ impl<'a> CheckpointController<'a> {
         }
         Ok(())
     }
+}
+
+/// RAII guard returned by `CheckpointController::begin_chunk`. Its lifetime
+/// matches the duration of "chunk in flight" — drop only after the chunk's
+/// terminating `send_chunk_bundle` has been queued to the writer.
+///
+/// When the controller is disabled (resume off), this guard holds nothing.
+struct ChunkGuard<'a> {
+    _read: Option<parking_lot::RwLockReadGuard<'a, ()>>,
 }
 
 /// Reference-free global depth computation.
@@ -4518,16 +4666,9 @@ pub fn compute_depth_global(
     // assertions below are a defence-in-depth check.
     // ------------------------------------------------------------------
     if resume {
-        if !config.use_cigar_bfs {
-            return Err(io::Error::other(
-                "internal: --resume reached compute_depth_global without --use-BFS",
-            ));
-        }
-        if !(config.transitive || config.transitive_dfs) {
-            return Err(io::Error::other(
-                "internal: --resume requires transitive depth (-x or --transitive-dfs)",
-            ));
-        }
+        // Supported: non-transitive (streaming emitter + chunk-freeze barrier
+        // for atomicity), raw transitive BFS (per-chunk TSV/work-log bundles),
+        // and transitive CIGAR-BFS (per-chunk TSV/work-log bundles).
         if stats_mode || stats_combined {
             return Err(io::Error::other(
                 "internal: --resume is not yet supported with --stats",
@@ -4585,10 +4726,8 @@ pub fn compute_depth_global(
                 // Truncate live files to ckpt offsets. After this point any
                 // post-commit dirty bytes are physically gone; the writer
                 // thread (when we start it) will append cleanly.
-                let tsv_path: std::path::PathBuf =
-                    format!("{}{}", prefix, TSV_SUFFIX).into();
-                let work_path: std::path::PathBuf =
-                    format!("{}{}", prefix, WORKLOG_SUFFIX).into();
+                let tsv_path: std::path::PathBuf = format!("{}{}", prefix, TSV_SUFFIX).into();
+                let work_path: std::path::PathBuf = format!("{}{}", prefix, WORKLOG_SUFFIX).into();
                 truncate_to(&tsv_path, ck.tsv_byte_offset)?;
                 truncate_to(&work_path, ck.work_byte_offset)?;
                 Some(ResumeState {
@@ -4615,7 +4754,10 @@ pub fn compute_depth_global(
         info!("Computing depth (global mode, pre-scan + sweep-line)");
     }
     if min_interval_len > 0 {
-        info!("Min interval length: {} bp (shorter intervals absorbed into neighbors)", min_interval_len);
+        info!(
+            "Min interval length: {} bp (shorter intervals absorbed into neighbors)",
+            min_interval_len
+        );
     }
 
     // Build compact data structures
@@ -4695,8 +4837,7 @@ pub fn compute_depth_global(
     // total number of per-file indices. The old tree-cache toggle is no longer
     // needed for the pre-scan — leave the main-phase cache setting untouched.
     info!("Pre-scanning alignment degrees...");
-    let degrees =
-        compute_alignment_degrees(impg, &compact_lengths, &seq_included, min_seq_length);
+    let degrees = compute_alignment_degrees(impg, &compact_lengths, &seq_included, min_seq_length);
     // Pre-scan uses load_sub_index_uncached (does NOT populate
     // transient_header_cache), so the cache should already be empty here. Clear
     // both caches defensively in case a future code change reintroduces caching
@@ -4780,8 +4921,7 @@ pub fn compute_depth_global(
     //
     // Replay also populates `completed_chunks`, the per-chunk_id skip set
     // consulted by Phase 1 / Phase 2 workers.
-    let mut completed_chunks: std::collections::HashSet<u64> =
-        std::collections::HashSet::new();
+    let mut completed_chunks: std::collections::HashSet<u64> = std::collections::HashSet::new();
     if let Some(rs) = resume_state.as_ref() {
         let prefix = output_prefix.unwrap();
         let work_path: std::path::PathBuf = format!("{}{}", prefix, WORKLOG_SUFFIX).into();
@@ -5077,109 +5217,159 @@ pub fn compute_depth_global(
                 //     record are bundled atomically (`send_chunk_bundle`)
                 //     so the writer thread advances both files in lockstep
                 //     and the next ckpt commit captures consistent offsets.
-                phase1_chunks
-                    .par_iter()
-                    .enumerate()
-                    .try_for_each(
-                        |(idx, &(seq_id, sample_id, chunk_start, chunk_end))| -> io::Result<()> {
-                            let chunk_id = encode_chunk_id_phase1(idx);
-                            if work_log_active && completed_chunks.contains(&chunk_id) {
-                                let count = phase1_count.fetch_add(1, Ordering::Relaxed) + 1;
-                                pb_phase1.set_position(count as u64);
-                                return Ok(());
-                            }
-                            let result = process_anchor_region(
-                                impg,
-                                config,
-                                &compact_lengths,
-                                num_samples,
-                                seq_id,
-                                sample_id,
-                                chunk_start,
-                                chunk_end,
-                                &seq_included,
-                                min_seq_length,
-                                &global_used,
-                            );
-                            tracker.mark_processed_batch(&result.discovered_regions);
-                            let mut tsv_buf: Vec<u8> = Vec::new();
-                            // Capture discovered_regions before write_results
-                            // moves the result out — needed for the work-log
-                            // record so the next resume can rebuild the
-                            // tracker state without recomputing the BFS.
-                            let work_buf = if work_log_active {
-                                encode_work_record(chunk_id, &result.discovered_regions)
-                            } else {
-                                Vec::new()
-                            };
-                            write_results(vec![result], &mut tsv_buf)?;
-                            if let Some(ref w) = writer {
-                                if work_log_active {
-                                    w.send_chunk_bundle(
-                                        std::mem::take(&mut tsv_buf),
-                                        work_buf,
-                                    )?;
-                                } else if !tsv_buf.is_empty() {
-                                    w.send(std::mem::take(&mut tsv_buf))?;
-                                }
-                            }
-                            checkpoint_ctrl.note_chunk_done()?;
+                phase1_chunks.par_iter().enumerate().try_for_each(
+                    |(idx, &(seq_id, sample_id, chunk_start, chunk_end))| -> io::Result<()> {
+                        let chunk_id = encode_chunk_id_phase1(idx);
+                        if work_log_active && completed_chunks.contains(&chunk_id) {
                             let count = phase1_count.fetch_add(1, Ordering::Relaxed) + 1;
                             pb_phase1.set_position(count as u64);
-                            Ok(())
-                        },
-                    )?;
+                            return Ok(());
+                        }
+                        // Hold the chunk-in-flight read guard for the full
+                        // duration during which TSV bytes for this chunk
+                        // may end up in the writer channel. Released
+                        // explicitly before `note_chunk_done` so a commit
+                        // triggered by this very chunk's completion can
+                        // acquire the write guard immediately.
+                        let chunk_guard = checkpoint_ctrl.begin_chunk();
+                        let result = process_anchor_region(
+                            impg,
+                            config,
+                            &compact_lengths,
+                            num_samples,
+                            seq_id,
+                            sample_id,
+                            chunk_start,
+                            chunk_end,
+                            &seq_included,
+                            min_seq_length,
+                            &global_used,
+                        );
+                        tracker.mark_processed_batch(&result.discovered_regions);
+                        let mut tsv_buf: Vec<u8> = Vec::new();
+                        // Capture discovered_regions before write_results
+                        // moves the result out — needed for the work-log
+                        // record so the next resume can rebuild the
+                        // tracker state without recomputing the BFS.
+                        let work_buf = if work_log_active {
+                            encode_work_record(chunk_id, &result.discovered_regions)
+                        } else {
+                            Vec::new()
+                        };
+                        write_results(vec![result], &mut tsv_buf)?;
+                        if let Some(ref w) = writer {
+                            if work_log_active {
+                                w.send_chunk_bundle(std::mem::take(&mut tsv_buf), work_buf)?;
+                            } else if !tsv_buf.is_empty() {
+                                w.send(std::mem::take(&mut tsv_buf))?;
+                            }
+                        }
+                        drop(chunk_guard);
+                        checkpoint_ctrl.note_chunk_done()?;
+                        let count = phase1_count.fetch_add(1, Ordering::Relaxed) + 1;
+                        pb_phase1.set_position(count as u64);
+                        Ok(())
+                    },
+                )?;
             } else {
                 // Raw BFS path (default): batch BFS — sequential file loading,
                 // then parallel sweep-line.
+                const PHASE1_RAW_TRANS_BATCH_SIZE: usize = 8_192;
+                let phase1_batch_size =
+                    checkpoint_ctrl.checkpoint_batch_size(PHASE1_RAW_TRANS_BATCH_SIZE);
 
-                // Phase A: batch BFS (single-threaded file loading, all chunks coordinated)
-                let chunk_coords: Vec<(u32, i64, i64)> = phase1_chunks
-                    .iter()
-                    .map(|&(seq_id, _, start, end)| (seq_id, start, end))
-                    .collect();
-
-                info!("Phase 1: running batch BFS across {} chunks...", num_chunks);
-                let all_hits = batch_depth_bfs(
-                    impg,
-                    &chunk_coords,
-                    config.max_depth,
-                    config.min_transitive_len,
-                    config.min_distance_between_ranges,
-                );
-                info!("Phase 1: batch BFS complete, starting parallel sweep-line...");
-
-                // Phase B: parallel sweep-line (CPU-only, no sub-index loading)
-                phase1_chunks
-                    .par_iter()
-                    .zip(all_hits.into_par_iter())
-                    .try_for_each(
-                        |(&(seq_id, sample_id, chunk_start, chunk_end), hits)| -> io::Result<()> {
-                            let result = process_anchor_region_transitive_raw_with_hits(
-                                hits,
-                                &compact_lengths,
-                                num_samples,
-                                seq_id,
-                                sample_id,
-                                chunk_start,
-                                chunk_end,
-                                &seq_included,
-                                min_seq_length,
-                                &global_used,
-                            );
-                            tracker.mark_processed_batch(&result.discovered_regions);
-                            let mut buf: Vec<u8> = Vec::new();
-                            write_results(vec![result], &mut buf)?;
-                            if !buf.is_empty() {
-                                if let Some(ref w) = writer {
-                                    w.send(std::mem::take(&mut buf))?;
-                                }
+                for (batch_idx, batch) in phase1_chunks.chunks(phase1_batch_size).enumerate() {
+                    let base_idx = batch_idx * phase1_batch_size;
+                    let live_batch: Vec<(usize, u32, u16, i64, i64)> = batch
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(local_idx, &(seq_id, sample_id, start, end))| {
+                            let idx = base_idx + local_idx;
+                            let chunk_id = encode_chunk_id_phase1(idx);
+                            if work_log_active && completed_chunks.contains(&chunk_id) {
+                                None
+                            } else {
+                                Some((idx, seq_id, sample_id, start, end))
                             }
-                            let count = phase1_count.fetch_add(1, Ordering::Relaxed) + 1;
-                            pb_phase1.set_position(count as u64);
-                            Ok(())
-                        },
-                    )?;
+                        })
+                        .collect();
+
+                    let skipped = batch.len() - live_batch.len();
+                    if skipped > 0 {
+                        let count = phase1_count.fetch_add(skipped, Ordering::Relaxed) + skipped;
+                        pb_phase1.set_position(count as u64);
+                    }
+                    if live_batch.is_empty() {
+                        continue;
+                    }
+
+                    // Phase A: batch BFS for one checkpoint-sized slice when
+                    // resume is active. This is the key to visible incremental
+                    // output: the old single all-Phase-1 batch could spend a
+                    // long time in BFS before the first TSV/work-log byte was
+                    // ever sent to the writer.
+                    let chunk_coords: Vec<(u32, i64, i64)> = live_batch
+                        .iter()
+                        .map(|&(_, seq_id, _, start, end)| (seq_id, start, end))
+                        .collect();
+
+                    info!(
+                        "Phase 1: running batch BFS across {} chunks...",
+                        chunk_coords.len()
+                    );
+                    let all_hits = batch_depth_bfs(
+                        impg,
+                        &chunk_coords,
+                        config.max_depth,
+                        config.min_transitive_len,
+                        config.min_distance_between_ranges,
+                    );
+                    info!("Phase 1: batch BFS complete, starting parallel sweep-line...");
+
+                    // Phase B: parallel sweep-line (CPU-only, no sub-index loading)
+                    live_batch
+                        .par_iter()
+                        .zip(all_hits.into_par_iter())
+                        .try_for_each(
+                            |(&(idx, seq_id, sample_id, chunk_start, chunk_end), hits)| -> io::Result<()> {
+                                let chunk_id = encode_chunk_id_phase1(idx);
+                                let result = process_anchor_region_transitive_raw_with_hits(
+                                    hits,
+                                    &compact_lengths,
+                                    num_samples,
+                                    seq_id,
+                                    sample_id,
+                                    chunk_start,
+                                    chunk_end,
+                                    &seq_included,
+                                    min_seq_length,
+                                    &global_used,
+                                );
+                                tracker.mark_processed_batch(&result.discovered_regions);
+
+                                let work_buf = if work_log_active {
+                                    encode_work_record(chunk_id, &result.discovered_regions)
+                                } else {
+                                    Vec::new()
+                                };
+                                let mut buf: Vec<u8> = Vec::new();
+                                write_results(vec![result], &mut buf)?;
+                                if let Some(ref w) = writer {
+                                    if work_log_active {
+                                        w.send_chunk_bundle(std::mem::take(&mut buf), work_buf)?;
+                                    } else if !buf.is_empty() {
+                                        w.send(std::mem::take(&mut buf))?;
+                                    }
+                                }
+                                if work_log_active {
+                                    checkpoint_ctrl.note_chunk_done()?;
+                                }
+                                let count = phase1_count.fetch_add(1, Ordering::Relaxed) + 1;
+                                pb_phase1.set_position(count as u64);
+                                Ok(())
+                            },
+                        )?;
+                }
             }
 
             impg.clear_sub_index_cache();
@@ -5247,18 +5437,35 @@ pub fn compute_depth_global(
 
             let phase1_count = AtomicUsize::new(0);
 
-            phase1_chunks
-                .par_iter()
-                .try_for_each(|&(seq_id, chunk_start, chunk_end)| -> io::Result<()> {
+            phase1_chunks.par_iter().enumerate().try_for_each(
+                |(idx, &(seq_id, chunk_start, chunk_end))| -> io::Result<()> {
+                    // Resume skip: when checkpoint is active, every chunk has
+                    // a deterministic id from its position in the sorted Vec.
+                    // Chunks already replayed from the work-log have already
+                    // been marked in `tracker` / `global_used`, so the BFS /
+                    // sweep would just produce identical TSV bytes. Short-
+                    // circuiting here makes resume strictly faster.
+                    let chunk_id = encode_chunk_id_phase1(idx);
+                    if work_log_active && completed_chunks.contains(&chunk_id) {
+                        let count = phase1_count.fetch_add(1, Ordering::Relaxed) + 1;
+                        pb_phase1.set_position(count as u64);
+                        return Ok(());
+                    }
+                    // Hold the chunk-in-flight read guard for the entire
+                    // chunk lifetime: from before any `emitter.emit(...)`
+                    // (which can produce mid-chunk TSV bytes via the
+                    // STREAMING_FLUSH_THRESHOLD path) through the trailing
+                    // `send_chunk_bundle` call. Released explicitly before
+                    // `note_chunk_done` so the write-side commit barrier
+                    // doesn't deadlock against the very chunk that just
+                    // tripped the commit interval.
+                    let chunk_guard = checkpoint_ctrl.begin_chunk();
                     let sample_id = compact_lengths.get_sample_id(seq_id);
 
                     // Range query bounded by the chunk: peak per-task memory is
                     // O(chunk_alignments) instead of O(chromosome_alignments).
-                    let mut raw_alns = impg.query_raw_overlapping_transient(
-                        seq_id,
-                        chunk_start,
-                        chunk_end,
-                    );
+                    let mut raw_alns =
+                        impg.query_raw_overlapping_transient(seq_id, chunk_start, chunk_end);
                     if min_seq_length > 0 {
                         raw_alns.retain(|aln| {
                             seq_included
@@ -5306,6 +5513,13 @@ pub fn compute_depth_global(
                         } else {
                             None
                         },
+                        // `defer_buf_flush` only governs the *trailing* buffer
+                        // at chunk-end (so the worker can `take_buf` and bundle
+                        // it with a work-log record). Mid-chunk 4 MB auto-
+                        // flushes are NOT gated by this flag any more — they
+                        // fire as `WriterMsg::TsvOnly` regardless, kept atomic
+                        // by the chunk-freeze barrier in CheckpointController.
+                        defer_buf_flush: work_log_active,
                     };
 
                     let discovered = process_anchor_region_raw_streaming(
@@ -5319,15 +5533,30 @@ pub fn compute_depth_global(
                         &global_used,
                         &mut |interval| emitter.emit(interval),
                     );
+                    // flush() drains pending+seq_intervals into emitter.buf.
+                    // When defer_buf_flush is set it stops there; otherwise it
+                    // forwards the buffer to the writer (legacy behaviour).
                     emitter.flush()?;
+                    if work_log_active {
+                        let tsv_buf = emitter.take_buf();
+                        let work_buf = encode_work_record(chunk_id, &discovered);
+                        if let Some(ref w) = writer {
+                            w.send_chunk_bundle(tsv_buf, work_buf)?;
+                        }
+                    }
                     tracker.mark_processed_batch(&discovered);
                     emitter.merge_stats_into(&stats_accumulator, &stats_combined_acc);
+                    drop(chunk_guard);
+                    if work_log_active {
+                        checkpoint_ctrl.note_chunk_done()?;
+                    }
 
                     let count = phase1_count.fetch_add(1, Ordering::Relaxed) + 1;
                     pb_phase1.set_position(count as u64);
 
                     Ok(())
-                })?;
+                },
+            )?;
 
             // Same rationale as the transitive branch above: drop both the
             // sub-index BFS cache and the transient per-file header cache
@@ -5426,8 +5655,7 @@ pub fn compute_depth_global(
             }
         }
 
-        let mut phase2_chunks: Vec<(u32, i64, i64)> =
-            Vec::with_capacity(phase2_chunk_count_pre);
+        let mut phase2_chunks: Vec<(u32, i64, i64)> = Vec::with_capacity(phase2_chunk_count_pre);
         for &seq_id in &phase2_seqs {
             let seq_len = compact_lengths.get_length(seq_id);
             if seq_len <= 0 {
@@ -5486,21 +5714,54 @@ pub fn compute_depth_global(
         // loads but raise this peak; smaller batches lose amortization. 65k is a
         // pragmatic operating point for HPRC/VGP scale.
         const PHASE2_BATCH_SIZE: usize = 65_536;
+        let phase2_batch_size = checkpoint_ctrl.checkpoint_batch_size(PHASE2_BATCH_SIZE);
 
-        for batch in phase2_chunks.chunks(PHASE2_BATCH_SIZE) {
+        for batch in phase2_chunks.chunks(phase2_batch_size) {
+            // Resume filter: drop chunks whose chunk_id is already in
+            // `completed_chunks` BEFORE running the heavy batch query, so
+            // partial-Phase-2 resumes don't pay for sub-index loads on work
+            // that's already on disk. After Phase 1's replay, `tracker.get_
+            // unprocessed` should already exclude these — this is defensive
+            // against any chunk that slipped through (e.g., a chunk whose
+            // discovered_regions only covered query-side ranges and not the
+            // full anchor extent).
+            let live_batch: Vec<(u32, i64, i64)> = if work_log_active {
+                batch
+                    .iter()
+                    .copied()
+                    .filter(|&(seq_id, chunk_start, _)| {
+                        !completed_chunks.contains(&encode_chunk_id_phase2(seq_id, chunk_start))
+                    })
+                    .collect()
+            } else {
+                batch.to_vec()
+            };
+            let skipped = batch.len() - live_batch.len();
+            if skipped > 0 {
+                phase2_chunk_count.fetch_add(skipped, Ordering::Relaxed);
+                pb_depth.set_position(phase2_chunk_count.load(Ordering::Relaxed) as u64);
+            }
+            if live_batch.is_empty() {
+                continue;
+            }
+
             // Phase A: file-grouped batch query. `batch_query_raw_overlapping`
             // is internally rayon-parallel across files; each file is loaded
             // transiently, answers all of its queries, then is freed.
-            let queries: Vec<(u32, i64, i64)> =
-                batch.iter().map(|&(s, cs, ce)| (s, cs, ce)).collect();
+            let queries: Vec<(u32, i64, i64)> = live_batch.clone();
             let all_alns = impg.batch_query_raw_overlapping(&queries);
 
             // Phase B: parallel sweep + emit.
-            batch
+            live_batch
                 .par_iter()
                 .zip(all_alns.into_par_iter())
                 .try_for_each(
                     |(&(seq_id, chunk_start, chunk_end), mut raw_alns)| -> io::Result<()> {
+                        // Hold the chunk-in-flight read guard for the duration
+                        // during which mid-chunk TSV bytes may enter the writer
+                        // channel; released before `note_chunk_done` so a
+                        // commit-side write barrier can proceed.
+                        let chunk_guard = checkpoint_ctrl.begin_chunk();
                         let sample_id = compact_lengths.get_sample_id(seq_id);
 
                         if min_seq_length > 0 {
@@ -5550,6 +5811,14 @@ pub fn compute_depth_global(
                             } else {
                                 None
                             },
+                            // `defer_buf_flush` only governs whether the
+                            // chunk's *trailing* (post-final-emit) bytes are
+                            // flushed by `emitter.flush()` itself or held for
+                            // `take_buf` + `send_chunk_bundle` below. Mid-
+                            // chunk 4 MB auto-flushes happen unconditionally
+                            // and rely on the chunk-freeze barrier in
+                            // CheckpointController for resume atomicity.
+                            defer_buf_flush: work_log_active,
                         };
 
                         let discovered = process_anchor_region_raw_streaming(
@@ -5564,8 +5833,20 @@ pub fn compute_depth_global(
                             &mut |interval| emitter.emit(interval),
                         );
                         emitter.flush()?;
+                        if work_log_active {
+                            let chunk_id = encode_chunk_id_phase2(seq_id, chunk_start);
+                            let tsv_buf = emitter.take_buf();
+                            let work_buf = encode_work_record(chunk_id, &discovered);
+                            if let Some(ref w) = writer {
+                                w.send_chunk_bundle(tsv_buf, work_buf)?;
+                            }
+                        }
                         tracker.mark_processed_batch(&discovered);
                         emitter.merge_stats_into(&stats_accumulator, &stats_combined_acc);
+                        drop(chunk_guard);
+                        if work_log_active {
+                            checkpoint_ctrl.note_chunk_done()?;
+                        }
 
                         let count = phase2_chunk_count.fetch_add(1, Ordering::Relaxed) + 1;
                         pb_depth.set_position(count as u64);
@@ -5601,25 +5882,24 @@ pub fn compute_depth_global(
 
         // Helper: send one chunk's TSV bytes + work-log record (when
         // checkpointing is active) and tick the checkpoint controller.
-        let emit_chunk =
-            |chunk_id: u64, result: AnchorRegionResult| -> io::Result<()> {
-                let mut tsv_buf: Vec<u8> = Vec::new();
-                let work_buf = if work_log_active {
-                    encode_work_record(chunk_id, &result.discovered_regions)
-                } else {
-                    Vec::new()
-                };
-                write_results(vec![result], &mut tsv_buf)?;
-                if let Some(ref w) = writer {
-                    if work_log_active {
-                        w.send_chunk_bundle(std::mem::take(&mut tsv_buf), work_buf)?;
-                    } else if !tsv_buf.is_empty() {
-                        w.send(std::mem::take(&mut tsv_buf))?;
-                    }
-                }
-                checkpoint_ctrl.note_chunk_done()?;
-                Ok(())
+        let emit_chunk = |chunk_id: u64, result: AnchorRegionResult| -> io::Result<()> {
+            let mut tsv_buf: Vec<u8> = Vec::new();
+            let work_buf = if work_log_active {
+                encode_work_record(chunk_id, &result.discovered_regions)
+            } else {
+                Vec::new()
             };
+            write_results(vec![result], &mut tsv_buf)?;
+            if let Some(ref w) = writer {
+                if work_log_active {
+                    w.send_chunk_bundle(std::mem::take(&mut tsv_buf), work_buf)?;
+                } else if !tsv_buf.is_empty() {
+                    w.send(std::mem::take(&mut tsv_buf))?;
+                }
+            }
+            checkpoint_ctrl.note_chunk_done()?;
+            Ok(())
+        };
 
         phase2_seqs
             .par_iter()
@@ -5651,11 +5931,8 @@ pub fn compute_depth_global(
                         // Single-chunk raw fallback: short gaps below the
                         // BFS gate would otherwise be dropped entirely.
                         let chunk_id = encode_chunk_id_phase2(seq_id, region_start);
-                        let mut raw_alns = impg.query_raw_overlapping_transient(
-                            seq_id,
-                            region_start,
-                            region_end,
-                        );
+                        let mut raw_alns =
+                            impg.query_raw_overlapping_transient(seq_id, region_start, region_end);
                         if min_seq_length > 0 {
                             raw_alns.retain(|aln| {
                                 seq_included
@@ -5766,6 +6043,10 @@ pub fn compute_depth_global(
         // size (matches the non-transitive path above).
         const PHASE2_NONTRANS_BATCH_SIZE: usize = 65_536;
         const PHASE2_TRANS_BATCH_SIZE: usize = 8_192;
+        let phase2_nontrans_batch_size =
+            checkpoint_ctrl.checkpoint_batch_size(PHASE2_NONTRANS_BATCH_SIZE);
+        let phase2_trans_batch_size =
+            checkpoint_ctrl.checkpoint_batch_size(PHASE2_TRANS_BATCH_SIZE);
 
         let mut transitive_chunks: Vec<(u32, i64, i64)> = Vec::new();
         let mut nontrans_chunks: Vec<(u32, i64, i64)> = Vec::new();
@@ -5817,16 +6098,37 @@ pub fn compute_depth_global(
 
         // Pass A: non-transitive fallback chunks (sub-min_transitive_len gaps).
         // Same batched query pattern as the non-transitive Phase 2 branch.
-        for batch in nontrans_chunks.chunks(PHASE2_NONTRANS_BATCH_SIZE) {
+        for batch in nontrans_chunks.chunks(phase2_nontrans_batch_size) {
+            let live_batch: Vec<(u32, i64, i64)> = if work_log_active {
+                batch
+                    .iter()
+                    .copied()
+                    .filter(|&(seq_id, region_start, _)| {
+                        !completed_chunks.contains(&encode_chunk_id_phase2(seq_id, region_start))
+                    })
+                    .collect()
+            } else {
+                batch.to_vec()
+            };
+            let skipped = batch.len() - live_batch.len();
+            if skipped > 0 {
+                let count = phase2_chunk_count.fetch_add(skipped, Ordering::Relaxed) + skipped;
+                pb_depth.set_position(count as u64);
+            }
+            if live_batch.is_empty() {
+                continue;
+            }
+
             let queries: Vec<(u32, i64, i64)> =
-                batch.iter().map(|&(s, cs, ce)| (s, cs, ce)).collect();
+                live_batch.iter().map(|&(s, cs, ce)| (s, cs, ce)).collect();
             let all_alns = impg.batch_query_raw_overlapping(&queries);
 
-            batch
+            live_batch
                 .par_iter()
                 .zip(all_alns.into_par_iter())
                 .try_for_each(
                     |(&(seq_id, region_start, region_end), mut raw_alns)| -> io::Result<()> {
+                        let chunk_id = encode_chunk_id_phase2(seq_id, region_start);
                         let sample_id = compact_lengths.get_sample_id(seq_id);
 
                         if min_seq_length > 0 {
@@ -5851,12 +6153,22 @@ pub fn compute_depth_global(
                         );
                         tracker.mark_processed_batch(&result.discovered_regions);
 
+                        let work_buf = if work_log_active {
+                            encode_work_record(chunk_id, &result.discovered_regions)
+                        } else {
+                            Vec::new()
+                        };
                         let mut buf: Vec<u8> = Vec::new();
                         write_results(vec![result], &mut buf)?;
-                        if !buf.is_empty() {
-                            if let Some(ref w) = writer {
+                        if let Some(ref w) = writer {
+                            if work_log_active {
+                                w.send_chunk_bundle(std::mem::take(&mut buf), work_buf)?;
+                            } else if !buf.is_empty() {
                                 w.send(std::mem::take(&mut buf))?;
                             }
+                        }
+                        if work_log_active {
+                            checkpoint_ctrl.note_chunk_done()?;
                         }
 
                         let count = phase2_chunk_count.fetch_add(1, Ordering::Relaxed) + 1;
@@ -5875,9 +6187,29 @@ pub fn compute_depth_global(
         //   Phase B) Parallel sweep + emit via
         //            `process_anchor_region_transitive_raw_with_hits` —
         //            CPU-only, no further file I/O.
-        for batch in transitive_chunks.chunks(PHASE2_TRANS_BATCH_SIZE) {
+        for batch in transitive_chunks.chunks(phase2_trans_batch_size) {
+            let live_batch: Vec<(u32, i64, i64)> = if work_log_active {
+                batch
+                    .iter()
+                    .copied()
+                    .filter(|&(seq_id, chunk_start, _)| {
+                        !completed_chunks.contains(&encode_chunk_id_phase2(seq_id, chunk_start))
+                    })
+                    .collect()
+            } else {
+                batch.to_vec()
+            };
+            let skipped = batch.len() - live_batch.len();
+            if skipped > 0 {
+                let count = phase2_chunk_count.fetch_add(skipped, Ordering::Relaxed) + skipped;
+                pb_depth.set_position(count as u64);
+            }
+            if live_batch.is_empty() {
+                continue;
+            }
+
             let chunk_coords: Vec<(u32, i64, i64)> =
-                batch.iter().map(|&(s, cs, ce)| (s, cs, ce)).collect();
+                live_batch.iter().map(|&(s, cs, ce)| (s, cs, ce)).collect();
             let all_hits = batch_depth_bfs(
                 impg,
                 &chunk_coords,
@@ -5886,11 +6218,12 @@ pub fn compute_depth_global(
                 config.min_distance_between_ranges,
             );
 
-            batch
+            live_batch
                 .par_iter()
                 .zip(all_hits.into_par_iter())
                 .try_for_each(
                     |(&(seq_id, chunk_start, chunk_end), hits)| -> io::Result<()> {
+                        let chunk_id = encode_chunk_id_phase2(seq_id, chunk_start);
                         let sample_id = compact_lengths.get_sample_id(seq_id);
                         let result = process_anchor_region_transitive_raw_with_hits(
                             hits,
@@ -5906,12 +6239,22 @@ pub fn compute_depth_global(
                         );
                         tracker.mark_processed_batch(&result.discovered_regions);
 
+                        let work_buf = if work_log_active {
+                            encode_work_record(chunk_id, &result.discovered_regions)
+                        } else {
+                            Vec::new()
+                        };
                         let mut buf: Vec<u8> = Vec::new();
                         write_results(vec![result], &mut buf)?;
-                        if !buf.is_empty() {
-                            if let Some(ref w) = writer {
+                        if let Some(ref w) = writer {
+                            if work_log_active {
+                                w.send_chunk_bundle(std::mem::take(&mut buf), work_buf)?;
+                            } else if !buf.is_empty() {
                                 w.send(std::mem::take(&mut buf))?;
                             }
+                        }
+                        if work_log_active {
+                            checkpoint_ctrl.note_chunk_done()?;
                         }
 
                         let count = phase2_chunk_count.fetch_add(1, Ordering::Relaxed) + 1;
@@ -5948,72 +6291,72 @@ pub fn compute_depth_global(
     }
     if let Some(ref fai) = fai_seq_lengths {
         if !fai_already_done {
-        let indexed_seqs: FxHashSet<&str> = (0..impg.seq_index().len() as u32)
-            .filter_map(|id| impg.seq_index().get_name(id))
-            .collect();
+            let indexed_seqs: FxHashSet<&str> = (0..impg.seq_index().len() as u32)
+                .filter_map(|id| impg.seq_index().get_name(id))
+                .collect();
 
-        for (seq_name, &seq_len) in &fai.lengths {
-            if indexed_seqs.contains(seq_name.as_str()) {
-                continue;
-            }
+            for (seq_name, &seq_len) in &fai.lengths {
+                if indexed_seqs.contains(seq_name.as_str()) {
+                    continue;
+                }
 
-            let sample_name = extract_sample(seq_name, separator);
+                let sample_name = extract_sample(seq_name, separator);
 
-            // ref_only filter for FAI sequences
-            if ref_only {
-                if let Some(ref_name) = ref_sample {
-                    if sample_name != ref_name {
-                        continue;
+                // ref_only filter for FAI sequences
+                if ref_only {
+                    if let Some(ref_name) = ref_sample {
+                        if sample_name != ref_name {
+                            continue;
+                        }
                     }
                 }
-            }
 
-            if stats_mode {
-                // Add depth=1 to stats accumulators (pangenome_bases = seq_len for single sample)
-                if let Some(ref acc) = stats_accumulator {
-                    acc.lock().add_interval(seq_name, 0, seq_len, 1, seq_len);
+                if stats_mode {
+                    // Add depth=1 to stats accumulators (pangenome_bases = seq_len for single sample)
+                    if let Some(ref acc) = stats_accumulator {
+                        acc.lock().add_interval(seq_name, 0, seq_len, 1, seq_len);
+                    }
+                    if let Some(ref acc) = stats_combined_acc {
+                        acc.lock().add_interval(
+                            seq_name,
+                            0,
+                            seq_len,
+                            1,
+                            vec![sample_name.to_string()],
+                            seq_len,
+                        );
+                    }
+                } else if let Some(ref w) = writer {
+                    let rid = row_counter.fetch_add(1, Ordering::Relaxed) + 1;
+
+                    // Output as depth=1 for entire sequence. Match the normal row
+                    // format: id, length, depth, positions (semicolon-separated);
+                    // for an unaligned FAI scaffold the positions list has exactly
+                    // one entry — the sequence itself.
+                    let _ = num_samples;
+                    let _ = sample_index;
+                    let _ = sample_name;
+                    let mut buf: Vec<u8> = Vec::with_capacity(64);
+                    writeln!(
+                        &mut buf,
+                        "{}\t{}\t1\t{}:0-{}",
+                        rid, seq_len, seq_name, seq_len
+                    )?;
+                    w.send(buf)?;
                 }
-                if let Some(ref acc) = stats_combined_acc {
-                    acc.lock().add_interval(
-                        seq_name,
-                        0,
-                        seq_len,
-                        1,
-                        vec![sample_name.to_string()],
-                        seq_len,
-                    );
+            }
+
+            // Mark the FAI loop done in the work-log with a sentinel record + a
+            // forced commit. Subsequent resumes will see the sentinel in
+            // `completed_chunks` and skip the FAI loop, preventing duplicate
+            // rows.
+            if work_log_active {
+                if let Some(ref w) = writer {
+                    let work_buf = encode_work_record(CHUNK_ID_FAI_DONE, &[]);
+                    w.send_chunk_bundle(Vec::new(), work_buf)?;
                 }
-            } else if let Some(ref w) = writer {
-                let rid = row_counter.fetch_add(1, Ordering::Relaxed) + 1;
-
-                // Output as depth=1 for entire sequence. Match the normal row
-                // format: id, length, depth, positions (semicolon-separated);
-                // for an unaligned FAI scaffold the positions list has exactly
-                // one entry — the sequence itself.
-                let _ = num_samples;
-                let _ = sample_index;
-                let _ = sample_name;
-                let mut buf: Vec<u8> = Vec::with_capacity(64);
-                writeln!(
-                    &mut buf,
-                    "{}\t{}\t1\t{}:0-{}",
-                    rid, seq_len, seq_name, seq_len
-                )?;
-                w.send(buf)?;
+                checkpoint_ctrl.force_commit()?;
             }
-        }
-
-        // Mark the FAI loop done in the work-log with a sentinel record + a
-        // forced commit. Subsequent resumes will see the sentinel in
-        // `completed_chunks` and skip the FAI loop, preventing duplicate
-        // rows.
-        if work_log_active {
-            if let Some(ref w) = writer {
-                let work_buf = encode_work_record(CHUNK_ID_FAI_DONE, &[]);
-                w.send_chunk_bundle(Vec::new(), work_buf)?;
-            }
-            checkpoint_ctrl.force_commit()?;
-        }
         } // end !fai_already_done
     }
 
@@ -6320,9 +6663,8 @@ pub fn query_region_depth(
         }
         _ => (true, BitVec::new()),
     };
-    let sample_allowed = |sid: u16| -> bool {
-        include_all || sample_mask.get(sid as usize).map_or(false, |b| *b)
-    };
+    let sample_allowed =
+        |sid: u16| -> bool { include_all || sample_mask.get(sid as usize).map_or(false, |b| *b) };
 
     // Collect all alignments for this region (compact: u16 sample, u32 seq).
     let mut alignments: Vec<CompactAlignmentInfo> = Vec::new();
@@ -6403,7 +6745,12 @@ pub fn query_region_depth(
             let query_id = query_interval.metadata;
             let query_sample_id = compact_lengths.get_sample_id(query_id);
 
-            if is_self_alignment(query_sample_id, anchor_sample_id, query_id, target_interval.metadata) {
+            if is_self_alignment(
+                query_sample_id,
+                anchor_sample_id,
+                query_id,
+                target_interval.metadata,
+            ) {
                 continue;
             }
             if !sample_allowed(query_sample_id) {
@@ -6430,8 +6777,13 @@ pub fn query_region_depth(
                 );
                 depth_trace!(
                     "HOP2 stage=region_use_bfs sample_id={} q_id={} t_id={} t={}-{} a={}-{}",
-                    query_sample_id, query_id, target_interval.metadata,
-                    t_start, t_end, p.0, p.1
+                    query_sample_id,
+                    query_id,
+                    target_interval.metadata,
+                    t_start,
+                    t_end,
+                    p.0,
+                    p.1
                 );
                 p
             };
@@ -6493,7 +6845,12 @@ pub fn query_region_depth(
         for hit in &hits {
             let query_sample_id = compact_lengths.get_sample_id(hit.query_id);
 
-            if is_self_alignment(query_sample_id, anchor_sample_id, hit.query_id, hit.target_id) {
+            if is_self_alignment(
+                query_sample_id,
+                anchor_sample_id,
+                hit.query_id,
+                hit.target_id,
+            ) {
                 continue;
             }
             if !sample_allowed(query_sample_id) {
@@ -6519,8 +6876,13 @@ pub fn query_region_depth(
                 );
                 depth_trace!(
                     "HOP2 stage=region_raw_bfs sample_id={} q_id={} t_id={} t={}-{} a={}-{}",
-                    query_sample_id, hit.query_id, hit.target_id,
-                    t_start, t_end, p.0, p.1
+                    query_sample_id,
+                    hit.query_id,
+                    hit.target_id,
+                    t_start,
+                    t_end,
+                    p.0,
+                    p.1
                 );
                 p
             };
@@ -6945,7 +7307,9 @@ mod tests {
         // Deterministic LCG to keep the test reproducible without adding deps
         let mut state: u64 = 0xdead_beef_cafe_babe;
         let mut rand_u32 = || -> u32 {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (state >> 32) as u32
         };
 
@@ -6959,10 +7323,14 @@ mod tests {
             let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
             let is_add = rand_u32() & 1 == 0;
             if is_add {
-                for i in lo..hi { bitmap[i] = true; }
+                for i in lo..hi {
+                    bitmap[i] = true;
+                }
                 set.add(lo as i64, hi as i64);
             } else {
-                for i in lo..hi { bitmap[i] = false; }
+                for i in lo..hi {
+                    bitmap[i] = false;
+                }
                 set.subtract(lo as i64, hi as i64);
             }
 
@@ -6972,7 +7340,9 @@ mod tests {
             while i < U {
                 if bitmap[i] {
                     let start = i;
-                    while i < U && bitmap[i] { i += 1; }
+                    while i < U && bitmap[i] {
+                        i += 1;
+                    }
                     expected.push((start as i64, i as i64));
                 } else {
                     i += 1;
@@ -6980,12 +7350,20 @@ mod tests {
             }
 
             let got: Vec<(i64, i64)> = set.intervals().collect();
-            assert_eq!(got, expected,
-                "mismatch after op lo={} hi={} add={}", lo, hi, is_add);
+            assert_eq!(
+                got, expected,
+                "mismatch after op lo={} hi={} add={}",
+                lo, hi, is_add
+            );
 
             let expected_total: i64 = expected.iter().map(|(s, e)| e - s).sum();
-            assert_eq!(set.total_length(), expected_total,
-                "total_length mismatch: expected={}, got={}", expected_total, set.total_length());
+            assert_eq!(
+                set.total_length(),
+                expected_total,
+                "total_length mismatch: expected={}, got={}",
+                expected_total,
+                set.total_length()
+            );
         }
     }
 
@@ -6997,13 +7375,26 @@ mod tests {
     }
 
     impl OldIntervalSetVec {
-        fn new() -> Self { Self { intervals: Vec::new(), total_length: 0 } }
+        fn new() -> Self {
+            Self {
+                intervals: Vec::new(),
+                total_length: 0,
+            }
+        }
         fn new_single(s: i64, e: i64) -> Self {
-            if s >= e { Self::new() }
-            else { Self { intervals: vec![(s, e)], total_length: e - s } }
+            if s >= e {
+                Self::new()
+            } else {
+                Self {
+                    intervals: vec![(s, e)],
+                    total_length: e - s,
+                }
+            }
         }
         fn add(&mut self, start: i64, end: i64) {
-            if start >= end { return; }
+            if start >= end {
+                return;
+            }
             if self.intervals.is_empty() {
                 self.intervals.push((start, end));
                 self.total_length = end - start;
@@ -7019,32 +7410,47 @@ mod tests {
                 let ms = start.min(self.intervals[first_overlap_idx].0);
                 let me = end.max(self.intervals[last_overlap_end - 1].1);
                 let removed: i64 = self.intervals[first_overlap_idx..last_overlap_end]
-                    .iter().map(|&(s, e)| e - s).sum();
+                    .iter()
+                    .map(|&(s, e)| e - s)
+                    .sum();
                 self.intervals.drain(first_overlap_idx..last_overlap_end);
                 self.intervals.insert(first_overlap_idx, (ms, me));
                 self.total_length = self.total_length - removed + (me - ms);
             }
         }
         fn subtract(&mut self, ss: i64, se: i64) {
-            if ss >= se || self.intervals.is_empty() { return; }
+            if ss >= se || self.intervals.is_empty() {
+                return;
+            }
             let first_overlap_idx = self.intervals.partition_point(|&(_, e)| e <= ss);
             let last_overlap_end = first_overlap_idx
                 + self.intervals[first_overlap_idx..].partition_point(|&(s, _)| s < se);
-            if first_overlap_idx == last_overlap_end { return; }
+            if first_overlap_idx == last_overlap_end {
+                return;
+            }
             let mut repl = Vec::new();
             let mut removed: i64 = 0;
             for &(s, e) in &self.intervals[first_overlap_idx..last_overlap_end] {
-                if s < ss { repl.push((s, ss)); }
-                if e > se { repl.push((se, e)); }
+                if s < ss {
+                    repl.push((s, ss));
+                }
+                if e > se {
+                    repl.push((se, e));
+                }
                 let os = s.max(ss);
                 let oe = e.min(se);
                 removed += oe - os;
             }
-            self.intervals.splice(first_overlap_idx..last_overlap_end, repl);
+            self.intervals
+                .splice(first_overlap_idx..last_overlap_end, repl);
             self.total_length -= removed;
         }
-        fn total_length(&self) -> i64 { self.total_length }
-        fn intervals(&self) -> &[(i64, i64)] { &self.intervals }
+        fn total_length(&self) -> i64 {
+            self.total_length
+        }
+        fn intervals(&self) -> &[(i64, i64)] {
+            &self.intervals
+        }
     }
 
     // Simulates the inner claim_unprocessed path using the old impl.
@@ -7054,8 +7460,12 @@ mod tests {
         } else {
             let mut result = OldIntervalSetVec::new_single(start, end);
             for &(s, e) in set.intervals() {
-                if s >= end { break; }
-                if e <= start { continue; }
+                if s >= end {
+                    break;
+                }
+                if e <= start {
+                    continue;
+                }
                 result.subtract(s, e);
             }
             result.intervals().to_vec()
@@ -7364,7 +7774,9 @@ mod tests {
     fn test_claim_any_unprocessed_matches_claim_unprocessed() {
         let mut rng_state: u64 = 0xC1A1_BEEF_FACE_F00D;
         let mut next = || {
-            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             rng_state
         };
 
@@ -7384,19 +7796,16 @@ mod tests {
                     !baseline_vec.is_empty(),
                     probe_bool,
                     "bool divergence at [{},{}): baseline returned {:?}",
-                    s, e, baseline_vec
+                    s,
+                    e,
+                    baseline_vec
                 );
 
                 // Compare full post-state intervals to confirm both trackers
                 // ended up storing the same set after the operation.
-                let baseline_state: Vec<(i64, i64)> = baseline.processed[0]
-                    .lock()
-                    .intervals()
-                    .collect();
-                let probe_state: Vec<(i64, i64)> = probe.processed[0]
-                    .lock()
-                    .intervals()
-                    .collect();
+                let baseline_state: Vec<(i64, i64)> =
+                    baseline.processed[0].lock().intervals().collect();
+                let probe_state: Vec<(i64, i64)> = probe.processed[0].lock().intervals().collect();
                 assert_eq!(
                     baseline_state, probe_state,
                     "post-state divergence after claim [{},{})",
@@ -7524,7 +7933,9 @@ mod tests {
         // `rand` as a dev-dep.
         let mut rng_state: u64 = 0xDEAD_BEEF_CAFE_F00D;
         let mut next = || {
-            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             rng_state
         };
 

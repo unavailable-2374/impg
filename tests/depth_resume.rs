@@ -32,6 +32,9 @@ use impg::seqidx::SequenceIndex;
 use tempfile::TempDir;
 
 fn impg_binary() -> PathBuf {
+    if let Some(p) = option_env!("CARGO_BIN_EXE_impg") {
+        return PathBuf::from(p);
+    }
     if let Ok(p) = std::env::var("CARGO_BIN_EXE_impg") {
         return PathBuf::from(p);
     }
@@ -149,6 +152,71 @@ fn run_depth(
     (out.status, stderr)
 }
 
+/// Run `impg depth` in the default raw transitive mode (`-x` without
+/// `--use-BFS`). This is the common high-throughput path and must also be
+/// checkpointable.
+fn run_depth_raw_transitive(
+    alist: &Path,
+    prefix: &Path,
+    extra_args: &[&str],
+    env_overrides: &[(&str, &str)],
+) -> (std::process::ExitStatus, String) {
+    let bin = impg_binary();
+    let mut cmd = Command::new(&bin);
+    cmd.arg("depth")
+        .arg("--alignment-list")
+        .arg(alist)
+        .arg("-O")
+        .arg(prefix)
+        .arg("-x")
+        .arg("--ref")
+        .arg("sampleA")
+        .arg("--min-transitive-len")
+        .arg("100");
+    for a in extra_args {
+        cmd.arg(a);
+    }
+    cmd.env_remove("IMPG_TEST_EXIT_AFTER_COMMIT");
+    cmd.env_remove("IMPG_CHECKPOINT_INTERVAL_OVERRIDE");
+    for (k, v) in env_overrides {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("spawn impg");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    (out.status, stderr)
+}
+
+/// Run `impg depth` in non-transitive global mode (no `-x`, no `--use-BFS`).
+/// Mirrors `run_depth` but exercises the non-transitive Phase 1 / Phase 2
+/// branches that were brought into the resume scope.
+fn run_depth_nontrans(
+    alist: &Path,
+    prefix: &Path,
+    extra_args: &[&str],
+    env_overrides: &[(&str, &str)],
+) -> (std::process::ExitStatus, String) {
+    let bin = impg_binary();
+    let mut cmd = Command::new(&bin);
+    cmd.arg("depth")
+        .arg("--alignment-list")
+        .arg(alist)
+        .arg("-O")
+        .arg(prefix)
+        .arg("--ref")
+        .arg("sampleA");
+    for a in extra_args {
+        cmd.arg(a);
+    }
+    cmd.env_remove("IMPG_TEST_EXIT_AFTER_COMMIT");
+    cmd.env_remove("IMPG_CHECKPOINT_INTERVAL_OVERRIDE");
+    for (k, v) in env_overrides {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("spawn impg");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    (out.status, stderr)
+}
+
 /// Read a `<prefix>.depth.tsv`, drop the header, drop the per-row `#id`
 /// column (non-deterministic across runs), and return sorted lines.
 fn read_normalized_tsv(path: &Path) -> Vec<String> {
@@ -170,6 +238,14 @@ fn read_normalized_tsv(path: &Path) -> Vec<String> {
     lines
 }
 
+fn tsv_body_line_count(path: &Path) -> usize {
+    fs::read_to_string(path)
+        .expect("read tsv")
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .count()
+}
+
 #[test]
 fn resume_happy_path_completes_and_cleans_up() {
     let tmp = TempDir::new().unwrap();
@@ -178,17 +254,18 @@ fn resume_happy_path_completes_and_cleans_up() {
     let baseline = tmp.path().join("baseline");
     let (st, err) = run_depth(&alist, &baseline, &[], &[]);
     assert!(st.success(), "baseline depth failed:\n{err}");
-    let base_tsv =
-        read_normalized_tsv(Path::new(&format!("{}.depth.tsv", baseline.display())));
+    let base_tsv = read_normalized_tsv(Path::new(&format!("{}.depth.tsv", baseline.display())));
     assert!(!base_tsv.is_empty(), "baseline produced empty TSV");
 
     let resumed = tmp.path().join("resumed");
     let (st, err) = run_depth(&alist, &resumed, &["--resume"], &[]);
     assert!(st.success(), "--resume depth failed:\n{err}");
-    let resumed_tsv =
-        read_normalized_tsv(Path::new(&format!("{}.depth.tsv", resumed.display())));
+    let resumed_tsv = read_normalized_tsv(Path::new(&format!("{}.depth.tsv", resumed.display())));
 
-    assert_eq!(base_tsv, resumed_tsv, "TSV differs between baseline and --resume");
+    assert_eq!(
+        base_tsv, resumed_tsv,
+        "TSV differs between baseline and --resume"
+    );
 
     // Cleanup: ckpt and work-log artifacts must not survive a successful run.
     assert!(
@@ -210,8 +287,7 @@ fn resume_after_simulated_crash_matches_baseline() {
     let baseline = tmp.path().join("baseline");
     let (st, err) = run_depth(&alist, &baseline, &[], &[]);
     assert!(st.success(), "baseline depth failed:\n{err}");
-    let base_tsv =
-        read_normalized_tsv(Path::new(&format!("{}.depth.tsv", baseline.display())));
+    let base_tsv = read_normalized_tsv(Path::new(&format!("{}.depth.tsv", baseline.display())));
 
     // First --resume run with crash injection: every commit triggers
     // IMPG_TEST_EXIT_AFTER_COMMIT, so the process exits 99 right after the
@@ -251,5 +327,205 @@ fn resume_after_simulated_crash_matches_baseline() {
     assert!(
         !work_path.exists(),
         "work.bin should be cleaned up on success"
+    );
+}
+
+#[test]
+fn resume_raw_transitive_happy_path_completes_and_cleans_up() {
+    let tmp = TempDir::new().unwrap();
+    let (_paths, alist) = build_test_dataset(tmp.path());
+
+    let baseline = tmp.path().join("baseline_raw");
+    let (st, err) = run_depth_raw_transitive(&alist, &baseline, &[], &[]);
+    assert!(st.success(), "raw transitive baseline depth failed:\n{err}");
+    let base_tsv = read_normalized_tsv(Path::new(&format!("{}.depth.tsv", baseline.display())));
+    assert!(
+        !base_tsv.is_empty(),
+        "raw transitive baseline produced empty TSV"
+    );
+
+    let resumed = tmp.path().join("resumed_raw");
+    let (st, err) = run_depth_raw_transitive(&alist, &resumed, &["--resume"], &[]);
+    assert!(st.success(), "raw transitive --resume depth failed:\n{err}");
+    let resumed_tsv = read_normalized_tsv(Path::new(&format!("{}.depth.tsv", resumed.display())));
+
+    assert_eq!(
+        base_tsv, resumed_tsv,
+        "raw transitive TSV differs between baseline and --resume"
+    );
+
+    assert!(
+        !Path::new(&format!("{}.depth.ckpt", resumed.display())).exists(),
+        "ckpt should be removed on success (raw transitive)"
+    );
+    assert!(
+        !Path::new(&format!("{}.depth.work.bin", resumed.display())).exists(),
+        "work.bin should be removed on success (raw transitive)"
+    );
+}
+
+#[test]
+fn resume_raw_transitive_after_simulated_crash_matches_baseline() {
+    let tmp = TempDir::new().unwrap();
+    let (_paths, alist) = build_test_dataset(tmp.path());
+
+    let baseline = tmp.path().join("baseline_raw");
+    let (st, err) = run_depth_raw_transitive(&alist, &baseline, &[], &[]);
+    assert!(st.success(), "raw transitive baseline failed:\n{err}");
+    let base_tsv = read_normalized_tsv(Path::new(&format!("{}.depth.tsv", baseline.display())));
+
+    let resume_prefix = tmp.path().join("crash_raw");
+    let (st, err) = run_depth_raw_transitive(
+        &alist,
+        &resume_prefix,
+        &["--resume"],
+        &[
+            ("IMPG_CHECKPOINT_INTERVAL_OVERRIDE", "1"),
+            ("IMPG_TEST_EXIT_AFTER_COMMIT", "1"),
+        ],
+    );
+    assert_eq!(
+        st.code(),
+        Some(99),
+        "expected forced exit 99 from test hook (raw transitive); stderr=\n{err}",
+    );
+    let tsv_path = PathBuf::from(format!("{}.depth.tsv", resume_prefix.display()));
+    let ckpt_path = PathBuf::from(format!("{}.depth.ckpt", resume_prefix.display()));
+    let work_path = PathBuf::from(format!("{}.depth.work.bin", resume_prefix.display()));
+    assert!(
+        ckpt_path.exists(),
+        "ckpt missing after simulated crash (raw transitive)"
+    );
+    assert!(
+        work_path.exists(),
+        "work.bin missing after simulated crash (raw transitive)"
+    );
+    assert!(
+        tsv_body_line_count(&tsv_path) > 0,
+        "raw transitive crash checkpoint did not leave incremental TSV rows"
+    );
+
+    let (st, err) = run_depth_raw_transitive(&alist, &resume_prefix, &["--resume"], &[]);
+    assert!(
+        st.success(),
+        "second raw transitive --resume run failed:\n{err}"
+    );
+    let final_tsv = read_normalized_tsv(&tsv_path);
+
+    assert_eq!(
+        base_tsv, final_tsv,
+        "post-resume TSV differs from baseline (raw transitive)"
+    );
+
+    assert!(
+        !ckpt_path.exists(),
+        "ckpt should be cleaned up on success (raw transitive)"
+    );
+    assert!(
+        !work_path.exists(),
+        "work.bin should be cleaned up on success (raw transitive)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Non-transitive global depth + --resume
+// ---------------------------------------------------------------------------
+//
+// These mirror the two transitive CIGAR-BFS tests but drop `-x --use-BFS` so
+// the run goes through the non-transitive Phase 1 + Phase 2 branches. The
+// dataset is small enough that Phase 1 may be the only phase that runs (sampleA
+// is the ref-anchored hub); even so the per-chunk bundle path and the
+// checkpoint commit at run-end are exercised.
+
+#[test]
+fn resume_nontrans_happy_path_completes_and_cleans_up() {
+    let tmp = TempDir::new().unwrap();
+    let (_paths, alist) = build_test_dataset(tmp.path());
+
+    let baseline = tmp.path().join("baseline_nt");
+    let (st, err) = run_depth_nontrans(&alist, &baseline, &[], &[]);
+    assert!(st.success(), "non-transitive baseline depth failed:\n{err}");
+    let base_tsv = read_normalized_tsv(Path::new(&format!("{}.depth.tsv", baseline.display())));
+    assert!(
+        !base_tsv.is_empty(),
+        "non-transitive baseline produced empty TSV"
+    );
+
+    let resumed = tmp.path().join("resumed_nt");
+    let (st, err) = run_depth_nontrans(&alist, &resumed, &["--resume"], &[]);
+    assert!(st.success(), "non-transitive --resume depth failed:\n{err}");
+    let resumed_tsv = read_normalized_tsv(Path::new(&format!("{}.depth.tsv", resumed.display())));
+
+    assert_eq!(
+        base_tsv, resumed_tsv,
+        "non-transitive TSV differs between baseline and --resume"
+    );
+
+    assert!(
+        !Path::new(&format!("{}.depth.ckpt", resumed.display())).exists(),
+        "ckpt should be removed on success (non-transitive)"
+    );
+    assert!(
+        !Path::new(&format!("{}.depth.work.bin", resumed.display())).exists(),
+        "work.bin should be removed on success (non-transitive)"
+    );
+}
+
+#[test]
+fn resume_nontrans_after_simulated_crash_matches_baseline() {
+    let tmp = TempDir::new().unwrap();
+    let (_paths, alist) = build_test_dataset(tmp.path());
+
+    let baseline = tmp.path().join("baseline_nt");
+    let (st, err) = run_depth_nontrans(&alist, &baseline, &[], &[]);
+    assert!(st.success(), "non-transitive baseline failed:\n{err}");
+    let base_tsv = read_normalized_tsv(Path::new(&format!("{}.depth.tsv", baseline.display())));
+
+    let resume_prefix = tmp.path().join("crash_nt");
+    let (st, err) = run_depth_nontrans(
+        &alist,
+        &resume_prefix,
+        &["--resume"],
+        &[
+            ("IMPG_CHECKPOINT_INTERVAL_OVERRIDE", "1"),
+            ("IMPG_TEST_EXIT_AFTER_COMMIT", "1"),
+        ],
+    );
+    assert_eq!(
+        st.code(),
+        Some(99),
+        "expected forced exit 99 from test hook (non-transitive); stderr=\n{err}",
+    );
+    let ckpt_path = PathBuf::from(format!("{}.depth.ckpt", resume_prefix.display()));
+    let work_path = PathBuf::from(format!("{}.depth.work.bin", resume_prefix.display()));
+    assert!(
+        ckpt_path.exists(),
+        "ckpt missing after simulated crash (non-transitive)"
+    );
+    assert!(
+        work_path.exists(),
+        "work.bin missing after simulated crash (non-transitive)"
+    );
+
+    let (st, err) = run_depth_nontrans(&alist, &resume_prefix, &["--resume"], &[]);
+    assert!(
+        st.success(),
+        "second non-transitive --resume run failed:\n{err}"
+    );
+    let final_tsv =
+        read_normalized_tsv(Path::new(&format!("{}.depth.tsv", resume_prefix.display())));
+
+    assert_eq!(
+        base_tsv, final_tsv,
+        "post-resume TSV differs from baseline (non-transitive)"
+    );
+
+    assert!(
+        !ckpt_path.exists(),
+        "ckpt should be cleaned up on success (non-transitive)"
+    );
+    assert!(
+        !work_path.exists(),
+        "work.bin should be cleaned up on success (non-transitive)"
     );
 }

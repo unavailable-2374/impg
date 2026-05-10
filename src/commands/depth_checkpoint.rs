@@ -1,8 +1,8 @@
 //! Checkpoint / resume support for `impg depth` global mode.
 //!
-//! Scope: only the global, transitive, CIGAR-precise BFS path
-//! (`compute_depth_global` + `--use-BFS`). All other modes are out of scope and
-//! the calling code rejects `--resume` for them.
+//! Scope: global `compute_depth_global` runs, including non-transitive depth,
+//! raw transitive BFS, and CIGAR-precise BFS. Region queries and stats mode are
+//! out of scope and the calling code rejects `--resume` for them.
 //!
 //! Three on-disk artifacts share `<prefix>.depth.` as a base:
 //!
@@ -660,4 +660,3 @@ mod tests {
         assert_ne!(h1, h2, "ref_only flip must change hash");
     }
 }
-

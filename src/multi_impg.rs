@@ -576,7 +576,9 @@ impl MultiImpg {
         let impg = Arc::new(impg);
 
         // Propagate tree cache setting to the newly loaded sub-index
-        let cache_enabled = self.tree_cache_enabled.load(std::sync::atomic::Ordering::Relaxed);
+        let cache_enabled = self
+            .tree_cache_enabled
+            .load(std::sync::atomic::Ordering::Relaxed);
         impg.set_tree_cache_enabled(cache_enabled);
 
         // Store in sub-index cache
@@ -629,7 +631,8 @@ impl MultiImpg {
         // re-parses, which empirically is a small fraction of the
         // chunk-processing time.
         if self.transient_cache_limit > 0
-            && self.transient_cache_count.load(AtomicOrdering::Relaxed) >= self.transient_cache_limit
+            && self.transient_cache_count.load(AtomicOrdering::Relaxed)
+                >= self.transient_cache_limit
         {
             self.evict_transient_header_cache();
         }
@@ -714,7 +717,6 @@ impl MultiImpg {
         impg.set_tree_cache_enabled(false);
         Ok(Arc::new(impg))
     }
-
 
     /// Translate an AdjustedInterval from local IDs to unified IDs.
     fn translate_to_unified(
@@ -1112,7 +1114,13 @@ impl ImpgIndex for MultiImpg {
                             let query_end = interval.metadata.query_end();
                             let target_start = interval.first as i64;
                             let target_end = interval.last as i64;
-                            results.push((query_start, query_end, target_start, target_end, target_id));
+                            results.push((
+                                query_start,
+                                query_end,
+                                target_start,
+                                target_end,
+                                target_id,
+                            ));
                         }
                     }
                 }
@@ -1149,7 +1157,8 @@ impl ImpgIndex for MultiImpg {
 
     fn set_tree_cache_enabled(&self, enabled: bool) {
         // Store at MultiImpg level so newly lazy-loaded sub-indices inherit the setting
-        self.tree_cache_enabled.store(enabled, std::sync::atomic::Ordering::Relaxed);
+        self.tree_cache_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
         // Also propagate to already-loaded sub-indices
         let indices = self.sub_indices.read().unwrap();
         for sub_index in indices.iter().flatten() {
@@ -1212,11 +1221,7 @@ impl ImpgIndex for MultiImpg {
     ///   the same unified target (which is exactly what `query_raw_intervals` does
     ///   under the hood via the unified forest_map).
     /// - Excluded sequences (`seq_included[id] == false`) are skipped on both sides.
-    fn compute_sample_degrees(
-        &self,
-        seq_included: &[bool],
-        seq_to_sample: &[u16],
-    ) -> Vec<u16> {
+    fn compute_sample_degrees(&self, seq_included: &[bool], seq_to_sample: &[u16]) -> Vec<u16> {
         use std::sync::atomic::{AtomicU64, Ordering};
 
         let num_unified = self.seq_index.len();
@@ -1265,8 +1270,7 @@ impl ImpgIndex for MultiImpg {
                 let l2u = &self.local_to_unified[index_idx];
 
                 // Iterate every local target in this file.
-                let local_target_ids: Vec<u32> =
-                    impg.forest_map.entries.keys().copied().collect();
+                let local_target_ids: Vec<u32> = impg.forest_map.entries.keys().copied().collect();
 
                 // Per-thread reusable scratch buffers — drop only when the
                 // closure returns, so a single allocation amortises across
@@ -1328,9 +1332,8 @@ impl ImpgIndex for MultiImpg {
                             .unwrap_or(0);
                         if query_sample != self_sample {
                             // Safe: query_sample <= max_sample by construction.
-                            let slot = unsafe {
-                                local_seen.get_unchecked_mut(query_sample as usize)
-                            };
+                            let slot =
+                                unsafe { local_seen.get_unchecked_mut(query_sample as usize) };
                             if *slot == 0 {
                                 *slot = 1;
                                 touched_samples.push(query_sample);
@@ -1375,7 +1378,12 @@ impl ImpgIndex for MultiImpg {
             .collect()
     }
 
-    fn query_raw_overlapping(&self, unified_target_id: u32, start: i64, end: i64) -> Vec<RawAlignmentInterval> {
+    fn query_raw_overlapping(
+        &self,
+        unified_target_id: u32,
+        start: i64,
+        end: i64,
+    ) -> Vec<RawAlignmentInterval> {
         let locations = match self.forest_map.get(&unified_target_id) {
             Some(locs) => locs,
             None => return Vec::new(),
@@ -1559,10 +1567,12 @@ impl ImpgIndex for MultiImpg {
         for (qi, &(unified_target_id, start, end)) in queries.iter().enumerate() {
             if let Some(locs) = self.forest_map.get(&unified_target_id) {
                 for loc in locs {
-                    by_file
-                        .entry(loc.index_idx())
-                        .or_default()
-                        .push((qi, loc.local_target_id(), start, end));
+                    by_file.entry(loc.index_idx()).or_default().push((
+                        qi,
+                        loc.local_target_id(),
+                        start,
+                        end,
+                    ));
                 }
             }
         }
@@ -1668,23 +1678,21 @@ impl MultiImpg {
         subset_filter: Option<&SubsetFilter>,
         use_dfs: bool,
     ) -> Vec<AdjustedInterval> {
-        // Initialize visited ranges
+        // Initialize visited ranges.  Global depth --use-BFS calls this once
+        // per 5 MB chunk; without a mask, prebuilding an entry for every
+        // unified sequence is fixed O(num_sequences) work per chunk.  Keep
+        // masked runs exact, but allocate the unmasked map lazily.
         let mut visited_ranges: FxHashMap<u32, SortedRanges> = if let Some(m) = masked_regions {
             m.iter().map(|(&k, v)| (k, v.clone())).collect()
         } else {
-            (0..self.seq_index.len() as u32)
-                .into_par_iter()
-                .map(|id| {
-                    let len = self.seq_index.get_len_from_id(id).unwrap_or(0);
-                    (id, SortedRanges::new(len as i64, 0))
-                })
-                .collect()
+            FxHashMap::default()
         };
 
         // Filter input range
+        let target_len = self.seq_index.get_len_from_id(target_id).unwrap_or(0) as i64;
         let filtered_input_range = visited_ranges
             .entry(target_id)
-            .or_default()
+            .or_insert_with(|| SortedRanges::new(target_len, 0))
             .insert((range_start, range_end));
 
         let mut results = Vec::new();

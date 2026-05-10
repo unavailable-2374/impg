@@ -107,7 +107,8 @@ impl CigarOp {
         if len == 0 {
             return Vec::new();
         }
-        let mut out = Vec::with_capacity(((len + CIGAR_OP_MAX_LEN - 1) / CIGAR_OP_MAX_LEN) as usize);
+        let mut out =
+            Vec::with_capacity(((len + CIGAR_OP_MAX_LEN - 1) / CIGAR_OP_MAX_LEN) as usize);
         let mut remaining = len;
         while remaining > 0 {
             let take = remaining.min(CIGAR_OP_MAX_LEN);
@@ -1347,6 +1348,147 @@ impl Impg {
         }
     }
 
+    fn project_overlapping_interval_coords(
+        &self,
+        metadata: &QueryMetadata,
+        target_id: u32,
+        range_start: i64,
+        range_end: i64,
+        sequence_index: Option<&UnifiedSequenceIndex>,
+    ) -> Option<(Interval<u32>, Interval<u32>)> {
+        let file_index = metadata.alignment_file_index as usize;
+        let alignment_file = &self.alignment_files[file_index];
+        let is_tracepoint_file =
+            alignment_file.ends_with(".1aln") || alignment_file.ends_with(".tpa");
+
+        if let (true, Some(sequence_index)) = (is_tracepoint_file, sequence_index) {
+            if metadata.target_start >= range_end || metadata.target_end <= range_start {
+                return None;
+            }
+
+            let alignment = match self.get_tracepoint_alignment(metadata) {
+                Ok(a) => a,
+                Err(e) => {
+                    debug!("Cannot fetch tracepoint alignment for target_id={}, file_index={}: {}, skipping",
+                        target_id, metadata.alignment_file_index, e);
+                    return None;
+                }
+            };
+
+            let subset = match self.scan_overlapping_tracepoints(
+                &alignment,
+                metadata,
+                range_start,
+                range_end,
+                metadata.is_reversed(),
+            ) {
+                Some(s) => s,
+                None => {
+                    debug!(
+                        "No overlapping tracepoint segments for range {}-{} (target_id={}, file_index={}), skipping",
+                        range_start, range_end, target_id, metadata.alignment_file_index
+                    );
+                    return None;
+                }
+            };
+
+            let cigar_ops = self.process_subset_tracepoints(
+                &alignment,
+                metadata,
+                target_id,
+                &subset,
+                sequence_index,
+            );
+            let cigar_ops = if metadata.is_reversed() {
+                invert_cigar_ops(&cigar_ops, metadata.strand())
+            } else {
+                cigar_ops
+            };
+
+            let is_reverse = metadata.strand() == Strand::Reverse;
+            let subset_query_start = subset.first_query_pos;
+            let subset_query_end = if subset.last_idx == alignment.tracepoints.len() - 1 {
+                if metadata.is_reversed() && is_reverse {
+                    metadata.query_start
+                } else {
+                    metadata.query_end
+                }
+            } else {
+                subset.last_query_pos
+            };
+
+            let (_, _, first_seg_start, first_seg_end, _, _) = subset.first_segment_info;
+            let (_, _, last_seg_start, last_seg_end, _, _) = subset.last_segment_info;
+            let subset_target_start = first_seg_start
+                .min(first_seg_end)
+                .min(last_seg_start.min(last_seg_end));
+            let subset_target_end = if subset.last_idx == alignment.tracepoints.len() - 1 {
+                metadata.target_end
+            } else {
+                first_seg_start
+                    .max(first_seg_end)
+                    .max(last_seg_start.max(last_seg_end))
+            };
+
+            let (
+                adjusted_query_start,
+                adjusted_query_end,
+                adjusted_target_start,
+                adjusted_target_end,
+            ) = project_target_range_coords_through_alignment(
+                (range_start, range_end),
+                (
+                    subset_target_start,
+                    subset_target_end,
+                    subset_query_start.min(subset_query_end),
+                    subset_query_start.max(subset_query_end),
+                    metadata.strand(),
+                ),
+                &cigar_ops,
+            )?;
+
+            return Some((
+                Interval {
+                    first: adjusted_query_start,
+                    last: adjusted_query_end,
+                    metadata: metadata.query_id,
+                },
+                Interval {
+                    first: adjusted_target_start,
+                    last: adjusted_target_end,
+                    metadata: target_id,
+                },
+            ));
+        }
+
+        let cigar_ops = self.get_cigar_ops(metadata, target_id, sequence_index);
+        let (adjusted_query_start, adjusted_query_end, adjusted_target_start, adjusted_target_end) =
+            project_target_range_coords_through_alignment(
+                (range_start, range_end),
+                (
+                    metadata.target_start,
+                    metadata.target_end,
+                    metadata.query_start,
+                    metadata.query_end,
+                    metadata.strand(),
+                ),
+                &cigar_ops,
+            )?;
+
+        Some((
+            Interval {
+                first: adjusted_query_start,
+                last: adjusted_query_end,
+                metadata: metadata.query_id,
+            },
+            Interval {
+                first: adjusted_target_start,
+                last: adjusted_target_end,
+                metadata: target_id,
+            },
+        ))
+    }
+
     /// Fast approximate projection using tracepoints without CIGAR computation or sequence fetching.
     /// Returns approximate intervals with identity metrics calculated from tracepoint statistics.
     fn project_overlapping_interval_fast(
@@ -1589,10 +1731,7 @@ impl Impg {
                 continue;
             }
 
-            let missing_cigar_count = records
-                .iter()
-                .filter(|r| r.data_bytes == 0)
-                .count();
+            let missing_cigar_count = records.iter().filter(|r| r.data_bytes == 0).count();
 
             if missing_cigar_count > 0 {
                 return Err(io::Error::new(
@@ -1820,7 +1959,10 @@ impl Impg {
             let arc_tree = Arc::new(tree);
 
             // Only cache if tree caching is enabled
-            if self.tree_cache_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            if self
+                .tree_cache_enabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 self.trees
                     .write()
                     .unwrap()
@@ -1853,10 +1995,7 @@ impl Impg {
     /// Load a tree from disk WITHOUT caching it
     /// This is useful for parallel processing where each thread loads trees independently
     /// to avoid write lock contention on the shared tree cache
-    pub fn load_tree_no_cache(
-        &self,
-        target_id: u32,
-    ) -> Option<BasicCOITree<QueryMetadata, u32>> {
+    pub fn load_tree_no_cache(&self, target_id: u32) -> Option<BasicCOITree<QueryMetadata, u32>> {
         if let Some(tree_offset) = self.forest_map.get_tree_offset(target_id) {
             let mut file = File::open(&self.index_file_path).ok()?;
             file.seek(std::io::SeekFrom::Start(tree_offset)).ok()?;
@@ -1905,7 +2044,8 @@ impl Impg {
     /// This bounds peak memory for workloads like transitive depth where BFS would
     /// otherwise cache every tree it visits.
     pub fn set_tree_cache_enabled(&self, enabled: bool) {
-        self.tree_cache_enabled.store(enabled, std::sync::atomic::Ordering::Relaxed);
+        self.tree_cache_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Get the number of trees currently cached in memory
@@ -2029,6 +2169,21 @@ impl Impg {
         if let Some(tree) = self.get_or_load_tree(target_id) {
             tree.query(range_start, range_end, |interval| {
                 let metadata = &interval.metadata;
+                if !approximate_mode && !store_cigar && min_gap_compressed_identity.is_none() {
+                    if let Some((query_interval, target_interval)) = self
+                        .project_overlapping_interval_coords(
+                            metadata,
+                            target_id,
+                            range_start,
+                            range_end,
+                            sequence_index,
+                        )
+                    {
+                        results.push((query_interval, Vec::new(), target_interval));
+                    }
+                    return;
+                }
+
                 let projection = if approximate_mode {
                     // Approximate mode: fast projection without sequence I/O
                     self.project_overlapping_interval_fast(
@@ -2064,10 +2219,7 @@ impl Impg {
     /// This finds alignments where query_id matches, scanning all trees.
     /// Returns: Vec of (target_interval, query_interval, original_target_id) tuples
     /// Note: This is O(N) where N is total alignments - use sparingly.
-    pub fn query_reverse_for_depth(
-        &self,
-        query_id: u32,
-    ) -> Vec<(i64, i64, i64, i64, u32)> {
+    pub fn query_reverse_for_depth(&self, query_id: u32) -> Vec<(i64, i64, i64, i64, u32)> {
         let mut results = Vec::new();
 
         // Iterate through all target_ids in the forest map
@@ -2147,7 +2299,13 @@ impl Impg {
                             let query_end = interval.metadata.query_end;
                             let target_start = interval.first as i64;
                             let target_end = interval.last as i64;
-                            results.push((query_start, query_end, target_start, target_end, target_id));
+                            results.push((
+                                query_start,
+                                query_end,
+                                target_start,
+                                target_end,
+                                target_id,
+                            ));
                         }
                     }
                 }
@@ -2280,23 +2438,21 @@ impl Impg {
         approximate_mode: bool,
         subset_filter: Option<&crate::subset_filter::SubsetFilter>,
     ) -> Vec<AdjustedInterval> {
-        // Initialize visited ranges from masked regions if provided
+        // Initialize visited ranges from masked regions if provided.  The
+        // common depth --use-BFS path has no mask and invokes this once per
+        // chunk; prebuilding a SortedRanges for every sequence per chunk is
+        // pure overhead, so allocate entries lazily as the BFS reaches them.
         let mut visited_ranges: FxHashMap<u32, SortedRanges> = if let Some(m) = masked_regions {
             m.iter().map(|(&k, v)| (k, (*v).clone())).collect()
         } else {
-            (0..self.seq_index.len() as u32)
-                .into_par_iter() // Use parallel iterator
-                .map(|id| {
-                    let len = self.seq_index.get_len_from_id(id).unwrap();
-                    (id, SortedRanges::new(len as i64, 0))
-                })
-                .collect()
+            FxHashMap::default()
         };
 
         // Filter input range
+        let target_len = self.seq_index.get_len_from_id(target_id).unwrap_or(0) as i64;
         let filtered_input_range = visited_ranges
             .entry(target_id)
-            .or_default()
+            .or_insert_with(|| SortedRanges::new(target_len, 0))
             .insert((range_start, range_end));
 
         let mut results = Vec::new();
@@ -2372,6 +2528,19 @@ impl Impg {
                                 overlap_range.1,
                                 min_gap_compressed_identity,
                             )
+                        } else if !store_cigar && min_gap_compressed_identity.is_none() {
+                            self.project_overlapping_interval_coords(
+                                &metadata,
+                                current_target_id,
+                                overlap_range.0,
+                                overlap_range.1,
+                                sequence_index,
+                            )
+                            .map(
+                                |(query_interval, target_interval)| {
+                                    (query_interval, Vec::new(), target_interval)
+                                },
+                            )
                         } else {
                             self.project_overlapping_interval(
                                 &metadata,
@@ -2438,12 +2607,15 @@ impl Impg {
                         true
                     };
                     if should_add_to_output {
-                        results.push((query_interval, cigar.clone(), target_interval));
+                        results.push((query_interval, cigar, target_interval));
                     }
 
                     // Only add non-overlapping portions to the stack for further exploration
                     if query_id != current_target_id {
-                        let ranges = visited_ranges.entry(query_id).or_default();
+                        let ranges = visited_ranges.entry(query_id).or_insert_with(|| {
+                            let len = self.seq_index.get_len_from_id(query_id).unwrap_or(0);
+                            SortedRanges::new(len as i64, 0)
+                        });
 
                         let mut should_add = true;
 
@@ -2538,23 +2710,21 @@ impl Impg {
         approximate_mode: bool,
         subset_filter: Option<&crate::subset_filter::SubsetFilter>,
     ) -> Vec<AdjustedInterval> {
-        // Initialize visited ranges from masked regions if provided
+        // Initialize visited ranges from masked regions if provided.  The
+        // common depth --use-BFS path has no mask and invokes this once per
+        // chunk; prebuilding a SortedRanges for every sequence per chunk is
+        // pure overhead, so allocate entries lazily as the BFS reaches them.
         let mut visited_ranges: FxHashMap<u32, SortedRanges> = if let Some(m) = masked_regions {
             m.iter().map(|(&k, v)| (k, (*v).clone())).collect()
         } else {
-            (0..self.seq_index.len() as u32)
-                .into_par_iter() // Use parallel iterator
-                .map(|id| {
-                    let len = self.seq_index.get_len_from_id(id).unwrap();
-                    (id, SortedRanges::new(len as i64, 0))
-                })
-                .collect()
+            FxHashMap::default()
         };
 
         // Filter input range
+        let target_len = self.seq_index.get_len_from_id(target_id).unwrap_or(0) as i64;
         let filtered_input_range = visited_ranges
             .entry(target_id)
-            .or_default()
+            .or_insert_with(|| SortedRanges::new(target_len, 0))
             .insert((range_start, range_end));
 
         let mut results = Vec::new();
@@ -2620,24 +2790,38 @@ impl Impg {
                                             return;
                                         }
 
-                                        let projection_result = if approximate_mode {
-                                            self.project_overlapping_interval_fast(
-                                                metadata,
-                                                *current_target_id,
-                                                overlap_start,
-                                                overlap_end,
-                                                min_gap_compressed_identity,
-                                            )
-                                        } else {
-                                            self.project_overlapping_interval(
-                                                metadata,
-                                                *current_target_id,
-                                                overlap_start,
-                                                overlap_end,
-                                                sequence_index,
-                                                min_gap_compressed_identity,
-                                            )
-                                        };
+                                        let projection_result =
+                                            if approximate_mode {
+                                                self.project_overlapping_interval_fast(
+                                                    metadata,
+                                                    *current_target_id,
+                                                    overlap_start,
+                                                    overlap_end,
+                                                    min_gap_compressed_identity,
+                                                )
+                                            } else if !store_cigar
+                                                && min_gap_compressed_identity.is_none()
+                                            {
+                                                self.project_overlapping_interval_coords(
+                                                    metadata,
+                                                    *current_target_id,
+                                                    overlap_start,
+                                                    overlap_end,
+                                                    sequence_index,
+                                                )
+                                                .map(|(query_interval, target_interval)| {
+                                                    (query_interval, Vec::new(), target_interval)
+                                                })
+                                            } else {
+                                                self.project_overlapping_interval(
+                                                    metadata,
+                                                    *current_target_id,
+                                                    overlap_start,
+                                                    overlap_end,
+                                                    sequence_index,
+                                                    min_gap_compressed_identity,
+                                                )
+                                            };
 
                                         if let Some((query_interval, cigar_ops, target_interval)) =
                                             projection_result
@@ -2712,7 +2896,7 @@ impl Impg {
                                 last: adjusted_query_end,
                                 metadata: query_id,
                             },
-                            adjusted_cigar.clone(),
+                            adjusted_cigar,
                             Interval {
                                 first: adjusted_target_start,
                                 last: adjusted_target_end,
@@ -2723,7 +2907,10 @@ impl Impg {
 
                     // Only consider for next depth if it's a different sequence
                     if query_id != current_target_id {
-                        let ranges = visited_ranges.entry(query_id).or_default();
+                        let ranges = visited_ranges.entry(query_id).or_insert_with(|| {
+                            let len = self.seq_index.get_len_from_id(query_id).unwrap_or(0);
+                            SortedRanges::new(len as i64, 0)
+                        });
 
                         let mut should_add = true;
 
@@ -3027,7 +3214,12 @@ impl ImpgIndex for Impg {
         }
     }
 
-    fn query_raw_overlapping(&self, target_id: u32, start: i64, end: i64) -> Vec<RawAlignmentInterval> {
+    fn query_raw_overlapping(
+        &self,
+        target_id: u32,
+        start: i64,
+        end: i64,
+    ) -> Vec<RawAlignmentInterval> {
         if let Some(tree) = self.get_or_load_tree(target_id) {
             let mut results = Vec::new();
             tree.query(start, end, |interval| {
@@ -3093,7 +3285,10 @@ fn project_target_range_through_alignment(
             break;
         }
 
-        match (cigar_op.target_delta() as i64, cigar_op.query_delta(strand) as i64) {
+        match (
+            cigar_op.target_delta() as i64,
+            cigar_op.query_delta(strand) as i64,
+        ) {
             (0, query_delta) => {
                 // Insertion in query (deletions in target)
                 if target_pos >= requested_target_range.0 {
@@ -3172,13 +3367,110 @@ fn project_target_range_through_alignment(
         }
         // Adjust last operation length
         if last_op_remaining < 0 {
-            projected_cigar_ops[last_op_idx - first_op_idx - 1].adjust_len(last_op_remaining as i32);
+            projected_cigar_ops[last_op_idx - first_op_idx - 1]
+                .adjust_len(last_op_remaining as i32);
         }
 
         Some((
             projected_query_start,
             projected_query_end,
             projected_cigar_ops,
+            projected_target_start,
+            projected_target_end,
+        ))
+    } else {
+        None
+    }
+}
+
+fn project_target_range_coords_through_alignment(
+    requested_target_range: (i64, i64),
+    record: (i64, i64, i64, i64, Strand),
+    cigar_ops: &[CigarOp],
+) -> Option<(i64, i64, i64, i64)> {
+    let (target_start, target_end, query_start, query_end, strand) = record;
+    let dir: i64 = if strand == Strand::Forward { 1 } else { -1 };
+    let mut query_pos: i64 = if strand == Strand::Forward {
+        query_start
+    } else {
+        query_end
+    };
+    let mut target_pos: i64 = target_start;
+
+    let mut found_overlap = false;
+    let mut projected_query_start: i64 = -1;
+    let mut projected_query_end: i64 = -1;
+    let mut projected_target_start: i64 = -1;
+    let mut projected_target_end: i64 = -1;
+    let last_target_pos = min(target_end, requested_target_range.1);
+
+    for cigar_op in cigar_ops {
+        if target_pos > last_target_pos {
+            break;
+        }
+
+        match (
+            cigar_op.target_delta() as i64,
+            cigar_op.query_delta(strand) as i64,
+        ) {
+            (0, query_delta) => {
+                if target_pos >= requested_target_range.0 {
+                    if !found_overlap {
+                        projected_query_start = query_pos;
+                        projected_target_start = target_pos;
+                        found_overlap = true;
+                    }
+                    projected_query_end = query_pos + query_delta;
+                    projected_target_end = target_pos;
+                }
+                query_pos += query_delta;
+            }
+            (target_delta, 0) => {
+                let overlap_start = target_pos.max(requested_target_range.0);
+                let overlap_end = (target_pos + target_delta).min(last_target_pos);
+
+                if overlap_start < overlap_end {
+                    if !found_overlap {
+                        projected_query_start = query_pos;
+                        projected_target_start = overlap_start;
+                        found_overlap = true;
+                    }
+                    projected_query_end = query_pos;
+                    projected_target_end = overlap_end;
+                }
+                target_pos += target_delta;
+            }
+            (target_delta, query_delta) => {
+                let overlap_start = target_pos.max(requested_target_range.0);
+                let overlap_end = (target_pos + target_delta).min(requested_target_range.1);
+
+                if overlap_start < overlap_end {
+                    let overlap_length = overlap_end - overlap_start;
+                    let query_overlap_start = query_pos + (overlap_start - target_pos) * dir;
+                    let query_overlap_end = query_overlap_start + overlap_length * dir;
+
+                    if !found_overlap {
+                        projected_query_start = query_overlap_start;
+                        projected_target_start = overlap_start;
+                        found_overlap = true;
+                    }
+                    projected_query_end = query_overlap_end;
+                    projected_target_end = overlap_end;
+                }
+
+                target_pos += target_delta;
+                query_pos += query_delta;
+            }
+        }
+    }
+
+    if found_overlap
+        && projected_query_start != projected_query_end
+        && projected_target_start != projected_target_end
+    {
+        Some((
+            projected_query_start,
+            projected_query_end,
             projected_target_start,
             projected_target_end,
         ))
@@ -3306,6 +3598,35 @@ mod tests {
             let result =
                 project_target_range_through_alignment((70, 95), base, &cigar_ops).unwrap();
             assert_eq!(result, (170, 195, vec![CigarOp::new(25, '=')], 70, 95));
+        }
+    }
+
+    #[test]
+    fn test_project_target_range_coords_matches_full_projection() {
+        let cigar_ops = vec![
+            CigarOp::new(10, '='),
+            CigarOp::new(5, 'I'),
+            CigarOp::new(5, 'D'),
+            CigarOp::new(50, '='),
+            CigarOp::new(50, 'I'),
+            CigarOp::new(35, '='),
+        ];
+        let cases = [
+            ((0, 100), (0, 100, 50, 200, Strand::Forward)),
+            ((50, 55), (0, 100, 50, 200, Strand::Forward)),
+            ((50, 66), (0, 100, 50, 200, Strand::Forward)),
+            ((70, 95), (0, 100, 50, 200, Strand::Forward)),
+            ((0, 100), (0, 100, 50, 200, Strand::Reverse)),
+            ((50, 66), (0, 100, 50, 200, Strand::Reverse)),
+        ];
+
+        for (target_range, record) in cases {
+            let full =
+                project_target_range_through_alignment(target_range, record, &cigar_ops).unwrap();
+            let coords =
+                project_target_range_coords_through_alignment(target_range, record, &cigar_ops)
+                    .unwrap();
+            assert_eq!((full.0, full.1, full.3, full.4), coords);
         }
     }
 
