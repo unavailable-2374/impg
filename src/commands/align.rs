@@ -95,6 +95,13 @@ struct SequenceInfo {
 }
 
 /// Generate alignment pairs from named in-memory sequences.
+///
+/// Thin wrapper over [`sweepga::knn_graph::select_pairs_haplotype_aware`]
+/// (distance-based strategies) and
+/// [`sweepga::knn_graph::select_pairs_haplotype_aware_no_sketch`] (the
+/// `None` / `Random(_)` / `WfmashDensity(_)` strategies) — both group by
+/// PanSN `SAMPLE#HAPLOTYPE` prefix and fall back transparently to
+/// contig-level selection for non-PanSN inputs.
 pub fn generate_pairs_for_sequences(
     sequences: &[(String, &[u8])],
     strategy: &SparsificationStrategy,
@@ -104,28 +111,37 @@ pub fn generate_pairs_for_sequences(
     if n <= 1 {
         return vec![];
     }
+    let names: Vec<&str> = sequences.iter().map(|(name, _)| name.as_str()).collect();
 
-    // For strategies that benefit from sequence data, compute sketches
     match strategy {
         SparsificationStrategy::None
         | SparsificationStrategy::Random(_)
         | SparsificationStrategy::WfmashDensity(_) => {
-            sweepga::knn_graph::select_pairs(n, None, strategy, mash_params)
+            sweepga::knn_graph::select_pairs_haplotype_aware_no_sketch(
+                &names,
+                strategy,
+                mash_params,
+            )
         }
         _ => {
-            // Compute sketches for distance-based strategies
             let raw_seqs: Vec<Vec<u8>> = sequences.iter().map(|(_, s)| s.to_vec()).collect();
             let sketches = sweepga::mash::compute_sketches_parallel(
                 &raw_seqs,
                 mash_params.kmer_size,
                 mash_params.sketch_size,
             );
-            sweepga::knn_graph::select_pairs_from_sketches(&sketches, strategy)
+            sweepga::knn_graph::select_pairs_haplotype_aware(
+                &names,
+                &sketches,
+                strategy,
+                mash_params.sketch_size,
+            )
         }
     }
 }
 
-/// Generate pairs from pre-loaded SequenceInfo (with pre-computed sketches).
+/// Generate pairs from pre-loaded `SequenceInfo` (with pre-computed sketches),
+/// routed through sweepga's haplotype-aware selection.
 fn generate_pairs(
     sequences: &[SequenceInfo],
     strategy: &SparsificationStrategy,
@@ -135,18 +151,27 @@ fn generate_pairs(
     if n <= 1 {
         return vec![];
     }
+    let names: Vec<&str> = sequences.iter().map(|s| s.name.as_str()).collect();
 
-    // For simple strategies, no need for sketches
     match strategy {
         SparsificationStrategy::None
         | SparsificationStrategy::Random(_)
         | SparsificationStrategy::WfmashDensity(_) => {
-            sweepga::knn_graph::select_pairs(n, None, strategy, mash_params)
+            sweepga::knn_graph::select_pairs_haplotype_aware_no_sketch(
+                &names,
+                strategy,
+                mash_params,
+            )
         }
         _ => {
             let sketches: Vec<sweepga::mash::KmerSketch> =
                 sequences.iter().map(|s| s.sketch.clone()).collect();
-            sweepga::knn_graph::select_pairs_from_sketches(&sketches, strategy)
+            sweepga::knn_graph::select_pairs_haplotype_aware(
+                &names,
+                &sketches,
+                strategy,
+                mash_params.sketch_size,
+            )
         }
     }
 }
@@ -226,42 +251,148 @@ fn load_sequences(
     Ok(result)
 }
 
-/// Write job list for cluster execution
+/// Write job list for cluster execution.
+///
+/// For `wfmash`: emits one `wfmash -T <target_hap> -Q <query_hap> …`
+/// command per PanSN haplotype pair, using sweepga's upstream
+/// [`sweepga::joblist::write_wfmash_pansn_commands`] helper. Single-FASTA
+/// PanSN input is the common pangenome case; the same physical FASTA is
+/// passed on both sides and wfmash filters by prefix.
+///
+/// For `fastga`: FastGA has no PanSN prefix filter, so we emit one
+/// command per unique `(target_file, query_file)` pair (collapses
+/// single-file PanSN inputs to one self-alignment line).
 fn write_job_list<W: Write>(
     pairs: &[(usize, usize)],
     sequences: &[SequenceInfo],
     output_dir: &str,
     writer: &mut W,
     config: &AlignConfig,
-) -> io::Result<()> {
+) -> io::Result<usize> {
+    match config.aligner.as_str() {
+        "wfmash" => write_wfmash_joblist(pairs, sequences, output_dir, writer, config),
+        _ => write_fastga_joblist(pairs, sequences, output_dir, writer, config),
+    }
+}
+
+/// Emit one `wfmash` command per unique haplotype pair, backed by
+/// sweepga's upstream emitter. Supports both single-FASTA PanSN inputs
+/// (all haplotypes in one file; self-map form) and multi-FASTA inputs
+/// (per-haplotype FASTAs or mixed; each job points at the FASTA that
+/// owns its haplotype's contigs).
+fn write_wfmash_joblist<W: Write>(
+    pairs: &[(usize, usize)],
+    sequences: &[SequenceInfo],
+    output_dir: &str,
+    writer: &mut W,
+    config: &AlignConfig,
+) -> io::Result<usize> {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use sweepga::pansn::{extract_pansn_key, PanSnLevel};
+
+    // Contig index → haplotype key.
+    let hap_of: Vec<String> = sequences
+        .iter()
+        .map(|s| {
+            extract_pansn_key(&s.name, PanSnLevel::Haplotype).unwrap_or_else(|| s.name.clone())
+        })
+        .collect();
+
+    // Haplotype key → representative FASTA path (first-seen wins if a
+    // haplotype somehow spans multiple files).
+    let mut hap_file: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for (i, s) in sequences.iter().enumerate() {
+        hap_file
+            .entry(hap_of[i].clone())
+            .or_insert_with(|| PathBuf::from(&s.path));
+    }
+
+    // Collapse selected contig pairs to unique (target_hap, query_hap)
+    // keys. Sort order is (target, query) so output is reproducible.
+    let mut seen: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+    for &(i, j) in pairs {
+        let (a, b) = (&hap_of[i], &hap_of[j]);
+        let pair = if a <= b {
+            (a.clone(), b.clone())
+        } else {
+            (b.clone(), a.clone())
+        };
+        seen.insert(pair);
+    }
+
+    // Build per-job target/query FASTA paths.
+    let mut jobs: Vec<sweepga::joblist::WfmashPansnJob> = Vec::with_capacity(seen.len());
+    for (target_hap, query_hap) in seen {
+        let target_fasta = hap_file
+            .get(&target_hap)
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from(&sequences[0].path));
+        let query_fasta = hap_file
+            .get(&query_hap)
+            .cloned()
+            .unwrap_or_else(|| target_fasta.clone());
+        jobs.push(sweepga::joblist::WfmashPansnJob {
+            target_hap,
+            query_hap,
+            target_fasta,
+            query_fasta,
+        });
+    }
+
+    let out_dir = std::path::Path::new(output_dir);
+    let cfg = sweepga::joblist::WfmashPansnEmitConfig {
+        output_dir: out_dir,
+        threads: config.num_threads,
+        block_length: config.min_aln_length,
+    };
+    sweepga::joblist::write_wfmash_pansn_commands(&jobs, &cfg, writer)
+        .map_err(|e| io::Error::other(format!("wfmash joblist emit failed: {e}")))?;
+    Ok(jobs.len())
+}
+
+/// Emit one `FastGA` command per unique `(target_file, query_file)` pair.
+fn write_fastga_joblist<W: Write>(
+    pairs: &[(usize, usize)],
+    sequences: &[SequenceInfo],
+    output_dir: &str,
+    writer: &mut W,
+    config: &AlignConfig,
+) -> io::Result<usize> {
     let freq_arg = if let Some(f) = config.frequency {
         format!("-f{}", f)
     } else {
         format!("-f{}", sequences.len() * config.frequency_multiplier)
     };
 
-    for (i, j) in pairs {
-        let seq_i = &sequences[*i];
-        let seq_j = &sequences[*j];
-
-        // Create output filename
-        let output_name = format!("{}_vs_{}.paf", seq_i.name, seq_j.name);
+    let mut count = 0usize;
+    for (file_i, file_j) in collect_file_pairs(pairs, sequences) {
+        let stem_i = Path::new(&file_i)
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let stem_j = Path::new(&file_j)
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        // FastGA's joblist is indexed by file stems, which come from
+        // Path::file_stem() and so contain no path separators or PanSN `#`.
+        // No sanitization needed here; wfmash's joblist (which does use
+        // `SAMPLE#HAPLOTYPE` keys) goes through sweepga::joblist instead.
+        let output_name = format!("{}_vs_{}.paf", stem_i, stem_j);
         let output_path = format!("{}/{}", output_dir, output_name);
 
-        // Write command
         writeln!(
             writer,
             "FastGA {} -T{} -l{} {} {} > {}",
-            freq_arg,
-            config.num_threads,
-            config.min_aln_length,
-            seq_i.path,
-            seq_j.path,
-            output_path
+            freq_arg, config.num_threads, config.min_aln_length, file_i, file_j, output_path,
         )?;
+        count += 1;
     }
 
-    Ok(())
+    Ok(count)
 }
 
 /// Collect unique file pairs from sequence pairs.
@@ -411,7 +542,7 @@ fn run_alignments(
         avg_len,
         wfmash_density,
         None, // num_mappings: use wfmash default
-        pairs_file_path,
+        pairs_file_path.clone(),
     )?;
 
     // Run alignments for each unique file pair
@@ -432,18 +563,22 @@ fn run_alignments(
             );
         }
 
-        let paf_temp = sweepga::align_self_paf(
-            fasta_path,
-            aligner.as_ref(),
-            &config.aligner,
-            kmer_frequency,
-            config.num_threads,
-            config.min_aln_length,
-            Some("90".to_string()),
-            config.temp_dir.clone(),
-            config.batch_bytes.as_deref(),
-            !config.show_progress,
-        )
+        let paf_temp = match config.batch_bytes.as_deref() {
+            None => sweepga::align_self_paf_direct(aligner.as_ref(), fasta_path),
+            Some(batch_bytes) => sweepga::align_self_paf_batched(
+                fasta_path,
+                &config.aligner,
+                kmer_frequency,
+                config.num_threads,
+                config.min_aln_length,
+                Some("90".to_string()),
+                config.temp_dir.clone(),
+                wfmash_density,
+                pairs_file_path.clone(),
+                batch_bytes,
+                !config.show_progress,
+            ),
+        }
         .map_err(|e| io::Error::other(format!("{} alignment failed: {}", config.aligner, e)))?;
 
         // Apply filtering unless --no-filter
@@ -777,18 +912,22 @@ fn sweepga_align_all_vs_all(
     )?;
 
     // Run all-vs-all alignment, with optional batching
-    sweepga::align_self_paf(
-        combined_fasta.path(),
-        aligner.as_ref(),
-        &config.aligner,
-        config.kmer_frequency,
-        config.num_threads,
-        config.min_aln_length,
-        config.map_pct_identity.clone(),
-        config.temp_dir.clone(),
-        config.batch_bytes.as_deref(),
-        true, // quiet
-    )
+    match config.batch_bytes.as_deref() {
+        None => sweepga::align_self_paf_direct(aligner.as_ref(), combined_fasta.path()),
+        Some(batch_bytes) => sweepga::align_self_paf_batched(
+            combined_fasta.path(),
+            &config.aligner,
+            config.kmer_frequency,
+            config.num_threads,
+            config.min_aln_length,
+            config.map_pct_identity.clone(),
+            config.temp_dir.clone(),
+            wfmash_density,
+            None, // pairs_file: sweepga_align_all_vs_all is unsparsified
+            batch_bytes,
+            true, // quiet
+        ),
+    }
     .map_err(|e| io::Error::other(format!("{} alignment failed: {}", config.aligner, e)))
 }
 
@@ -943,12 +1082,10 @@ fn sweepga_align_pairwise_generic(
                 }
             }
             Err(e) => {
-                log::warn!(
-                    "sweepga: pairwise alignment failed for {} vs {}: {}",
-                    sequences[i].0,
-                    sequences[j].0,
-                    e
-                );
+                return Err(io::Error::other(format!(
+                    "sweepga pairwise alignment failed for {} vs {}: {}",
+                    sequences[i].0, sequences[j].0, e
+                )));
             }
         }
     }
@@ -1005,14 +1142,138 @@ pub fn run_align(
         AlignOutputFormat::JobList => {
             let job_file = format!("{}/align_jobs.txt", output_dir);
             let mut writer = BufWriter::new(File::create(&job_file)?);
-            write_job_list(&pairs, &sequences, output_dir, &mut writer, &config)?;
-            info!("Wrote {} alignment jobs to {}", pairs.len(), job_file);
+            let written = write_job_list(&pairs, &sequences, output_dir, &mut writer, &config)?;
+            info!("Wrote {} alignment jobs to {}", written, job_file);
         }
         AlignOutputFormat::Paf | AlignOutputFormat::OneAln => {
             run_alignments(&pairs, &sequences, output_dir, &config)?;
         }
     }
 
+    Ok(())
+}
+
+/// Execute a joblist file (one shell command per line, `#`-comments and
+/// blank lines skipped) with `jobs`-way parallelism. Each command runs via
+/// `bash -c`. Progress — completion count, throughput, and ETA — is logged
+/// to stderr every ~2 seconds.
+///
+/// Returns an error listing failure counts if any individual job exits
+/// non-zero; successful jobs still ran and their output files are left in
+/// place (failures are reported, not rolled back).
+pub fn run_joblist(joblist_path: &Path, jobs: usize) -> io::Result<()> {
+    use std::process::Command;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    let file = File::open(joblist_path)?;
+    let reader = BufReader::new(file);
+    let commands: Vec<String> = reader
+        .lines()
+        .filter_map(|l| l.ok())
+        .filter(|l| {
+            let t = l.trim();
+            !t.is_empty() && !t.starts_with('#')
+        })
+        .collect();
+
+    let total = commands.len();
+    if total == 0 {
+        info!("Joblist {} is empty", joblist_path.display());
+        return Ok(());
+    }
+
+    let jobs = jobs.max(1);
+    info!(
+        "[joblist] running {} jobs from {} with {}-way parallelism",
+        total,
+        joblist_path.display(),
+        jobs,
+    );
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(jobs)
+        .build()
+        .map_err(|e| io::Error::other(format!("Failed to build joblist pool: {}", e)))?;
+
+    let start = Instant::now();
+    let completed = AtomicUsize::new(0);
+    let failures: Mutex<Vec<(usize, i32)>> = Mutex::new(Vec::new());
+    let last_log = Mutex::new(Instant::now() - std::time::Duration::from_secs(3));
+
+    pool.install(|| {
+        commands.par_iter().enumerate().for_each(|(i, cmd)| {
+            let status = Command::new("bash").args(["-c", cmd]).status();
+            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+
+            match status {
+                Ok(s) if s.success() => {}
+                Ok(s) => {
+                    let code = s.code().unwrap_or(-1);
+                    failures.lock().unwrap().push((i, code));
+                }
+                Err(e) => {
+                    failures.lock().unwrap().push((i, -1));
+                    log::warn!("[joblist] spawn failed for line {}: {}", i + 1, e);
+                }
+            }
+
+            let should_log = {
+                let mut last = last_log.lock().unwrap();
+                if last.elapsed().as_secs_f64() >= 2.0 || done == total {
+                    *last = Instant::now();
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_log {
+                let elapsed = start.elapsed().as_secs_f64();
+                let rate = done as f64 / elapsed.max(1e-9);
+                let remaining = total.saturating_sub(done);
+                let eta = if rate > 0.0 {
+                    remaining as f64 / rate
+                } else {
+                    0.0
+                };
+                info!(
+                    "[joblist] {}/{} ({:.1}%) elapsed={:.0}s rate={:.2} jobs/s eta={}m{:02}s",
+                    done,
+                    total,
+                    (done as f64 / total as f64) * 100.0,
+                    elapsed,
+                    rate,
+                    (eta / 60.0) as u64,
+                    (eta % 60.0) as u64,
+                );
+            }
+        });
+    });
+
+    let fails = failures.into_inner().unwrap();
+    let elapsed = start.elapsed().as_secs_f64();
+    if !fails.is_empty() {
+        let sample: Vec<String> = fails
+            .iter()
+            .take(5)
+            .map(|(i, code)| format!("line {} exit {}", i + 1, code))
+            .collect();
+        return Err(io::Error::other(format!(
+            "[joblist] {} of {} jobs failed (e.g. {}) after {:.1}s",
+            fails.len(),
+            total,
+            sample.join(", "),
+            elapsed,
+        )));
+    }
+
+    info!(
+        "[joblist] completed {} jobs in {:.1}s ({:.2} jobs/s)",
+        total,
+        elapsed,
+        total as f64 / elapsed.max(1e-9),
+    );
     Ok(())
 }
 
@@ -1035,6 +1296,11 @@ mod tests {
         let s: SparsificationStrategy = "wfmash:auto".parse().unwrap();
         assert_eq!(s, SparsificationStrategy::WfmashDensity(None));
     }
+
+    // The haplotype-grouping / sketch-merging / pair-expansion unit tests
+    // moved upstream with the helpers themselves (sweepga:
+    // knn_graph::{merge_sketches, expand_haplotype_pairs,
+    // select_pairs_haplotype_aware*} and pansn::group_indices_by_pansn).
 
     #[test]
     fn test_mash_sketch_and_distance() {

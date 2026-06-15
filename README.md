@@ -4,1010 +4,665 @@
 
 ## Why impg?
 
-Studying genomic variation at specific loci—disease genes, regulatory elements, structural variants—across populations or species traditionally requires either building expensive whole-genome graphs or using reference-based methods that miss variation. `impg` solves this by treating all-vs-all pairwise alignments as an *implicit pangenome graph*, rapidly projecting target ranges through the alignment network to extract only the homologous sequences you need. Query regions across many genomes in seconds. Perform transitive searches to discover connected sequences. Partition genomes into comparable loci. Refine regions to maximize sample coverage—all without constructing explicit graph structure. This makes pangenome-scale comparative genomics fast and practical.
+Studying variation at specific loci across populations or species usually
+means either building an expensive whole-genome graph or falling back to
+a single reference. `impg` takes a third path: it treats all-vs-all
+pairwise alignments as an *implicit pangenome graph* and projects
+target ranges through the alignment network to extract only the
+homologous sequences you need. Query regions across hundreds of
+genomes in seconds, walk transitive alignments, partition a cohort into
+comparable loci, refine regions to maximize sample support — all
+without ever materializing a graph structure.
 
-## Usage
+## What does it do?
 
-Here's a basic example:
+At its core, `impg` lifts ranges from a target sequence (the reference
+in a given alignment) into the queries aligned onto it. It outputs
+BED / BEDPE / PAF — ready to feed FASTA extraction, multiple sequence
+alignment, or a graph builder like `pggb` or `minigraph-cactus` — and
+can also emit GFA directly by chaining sweepga + seqwish + smoothxg-style
+smoothing.
+
+`impg` also embeds [syng](https://github.com/richarddurbin/syng) as a second backend: build a syncmer GBWT index once from a FASTA or AGC, then `query` / `partition` against it without ever running an aligner. Shared syncmers act as anchors; transitive chains define homology. Same output formats as the alignment path. `impg map` projects short reads onto a syng index in GAF or PAF form.
+
+## How does it work?
+
+`impg` uses [coitrees](https://github.com/dcjones/coitrees) (cache-oblivious
+interval trees) for fast range lookup, and stores CIGAR strings as
+compact deltas. The result is fast, memory-efficient projection of
+sequence ranges through alignment networks.
+
+## Install
 
 ```bash
-impg query -a cerevisiae.pan.paf.gz -r S288C#1#chrI:50000-100000 -x
-```
+# Bioconda
+conda install -c bioconda impg
 
-- `-a` specifies the path to the alignment file in PAF, 1ALN, or TPA format. PAF files must use CIGAR strings with `=` for matches and `X` for mismatches (e.g., from `wfmash` or `minimap2 --eqx`).
-- `-r` defines the target range in the format of `seq_name:start-end`
-- `-x` requests a *transitive closure* of the matches. That is, for each collected range, we then find what sequence ranges are aligned onto it. This is done progressively until we've closed the set of alignments connected to the initial target range.
-
-Depending on your alignments, this might result in the following BED file:
-
-```txt
-S288C#1#chrI        50000  100000
-DBVPG6044#1#chrI    35335  85288
-Y12#1#chrI          36263  86288
-DBVPG6765#1#chrI    36166  86150
-YPS128#1#chrI       47080  97062
-UWOPS034614#1#chrI  36826  86817
-SK1#1#chrI          52740  102721
-```
-
-## Installation
-
-You need Rust (`cargo`) installed. Then:
-
-```bash
+# Source
 git clone --recursive https://github.com/pangenome/impg.git
 cd impg
 cargo install --force --path .
 ```
 
-This single command installs `impg`, `gfaffix`, and companion binaries (`wfmash`, `FastGA`, etc.) into `~/.cargo/bin/`.
-
-### Troubleshooting
-
-If you encounter issues related to `libclang` during the build process, you may need to set specific environment variables to point to your LLVM installation. 
-
-```shell
-env -i HOME="$HOME" PATH="/usr/local/bin:/usr/bin:/bin:$HOME/.cargo/bin" LIBCLANG_PATH="/usr/lib/llvm-7/lib" BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/llvm-7/lib/clang/7.0.1/include" bash -c 'cargo build --release'
-```
-
-Alternatively, install from Bioconda:
-
-```bash
-conda install -c bioconda impg
-```
+The source install places `impg`, `gfaffix`, and the companion aligner
+binaries (`wfmash`, `FastGA`) into `~/.cargo/bin/`.
 
 ### Docker
 
-To simplify installation and versioning, we have an automated GitHub action that pushes the current docker build to [dockerhub](https://hub.docker.com/r/pangenome/impg).
-To use it, pull the docker image:
-
-```shell
+```bash
 docker pull pangenome/impg
-```
-
-Then, you can run `impg` with:
-
-```shell
 docker run pangenome/impg
 ```
 
-## Building with GNU Guix
+### Troubleshooting
 
-**NOTE**: All paths are relative to the repository root. If you are not working
-in the repository root, please update the paths to fit your work scenario.
+On older glibc systems (e.g. Debian Buster) a plain `cargo build` can
+fail because wfmash needs modern CMake / GCC / glibc. Use Guix's
+toolchain:
 
-To build `impg` with guix without making it available, run the following
-command:
-
-```sh
-guix build -L .guix/modules --file=guix.scm
+```bash
+source ./env.sh
+cargo build --release
 ```
 
-The `-L` option adds the `.guix/modules` directory to the front of the guile
-load path. The `--file` option points to the `guix.scm` at the root of the
-repository.
+See `.guix/` for the Guix build recipe (`guix build -L .guix/modules
+--file=guix.scm`). For `libclang` link errors, set `LIBCLANG_PATH` to
+your LLVM install (see `env -i … LIBCLANG_PATH=…`).
 
-To build and "install" `impg` with guix, run:
+## Quick start
 
-```sh
-guix install -L .guix/modules --file=guix.scm
+```bash
+impg query -a cerevisiae.pan.paf.gz -r S288C#1#chrI:50000-100000 -d 1000 -x
 ```
 
-### Development with Guix on older systems
+- `-a` — alignment file (PAF / 1ALN / TPA). PAF must use `=`/`X` CIGAR ops
+  (from `wfmash` or `minimap2 --eqx`).
+- `-r` — target range, `seq:start-end`.
+- `-d` — merge query-gathered ranges separated by up to this many bp.
+  This is also the largest internal gap/SV one query hop can absorb into
+  one reported interval.
+- `-x` — walk the transitive closure: find everything aligned to the
+  initial result, recursively.
 
-On systems with an older glibc (e.g. Debian Buster with glibc 2.28), a plain `cargo build` fails because wfmash requires cmake >= 3.16, GCC >= 9 (for C++17 `std::filesystem`), and several C libraries (htslib, gsl, jemalloc). Guix provides all of these, but its libraries are built against a newer glibc. To avoid mixing glibc versions, `env.sh` runs cargo and rustc under Guix's dynamic linker so everything uses Guix's toolchain consistently.
+Example output (BED):
 
-Prerequisites (one-time):
-
-```sh
-guix install jemalloc   # needed by wfmash
 ```
-
-Development workflow:
-
-```sh
-source ./env.sh              # once per shell session
-cargo build                  # debug build
-cargo build --release        # release build
-cargo test                   # run tests
-cargo install --path .       # install to ~/.cargo/bin
+S288C#1#chrI         50000   100000
+DBVPG6044#1#chrI     35335    85288
+Y12#1#chrI           36263    86288
+DBVPG6765#1#chrI     36166    86150
+YPS128#1#chrI        47080    97062
+UWOPS034614#1#chrI   36826    86817
+SK1#1#chrI           52740   102721
 ```
 
 ## Commands
 
-### Query
+All commands accept `-a` (alignment files, mixed PAF/1ALN/TPA) or
+`--alignment-list` (text file, one per line), `-t` / `--threads`, and
+`-v 0|1|2` for verbosity. Every command has a `--help` with the
+exhaustive flag list — this section covers the flags you'll actually turn.
 
-Query overlaps in the alignment:
-
-```bash
-# Query a single region
-impg query -a alignments.paf -r chr1:1000-2000
-
-# Query a whole sequence by name
-impg query -a alignments.paf -r chr1
-
-# Query multiple regions from a BED file (mix PAF and .1aln)
-impg query -a file1.paf file2.1aln -b regions.bed
-
-# Enable transitive overlap search
-impg query -a alignments.paf -r chr1:1000-2000 -x
-
-# Set maximum transitive depth (default: 2)
-impg query -a alignments.1aln -r chr1:1000-2000 -x -m 3
-
-# Filter by minimum gap-compressed identity
-impg query -a alignments.paf alignments.1aln -r chr1:1000-2000 --min-identity 0.9
-
-# Output formats (auto/bed/bedpe/paf/gfa/maf/fasta/fasta+paf/fasta-aln)
-impg query -a alignments.paf -r chr1:1000-2000 -o bed
-impg query -a alignments.1aln -r chr1:1000-2000 -o bedpe
-impg query -a file1.paf file2.1aln -b chr1:1000-2000 -o paf
-
-# Write output to file instead of stdout (using -O / --output-prefix)
-impg query -a alignments.paf -r chr1:1000-2000 -o bed -O results       # creates results.bed
-
-# gfa/maf/fasta output requires sequence files (--sequence-files or --sequence-list)
-impg query -a alignments.paf -r chr1:1000-2000 -o gfa --sequence-files ref.fa genomes.fa
-impg query -a alignments.1aln -r chr1:1000-2000 -o maf --sequence-list fastas.txt
-impg query -a file1.paf file2.1aln -r chr1:1000-2000 -o fasta --sequence-files *.fa
-
-# fasta+paf combines FASTA and PAF output
-impg query -a alignments.paf -r chr1:1000-2000 -o fasta+paf --sequence-files *.fa
-
-# fasta-aln outputs POA-based FASTA alignment
-impg query -a alignments.1aln -r chr1:1000-2000 -o fasta-aln --sequence-files *.fa
-
-# Works with AGC archives too
-impg query -a alignments.paf -r chr1:1000-2000 -o gfa --sequence-files genomes.agc
-
-# fasta output with reverse complement for reverse strand sequences
-impg query -a alignments.1aln -r chr1:1000-2000 -o fasta --sequence-files *.fa --reverse-complement
-
-# Merge nearby regions (default: 0)
-impg query -a file1.paf file2.1aln -r chr1:1000-2000 -d 1000
-
-# Filter results by minimum length
-impg query -a alignments.paf -r chr1:1000-2000 -l 5000
-
-# Use DFS instead of BFS for transitive search (slower but fewer overlapping results)
-impg query -a alignments.paf -r chr1:1000-2000 -x --transitive-dfs
-
-# Fast approximate mode for .1aln files (bed/bedpe only)
-impg query -a alignments.1aln -r chr1:1000-2000 --approximate
-
-# Fast approximate mode with transitive queries (requires --min-transitive-len > trace_spacing)
-impg query -a alignments.1aln -r chr1:1000-2000 --approximate -x --min-transitive-len 101
-
-# Restrict results to sequences listed in a file (one name per line)
-# Also filters intermediate steps during transitive queries
-impg query -a alignments.paf -r chr1:1000-2000 -x --subset-sequence-list sequences.txt
-
-# Transform coordinates back to original sequences when using subsequence inputs (seq_name:start-end)
-impg query -a alignments.paf -r chr1:1000-2000 -o paf --original-sequence-coordinates
-
-# Disable merging entirely
-impg query -a alignments.paf -r chr1:1000-2000 --no-merge
-
-# Force processing large regions (>10kbp) with gfa/maf output
-impg query -a alignments.paf -r chr1:1000-50000 -o gfa --sequence-files *.fa --force-large-region
-
-# Sparsify wfmash mappings for GFA output (auto or explicit fraction)
-impg query -a alignments.paf -r chr1:1000-2000 -o gfa --sequence-files *.fa --sparsify auto
-```
-
-#### GFA engine selection
-
-When outputting GFA (`-o gfa`), use `--gfa-engine` to choose the graph construction algorithm (default: `pggb`):
-
-| Engine | Algorithm | Best for |
-|--------|-----------|----------|
-| `pggb` | seqwish + smoothxg-style smoothing + gfaffix normalization | Default. Smoothed, normalized variation graphs. |
-| `seqwish` | All-vs-all sweepga + transitive closure graph induction | Raw (unsmoothed) variation graphs. |
-| `poa` | Single-pass partial order alignment (SPOA) | Small regions, quick MSA-based output. |
+### `query` — project a range through alignments
 
 ```bash
-# Choose a GFA engine (default: pggb)
-impg query -a alignments.paf -r chr1:1000-2000 -o gfa --gfa-engine pggb --sequence-files *.fa
-impg query -a alignments.paf -r chr1:1000-2000 -o gfa --gfa-engine seqwish --sequence-files *.fa
-impg query -a alignments.paf -r chr1:1000-2000 -o gfa --gfa-engine poa --sequence-files *.fa
+# A single range
+impg query -a aln.paf -r chr1:1000-2000 -d 100
 
-# Disable alignment filtering for seqwish (faster but may produce less clean graphs)
-impg query -a alignments.paf -r chr1:1000-2000 -o gfa --gfa-engine seqwish --no-filter --sequence-files *.fa
+# Transitive closure (depth 2 by default)
+impg query -a aln.paf -r chr1:1000-2000 -d 100 -x -m 3
 
-# Custom POA scoring (match,mismatch,gap_open1,gap_extend1,gap_open2,gap_extend2)
-impg query -a alignments.paf -r chr1:1000-2000 -o gfa --poa-scoring 5,4,6,2,24,1 --sequence-files *.fa
+# Many regions from a BED, mixed PAF + 1ALN
+impg query -a f1.paf f2.1aln -b regions.bed -d 100
 
-# Tune seqwish graph induction parameters (seqwish and pggb engines)
-impg query -a alignments.paf -r chr1:1000-50000 -o gfa --gfa-engine seqwish --sequence-files *.fa \
-    --min-match-len 50 --transclose-batch 5000000 --sparse-factor 0.5
+# One local graph per BED4 row, named from column 4
+impg query -a pan.syng -b regions.bed -d 100k -o gfa:syng:crush \
+           --sequence-files genomes.agc -O graphs/
 
-# Tune smoothxg-style smoothing (pggb engine, default: two passes at 700,1100 bp)
-impg query -a alignments.paf -r chr1:1000-50000 -o gfa --gfa-engine pggb --sequence-files *.fa \
-    --target-poa-length 700,1100 --max-node-length 200 --poa-padding-fraction 0.001
+# Output formats: auto | bed | bedpe | paf | gfa | vcf | maf | fasta | fasta+paf | fasta-aln
+impg query -a aln.paf -r chr1:1000-2000 -d 100 -o bed
+impg query -a aln.paf -r chr1:1000-2000 -d 100 -o gfa --sequence-files genomes.fa
+impg query -a aln.paf -r chr1:1000-2000 -d 100 -o vcf --sequence-files genomes.fa
+impg query -a aln.1aln -r chr1:1000-2000 -d 100 -o fasta --sequence-files *.fa \
+           --reverse-complement
+
+# Filter / shape the result
+impg query -a aln.paf -r chr1:1000-2000 --min-identity 0.9 -l 5000 -d 1000
+
+# Restrict to a sequence whitelist (also filters transitive intermediates)
+impg query -a aln.paf -r chr1:1000-2000 -d 100 -x --subset-sequence-list seqs.txt
+
+# Fast approximate mode (.1aln only; bed/bedpe output)
+impg query -a aln.1aln -r chr1:1000-2000 -d 100 --approximate
+
+# Alignment-free path: -a accepts a syng index prefix (see `syng` below)
+impg query -a pan.syng -r chr1:1000-2000 -d 100 --sequence-files genomes.fa
 ```
 
-#### Partitioned GFA pipeline
+GFA / MAF / FASTA outputs need `--sequence-files` (FASTA or AGC
+archive) or `--sequence-list`. See [GFA engines](#gfa-engines) for
+engine selection and partitioned builds. With `-b` and graph-like outputs
+(`gfa`, `vcf`, or `gbwt`), `-O` is treated as an output directory and
+each BED row is written separately using the BED column 4 name as the
+file stem.
 
-For large regions, append `:WINDOW` to the engine name to split the region into windows, build a GFA per window, lace them together, and run a single final gfaffix normalization. This reduces peak memory:
+### `graph` — build a pangenome graph from FASTA
+
+Runs alignment + seqwish + (optional) smoothing, no pre-computed
+alignment needed.
 
 ```bash
-# Build a partitioned GFA for a 50kb region using 10kb windows (seqwish engine)
-impg query -a alignments.paf -r chr1:0-50000 -o gfa --gfa-engine seqwish:10000 \
-    --sequence-files *.fa -O output
+# Default pipeline: pggb (align → seqwish → smooth → gfaffix)
+impg graph --sequence-files genomes.fa -g output.gfa -t 16
 
-# Same with pggb engine (smoothing runs per partition, then laced + normalized)
-impg query -a alignments.paf -r chr1:0-50000 -o gfa --gfa-engine pggb:10000 \
-    --sequence-files *.fa -O output
+# Partitioned mode for large inputs (aligns once, then builds per-window)
+impg graph --sequence-files genomes.fa -g output.gfa --gfa-engine pggb:10000
 
-# POA engine with small windows (POA works best with small regions)
-impg query -a alignments.paf -r chr1:0-50000 -o gfa --gfa-engine poa:5000 \
-    --sequence-files *.fa -O output
+# Reuse an existing PAF instead of aligning
+impg graph --sequence-files genomes.fa -g output.gfa --paf-file aln.paf
+
+# Batch alignment to cap per-batch RAM (wfmash) or disk (FastGA)
+impg graph --sequence-files genomes.fa -g output.gfa --batch-bytes 2G
 ```
 
-The `ENGINE:WINDOW` syntax:
-- Window size in bp (minimum: 1000)
-- Bypasses the `--force-large-region` requirement (each partition is small)
-- Works with `query`, `partition`, and `graph` commands
+`query -o gfa` and `graph` share the same engine code and flags — the
+only difference is where the sequences come from (IMPG index +
+sequence files for `query`; FASTAs directly for `graph`).
 
-#### Alignment visualizations
-
-The `scripts/faln2html.py` tool converts FASTA alignments into interactive HTML visualizations that can be viewed in any web browser. It supports [react-msa](https://github.com/GMOD/JBrowseMSA) and [ProSeqViewer](https://github.com/BioComputingUP/ProSeqViewer) as MSA viewers.
+### `partition` — split the cohort into windowed loci
 
 ```bash
-# Visualize FASTA alignments in the browser (pipe directly to visualization script)
-impg query -a alignments.paf -r chr1:1000-2000 -o fasta-aln --sequence-files *.fa | \
-  python scripts/faln2html.py -i - -o alignment.html
+# 1Mb windows, single BED output
+impg partition -a aln.paf -w 1000000 -d 100000
 
-# Choose visualization tool (reactmsa or proseqviewer)
-impg query -a alignments.paf -r chr1:1000-2000 -o fasta-aln --sequence-files *.fa | \
-  python scripts/faln2html.py -i - -o alignment.html --tool proseqviewer
+# One FASTA per partition (for downstream pipelines)
+impg partition -a aln.1aln -w 1000000 -d 100000 -o fasta --sequence-files *.fa \
+               --separate-files --output-folder partitions/
+
+# Selection strategies pick the next starting sequence
+impg partition -a aln.paf -w 1000000 -d 100000 --selection-mode longest     # default
+impg partition -a aln.paf -w 1000000 -d 100000 --selection-mode sample      # PanSN sample
+impg partition -a aln.paf -w 1000000 -d 100000 --selection-mode haplotype   # PanSN haplotype
+
+# Start from a fixed list of sequences
+impg partition -a aln.paf -w 1000000 -d 100000 --starting-sequences-file seqs.txt
+
+# GFA output per partition; engines: pggb | seqwish | poa
+impg partition -a aln.paf -w 1000000 -d 100000 -o gfa --gfa-engine pggb \
+               --sequence-files *.fa --separate-files --output-folder gfas/
+
+# Fully partitioned pipeline: build → lace → one gfaffix pass
+impg partition -a aln.paf -w 100000 -d 100000 -o gfa --gfa-engine pggb:10000 \
+               --sequence-files *.fa --output-folder results/
 ```
 
-### Partition
+### `refine` — tighten a locus to maximize sample support
 
-Partition the alignment into smaller pieces:
+Explores asymmetric left/right expansions around each range, picking
+the smallest window that keeps the most sequences, samples, or
+haplotypes fully spanning it. Useful for anchoring loci outside
+structural variants.
 
 ```bash
-# Basic partitioning with 1Mb windows (outputs single partitions.bed file with partition number in 4th column)
-impg partition -a alignments.paf -w 1000000
+impg refine -a aln.paf -r chr1:1000-2000
+impg refine -a aln.paf -b loci.bed --span-bp 2000 -d 200000
 
-# Output separate files for each partition
-impg partition -a alignments.1aln -w 1000000 --separate-files
+# Maximize PanSN samples / haplotypes instead of raw sequence count
+impg refine -a aln.paf -r chr1:1000-2000 --pansn-mode sample
+impg refine -a aln.paf -r chr1:1000-2000 --pansn-mode haplotype
 
-# Specify output folder for partition files (directory will be created if it doesn't exist)
-impg partition -a file1.paf file2.1aln -w 1000000 --output-folder results
+# Cap expansion distance
+impg refine -a aln.paf -r chr1:1000-2000 --max-extension 0.90    # 90% of locus
+impg refine -a aln.paf -r chr1:1000-2000 --max-extension 50000   # 50kb absolute
 
-# Start from specific sequences (one per line)
-impg partition -a alignments.paf -w 1000000 --starting-sequences-file seqs.txt
-
-# Merge nearby intervals within partitions
-impg partition -a file1.paf file2.1aln -w 1000000 -d 10000
-
-# Selection strategies for next sequence
-impg partition -a alignments.paf -w 1000000 --selection-mode longest        # longest missing region
-impg partition -a alignments.1aln -w 1000000 --selection-mode total          # most total missing
-impg partition -a alignments.paf -w 1000000 --selection-mode sample         # by sample (PanSN)
-impg partition -a alignments.1aln -w 1000000 --selection-mode haplotype      # by haplotype (PanSN)
-
-# Control transitive search depth and minimum region size
-impg partition -a file1.paf file2.1aln -w 1000000 -m 2 --min-transitive-len 10000
-
-# Approximate mode with partition (requires --min-transitive-len > trace_spacing)
-impg partition -a alignments.1aln -w 1000000 --approximate --min-transitive-len 101 -o bed
-# Output as GFA, MAF or FASTA requires sequence files and --separate-files flag
-impg partition -a alignments.paf -w 1000000 -o gfa --sequence-files *.fa --separate-files --output-folder gfa_partitions
-impg partition -a alignments.1aln -w 1000000 -o maf --sequence-list fastas.txt --separate-files --output-folder maf_partitions
-impg partition -a file1.paf file2.1aln -w 1000000 -o fasta --sequence-files *.fa --separate-files --output-folder fasta_partitions
-# Works with AGC archives too
-impg partition -a alignments.paf -w 1000000 -o gfa --sequence-files genomes.agc --separate-files --output-folder gfa_partitions
-
-# GFA engine selection (same engines as query: pggb, seqwish, poa; default: pggb)
-impg partition -a alignments.paf -w 1000000 -o gfa --gfa-engine pggb --sequence-files *.fa --separate-files
-impg partition -a alignments.paf -w 1000000 -o gfa --gfa-engine seqwish --sequence-files *.fa --separate-files
-impg partition -a alignments.paf -w 1000000 -o gfa --gfa-engine seqwish --no-filter --sequence-files *.fa --separate-files  # no filtering
-
-# Tune seqwish graph induction parameters (seqwish and pggb engines)
-impg partition -a alignments.paf -w 1000000 -o gfa --gfa-engine seqwish --sequence-files *.fa --separate-files \
-    --min-match-len 50 --transclose-batch 5000000
-
-# Tune smoothxg-style smoothing (pggb engine, default: two passes at 700,1100 bp)
-impg partition -a alignments.paf -w 1000000 -o gfa --gfa-engine pggb --sequence-files *.fa --separate-files \
-    --target-poa-length 700,1100 --max-node-length 200
-
-# Partitioned GFA: build per-partition GFA, lace together, normalize in one step
-# Outputs a single partitions.gfa instead of separate files
-impg partition -a alignments.paf -w 100000 -o gfa --gfa-engine pggb:10000 \
-    --sequence-files *.fa --output-folder results
+# Emit the spanning-entity list alongside the refined BED
+impg refine -a aln.paf -r chr1:1000-2000 --support-output support.bed
 ```
 
-### Similarity
-
-Compute pairwise similarity between sequences in a region:
+### `similarity` — pairwise similarity / distance within a region
 
 ```bash
-# Basic similarity computation
-impg similarity -a alignments.paf -r chr1:1000-2000 --sequence-files ref.fa genomes.fa
+impg similarity -a aln.paf -r chr1:1000-2000 --sequence-files *.fa
+impg similarity -a aln.1aln -b regions.bed --sequence-files *.fa --distances
 
-# Query multiple regions from a BED file (it produces multiple similarity matrices)
-impg similarity -a alignments.1aln -b regions.bed --sequence-files *.fa
+# Group by PanSN prefix
+impg similarity -a aln.paf -r chr1:1000-2000 --sequence-files *.fa \
+                --delim '#' --delim-pos 2     # sample#haplotype
 
-# Output distances instead of similarities
-impg similarity -a file1.paf file2.1aln -r chr1:1000-2000 --sequence-files *.fa --distances
-
-# Include all pairs (even those with zero similarity)
-impg similarity -a alignments.paf -r chr1:1000-2000 --sequence-files *.fa --all
-
-# Restrict analysis to sequences listed in a file (one name per line)
-# Entries may be full contig names or sample identifiers (e.g., HG00097 or HG00097_hap1)
-impg similarity -a alignments.1aln -r chr1:1000-2000 --sequence-files *.fa --subset-sequence-list sequences.txt
-
-# Group sequences by delimiter (e.g., for PanSN naming, "sample#haplotype#chr" -> "sample")
-impg similarity -a alignments.paf -r chr1:1000-2000 --sequence-files *.fa --delim '#'
-
-# Use 2nd occurrence of delimiter for grouping (e.g., for PanSN naming, "sample#haplotype#chr" -> "sample#haplotype")
-impg similarity -a alignments.1aln -r chr1:1000-2000 --sequence-files *.fa --delim '#' --delim-pos 2
-
-# Perform PCA/MDS dimensionality reduction
-impg similarity -a file1.paf file2.1aln -r chr1:1000-2000 --sequence-files *.fa --pca
-
-# Specify number of PCA components (default: 2)
-impg similarity -a alignments.paf -r chr1:1000-2000 --sequence-files *.fa --pca --pca-components 3
-
-# Choose similarity measure for PCA distance matrix (jaccard/cosine/dice, default: jaccard)
-impg similarity -a alignments.1aln -r chr1:1000-2000 --sequence-files *.fa --pca --pca-measure cosine
-
-# PCA with adaptive polarization using previous regions
-impg similarity -a file1.paf file2.1aln -b regions.bed --sequence-files *.fa --pca --polarize-n-prev 3
-
-# PCA with sample-guided polarization
-impg similarity -a alignments.paf -b regions.bed --sequence-files *.fa --pca --polarize-guide-samples sample1,sample2
-
+# PCA / MDS on the distance matrix
+impg similarity -a aln.paf -r chr1:1000-2000 --sequence-files *.fa \
+                --pca --pca-components 3 --pca-measure cosine
 ```
 
-### Refine
-
-Refine loci to maximize sample support:
+### `lace` — combine many per-window graphs into one
 
 ```bash
-# Refine a single region to maximize the number of sequences spanning both ends
-impg refine -a alignments.paf -r chr1:1000-2000
+# GFAs (auto-detected)
+impg lace -f gfa1.gfa gfa2.gfa gfa3.gfa -o combined.gfa
 
-# Refine many regions from a BED file
-impg refine -a alignments.paf -b loci.bed
+# From a list file, fill inter-window gaps with sequence
+impg lace -l gfa_list.txt -o combined.gfa --fill-gaps 1 --sequence-files ref.fa
 
-# Allow merging within 200 kb and require at least 2 kb coverage near each end
-impg refine -a alignments.paf -r chr1:1000-2000 -d 200000 --span-bp 2000
-
-# Expand up to 90% of the locus length on each side (default: 0.5)
-impg refine -a alignments.paf -r chr1:1000-2000 --max-extension 0.90
-
-# Or cap the search to an absolute flank size
-impg refine -a alignments.paf -r chr1:1000-2000 --max-extension 50000
-
-# Maximize PanSN sample or haplotype counts instead of sequence counts
-impg refine -a alignments.paf -r chr1:1000-2000 --pansn-mode sample
-impg refine -a alignments.paf -r chr1:1000-2000 --pansn-mode haplotype
-
-# Capture the supporting entities in a separate BED file
-impg refine -a alignments.paf -r chr1:1000-2000 --support-output refine_support.bed
-
-# Control extension step size (default: 1000 bp)
-impg refine -a alignments.paf -r chr1:1000-2000 --extension-step 500
-
-# Exclude regions from entity counting via blacklist
-impg refine -a alignments.paf -r chr1:1000-2000 --blacklist-bed excluded.bed
-
-# Restrict to specific sequences (filters transitive steps too)
-impg refine -a alignments.paf -r chr1:1000-2000 --subset-sequence-list samples.txt
-
-# Works with .1aln files too (requires --sequence-files)
-impg refine -a alignments.1aln --sequence-files sequences.fa -r chr1:1000-2000
-
-# Fast approximate mode for .1aln files (requires --min-transitive-len > trace_spacing)
-impg refine -a alignments.1aln -r chr1:1000-2000 --approximate --min-transitive-len 101
+# VCFs
+impg lace -f *.vcf -o combined.vcf --reference ref.fa
 ```
 
-When `--support-output` is provided, the tool emits a BED file listing every sequence/sample/haplotype that spans the refined region: `sequence	start	end	region-name`.
+Path names must follow `NAME:START-END` (e.g.
+`HG002#1#chr20:1000-2000`); the coordinates drive reassembly. `NAME`
+may contain `:` — the last `:` is the separator.
 
-`impg refine` explores asymmetric left/right expansions around each target region to find the smallest window that maximizes the number of sequences, samples, or haplotypes. Keeping start/end alignment anchors outside structural variants helps avoid selecting loci that terminate inside large insertions or deletions.
-
-### Stats
-
-Print alignment statistics:
-
-```bash
-# Get statistics for PAF file
-impg stats -a alignments.paf
-
-# Get statistics for .1aln file
-impg stats -a alignments.1aln
-
-# Get statistics for combined PAF and .1aln files
-impg stats -a file1.paf file2.1aln
-```
-
-### Lace
-
-Combine multiple GFA or VCF files:
-
-```bash
-# Combine multiple GFA files (auto-detects format)
-impg lace -f file1.gfa file2.gfa file3.gfa -o combined.gfa
-
-# Combine multiple VCF files
-impg lace -f file1.vcf file2.vcf file3.vcf -o combined.vcf
-
-# Use a list file containing file paths
-impg lace -l files.txt -o combined.gfa
-
-# Explicitly specify input format (gfa, vcf, auto)
-impg lace -f *.gfa -o combined.gfa --format gfa
-
-# Fill gaps between contiguous path segments (GFA only)
-impg lace -f *.gfa -o combined.gfa --fill-gaps 1 # Fill with N's
-impg lace -f *.gfa -o combined.gfa --fill-gaps 1 --sequence-files sequence.fa # Fill with sequences
-
-# Fill all gaps, including start and end gaps (GFA only, requires sequence files)
-impg lace -f *.gfa -o combined.gfa --fill-gaps 2 --sequence-files sequence.fa
-
-# Control output compression
-impg lace -f *.gfa -o combined.gfa.gz --compress gzip
-impg lace -f *.gfa -o combined.gfa.bgz --compress bgzip
-impg lace -f *.gfa -o combined.gfa.zst --compress zstd
-
-# Use reference for VCF contig validation
-impg lace -f *.vcf -o combined.vcf --reference reference.fa
-
-# Use custom temporary directory
-impg lace -f *.gfa -o combined.gfa --temp-dir /tmp/lace_work
-```
-
-#### Path Name Format
-
-The command expects path names in the format:
-
-```
-NAME:START-END
-```
-
-Example: `HG002#1#chr20:1000-2000`
-
-The command uses these coordinates to:
-1. Identify which sequences belong together
-2. Order the sequences correctly
-3. Detect and handle overlaps or gaps
-
-Note: `NAME` can contain ':' characters. When parsing coordinates, the command uses the last occurrence of ':' to separate the name from the coordinate range.
-
-#### Post-processing recommendations
-
-After combining the GFA files, the resulting graph will already have compacted node IDs ranging from `1` to the total number of nodes. However, it is strongly recommended to perform post-processing steps using **[ODGI](https://github.com/pangenome/odgi)** to unchop and sort the graph.
-
-```bash
-odgi unchop -i combined.gfa -o - -t 16 | \
-    odgi sort -i - -o - -p gYs -t 16 | \
-    odgi view -i - -g > combined.final.gfa
-```
-
-If overlaps were present, and then trimmed during the merging process, it's advisable to run **[GFAffix](https://github.com/marschall-lab/GFAffix)** before the ODGI pipeline to remove redundant nodes introduced by the overlap trimming.
+Recommended post-processing:
 
 ```bash
 gfaffix combined.gfa -o combined.fix.gfa &> /dev/null
-
 odgi unchop -i combined.fix.gfa -o - -t 16 | \
-    odgi sort -i - -o - -p gYs -t 16 | \
-    odgi view -i - -g > combined.final.gfa
+  odgi sort  -i -              -o - -p gYs -t 16 | \
+  odgi view  -i -              -g > combined.final.gfa
 ```
 
-### Graph
-
-Build a pangenome graph directly from FASTA sequences (no pre-computed alignments needed):
+### `index` — build a reusable IMPG index
 
 ```bash
-# Build graph from FASTA files (default engine: pggb)
-impg graph --sequence-files sequences.fa -g output.gfa -t 16
+# Single combined index
+impg index -a aln.paf -i aln.impg
 
-# Build from multiple FASTA files
-impg graph --sequence-files file1.fa file2.fa file3.fa -g output.gfa
+# Mixed PAF + 1ALN + TPA
+impg index -a f1.paf f2.1aln f3.tpa -i all.impg
 
-# Use a list file containing FASTA paths
-impg graph --sequence-list fasta_files.txt -g output.gfa
-
-# Write to stdout
-impg graph --sequence-files sequences.fa -g - | odgi build -g - -o output.og
+# Per-file index (faster incremental rebuilds for large cohorts)
+impg index --alignment-list files.txt --index-mode per-file
 ```
 
-#### Engine selection
+`--index-mode auto` (default) picks per-file when ≥ 100 files are
+listed, single otherwise. impg warns when the index is older than its
+input alignments; `-f/--force-reindex` rebuilds.
 
-Use `--gfa-engine` to choose the graph construction algorithm (default: `pggb`):
+Bgzipped PAFs work natively (`impg` reads `.paf.gz`); optionally
+`bgzip -r alignments.paf.gz` creates a `.gzi` sidecar to speed up the
+first read.
+
+### `stats` — summarize alignments
 
 ```bash
-# Pggb: alignment + seqwish graph induction + smoothing + gfaffix normalization (default)
-impg graph --sequence-files sequences.fa -g output.gfa --gfa-engine pggb
-
-# Seqwish: alignment + seqwish graph induction + gfaffix normalization (no smoothing)
-impg graph --sequence-files sequences.fa -g output.gfa --gfa-engine seqwish
-
-# POA: single-pass partial order alignment (fastest for small inputs)
-impg graph --sequence-files sequences.fa -g output.gfa --gfa-engine poa
+impg stats -a aln.paf
+impg stats -a f1.paf f2.1aln
 ```
 
-All engines produce sorted, unchopped GFA with consistent path names.
+### `syng` and `map` — alignment-free syncmer backend
 
-#### Partitioned graph building
+`impg syng` builds a [syng](https://github.com/richarddurbin/syng) index from FASTA or AGC. Six sidecars are written under one prefix (`<prefix>.1khash` dictionary, `.1gbwt` GBWT, `.syng.names`, `.syng.pstep` sampled path-step checkpoints, `.syng.spos` sampled syncmer occurrence positions, `.syng.meta` parameters — auto-loaded on read). Any later `impg query` / `partition` / `map` can then point `-a` at the prefix (or any sidecar) and skip pairwise alignment. Exact target coordinates are located by walking GBWT occurrences forward to the next sampled checkpoint and resolving it through `.syng.spos`.
 
-Append `:WINDOW` to the engine name to build the graph in windows, reducing peak memory for large inputs:
+Parameters follow the syng paper: `--smer-length` (`s`, default 8) and `--syncmer-length` (`k`, must be odd, default 63). Position sidecars use a regular per-path syncmer-step grid plus the terminal syncmer: `--position-sample-rate 256` samples steps `0, 256, 512, ...` and the final step on each path. `--parallel-dictionary` adds a deterministic prepass for large inputs.
+
+`impg map` projects FASTA/FASTQ queries onto a syng index via shared syncmers. The default output is GAF (per-read syncmer-node walks); pass `-o paf` for projected genome coordinates, `-o pack` for a compact binary node support vector, `-o pack-tsv` for a human-readable TSV support vector, or `-o proj` for a sample projection bundle containing both `sample.pack` and `reads.gaf.zst`. Text map output written with `-O` is compressed automatically when the filename ends in `.zst` or `.zstd`; `pack` uses internal block zstd compression for random access by node ID. `packbin` remains accepted as a compatibility alias for compact pack output.
+
+Use `impg syng-repair -a <prefix> --position-sample-rate <N> --force` to rebuild or resample `.syng.pstep` and `.syng.spos` from an existing `.1gbwt` / `.1khash` syng index without re-reading the original sequences.
+
+End-to-end walkthrough using ODGI's C4 test GFA (90 HPRC haplotypes, ~6.9 Mb total):
 
 ```bash
-# Build with 10kb partitions (aligns once, then partitions + builds GFA per window)
-impg graph --sequence-files sequences.fa -g output.gfa --gfa-engine pggb:10000
+# 1. Get the C4 GFA from odgi/test/, dump paths to FASTA
+curl -sL -O https://raw.githubusercontent.com/pangenome/odgi/master/test/chr6.C4.gfa
+odgi paths -i chr6.C4.gfa -f > chr6.C4.fa
+samtools faidx chr6.C4.fa
 
-# Works with any engine
-impg graph --sequence-files sequences.fa -g output.gfa --gfa-engine seqwish:10000
+# 2. Build the syng index (~80 ms on this dataset, 4 threads)
+impg syng -f chr6.C4.fa -o c4.syng \
+          --syncmer-length 63 --smer-length 8 --syncmer-seed 7 \
+          --position-sample-rate 256 -t 4
+# writes c4.syng.1khash / .1gbwt / .syng.names / .syng.spos / .syng.pstep / .syng.meta
+
+# 3. Query a 10 kb grch38 sub-window onto all 90 haplotypes
+impg query -a c4.syng -r 'grch38#chr6:31972046-32055647:0-10000' \
+           -d 150 --sequence-files chr6.C4.fa | head -3
+# HG00673#1#JAHBBZ010000030.1:31835924-31919525  0  10000  grch38...:0-10000  .  +
+# HG01123#2#JAGYYY010000050.1:31954985-32038586  0  10001  grch38...:0-10000  .  +
+# HG01243#1#JAHEOY010000117.1:3252171-3329407    0   9999  grch38...:0-10000  .  +
+
+# 4. Whole grch38 C4 path (length from .fai) → 36 hits, FASTA out
+LEN=$(awk -F'\t' '$1=="grch38#chr6:31972046-32055647"{print $2}' chr6.C4.fa.fai)
+impg query -a c4.syng -r "grch38#chr6:31972046-32055647:0-${LEN}" \
+           -d 150 --sequence-files chr6.C4.fa -o fasta > c4.homologs.fa
+
+# 5. Map a 2 kb probe back onto the index
+samtools faidx chr6.C4.fa 'grch38#chr6:31972046-32055647:5000-7000' > probe.fa
+impg map -a c4.syng -q probe.fa | cut -f1-6 | head -1
+# grch38...:5000-7000  2001  16  1979  +  <264>265>266<267<268>...
+impg map -a c4.syng -q probe.fa -o pack-tsv | head
+# #node_id  count
+# 264      1
+# 265      1
+impg map -a c4.syng -q probe.fa -o pack-tsv -O probe.pack.tsv.zst
+impg map -a c4.syng -q probe.fa -o pack -O probe.pack \
+         --pack-compression-level 12
+impg map -a c4.syng -q probe.fa -o proj -O probe.proj
+impg map -a c4.syng -q probe.fa -o paf
+# grch38...:5000-7000  2001  1302  1833  +  HG02109#1#...  77232  6300  6831  126 531 0 an:i:2 sk:i:63
 ```
 
-#### Alignment backend options
+`pack` stores a dense u8 count vector over syng node IDs, zstd-compressed
+in independently addressable blocks, plus a small overflow table for node
+counts above 255. `--pack-compression-level` defaults to 12; level 19 is a
+compact cohort/archive setting that is slower to write but just as fast to
+read in practice.
 
-The seqwish and pggb engines run all-vs-all alignment internally. The aligner can be selected with `--aligner` (default: `wfmash`; alternative: `fastga`). PanSN-formatted sequence names are handled automatically, and the k-mer frequency is scaled by the number of genomes.
+A `proj` directory is the richer sample projection object:
 
-> **Aligner compatibility:**
-> - `--sparsify` is **wfmash-only** — combining `--aligner fastga` with `--sparsify` is an error.
-> - `--fastga-frequency` / `--fastga-frequency-multiplier` (k-mer frequency) is **fastga-only** — combining `--aligner wfmash` with these flags is an error.
-
-```bash
-# Choose aligner backend (default: wfmash)
-impg graph --sequence-files sequences.fa -g output.gfa --aligner fastga
-
-# Adjust k-mer frequency multiplier for fastga (default: 10x number of genomes)
-impg graph --sequence-files sequences.fa -g output.gfa --aligner fastga --fastga-frequency-multiplier 5
-
-# Set explicit k-mer frequency for fastga
-impg graph --sequence-files sequences.fa -g output.gfa --aligner fastga --fastga-frequency 100
-
-# Filter alignments by minimum length
-impg graph --sequence-files sequences.fa -g output.gfa --min-aln-length 500
-
-# Sparsify wfmash mappings (auto or explicit fraction; wfmash only)
-impg graph --sequence-files sequences.fa -g output.gfa --sparsify auto
-
-# Batch alignment to limit per-batch resource usage (FastGA: disk, wfmash: memory)
-impg graph --sequence-files sequences.fa -g output.gfa --batch-bytes 2G
-
-# Skip pre-computed alignment step with a PAF file
-impg graph --sequence-files sequences.fa -g output.gfa --paf-file alignments.paf
+```text
+sample.proj/
+  manifest.json
+  sample.pack
+  reads.gaf.zst
 ```
 
-#### Seqwish graph induction options
+Use `pack` when aggregate graph support is enough or when storing many
+samples. Use `proj` when inference should also have read-walk linkage evidence
+available.
 
-These options control the transitive closure step used by the seqwish and pggb engines. They are available in `graph`, `query -o gfa`, and `partition -o gfa`.
+`impg genotype` (`impg gt`) is the namespace for graph-based genotyping
+methods. The first listed method is `cos`: cosine genotyping over graph-feature
+coverage, following the COSIGT/LikeGT scoring model:
 
 ```bash
-# Minimum match length for alignments (default: 23)
-impg graph --sequence-files sequences.fa -g output.gfa --min-match-len 50
-
-# Batch size for transitive closure (default: 10000000; reduce for lower memory)
-impg graph --sequence-files sequences.fa -g output.gfa --transclose-batch 5000000
-
-# Use sparse factor to reduce alignment density (0.0 = keep all; default: 0.0)
-impg graph --sequence-files sequences.fa -g output.gfa --sparse-factor 0.5
-
-# Use disk-backed interval trees for very large datasets (slower but lower memory)
-impg graph --sequence-files *.fa -g output.gfa --disk-backed
-
-# Repeat filtering (suppress paths through repeats that appear too many times)
-impg graph --sequence-files sequences.fa -g output.gfa --repeat-max 1000 --min-repeat-dist 500
+impg genotype cos -a c4.syng -p sample.pack \
+  -r 'grch38#chr6:31972046-32055647:0-10000' \
+  --ploidy 2 --top-n 20
 ```
 
-#### Smoothxg-style smoothing options (pggb engine)
+`cosigt` is accepted as an alias for `cos` to make the paper/tool lineage
+clear. `cos` extracts haplotype candidates from the requested reference path
+range, builds traversal-count vectors over the candidate syncmer nodes, and ranks
+ploidy-sized haplotype combinations against the sample `pack`
+coverage vector by cosine similarity. The default candidate mode is
+`spanning`: candidates must have shared anchors spanning the requested
+reference interval. Use `--candidate-mode overlapping` to score each gathered
+candidate interval independently. See `docs/genotype-architecture.md` for the
+graph-feature evidence model this is built around.
 
-These options control the per-block POA smoothing step in the `pggb` engine. They are available in `graph`, `query -o gfa`, and `partition -o gfa`.
-
-The `--target-poa-length` parameter accepts a comma-separated list of values, one per smoothing pass (matching pggb's `-G` flag). The default `700,1100` runs two passes: first resolving variation up to ~700 bp, then a second pass resolving up to ~1100 bp. Each pass feeds its output into the next, progressively smoothing longer variation.
+`impg infer` lifts the same pack/cos scoring path over ranges or partitions and
+emits allele calls over genomic intervals:
 
 ```bash
-# Two-pass smoothing with custom lengths (default: "700,1100")
-impg graph --sequence-files sequences.fa -g output.gfa --gfa-engine pggb --target-poa-length 700,1100
-
-# Single-pass smoothing
-impg graph --sequence-files sequences.fa -g output.gfa --gfa-engine pggb --target-poa-length 700
-
-# Three-pass smoothing for very diverse regions
-impg graph --sequence-files sequences.fa -g output.gfa --gfa-engine pggb --target-poa-length 700,1100,1500
-
-# Maximum node length before chopping (default: 100)
-impg graph --sequence-files sequences.fa -g output.gfa --gfa-engine pggb --max-node-length 200
-
-# POA padding fraction of average block length (default: 0.001)
-impg graph --sequence-files sequences.fa -g output.gfa --gfa-engine pggb --poa-padding-fraction 0.01
+impg infer -a hprc.syng --proj sample.proj \
+  --partitions partitions.bed --top-n 1 -O sample.infer.tsv.zst
 ```
 
-#### Alignment filtering options (seqwish engine)
+Inputs choose the operation mode: `-r/--target-range` types one range,
+`--target-bed` types a BED-like range list, `--partitions` consumes ready
+`impg partition` BED output, and omitting all three runs internal syng partition
+discovery, which requires `-d/--merge-distance`. `infer` can consume `--pack`
+for aggregate graph support or `--proj` for a bundle that also carries read
+walks. Add `--stitch beam --emit-mosaic out.tsv --emit-fasta haps.fa
+--emit-gfa diplotype.gfa --sequence-files panel.fa-or.agc` to stitch local
+calls into phased mosaic paths and materialize sequence. When `--proj` or
+`--gaf` read walks are available, stitched inference rewards phase transitions
+supported by the same reads (`--read-link-weight`,
+`--min-read-link-anchors`) while `--switch-penalty` keeps unnecessary panel
+crossovers expensive. Add `--phase-block-size N` to split broad targets into
+internal phase blocks before stitching, which lets the same model infer copied
+segments inside a partition. See `docs/infer-design.md`.
 
-By default, `impg graph` applies sweepga's plane-sweep filtering to produce clean alignments with scaffold-based chaining. This removes spurious cross-chromosome alignments (e.g., from repetitive elements like TEs, telomeres, or rDNA).
+`-r` splits on the **last** `:`. Path names from `odgi paths -f`
+already contain coordinates (`grch38#chr6:31972046-32055647`), so a
+whole-sequence query still needs an explicit trailing sub-range
+(`:0-${LEN}`) — otherwise impg parses `grch38#chr6` as the sequence
+and the bare `31972046-32055647` as the range, and the genome lookup
+fails.
+
+Default query mode runs BiWFA boundary refinement and so requires
+`--sequence-files`. Pass `--syng-raw` for the raw syncmer-resolution
+pass-through. Tune via `--syng-padding`, `--syng-min-chain-anchors`
+(lower -> more paralog hits; default is an adaptive cap derived from
+query length, syncmer density, and expected exact-syncmer survival at
+95% identity), `--syng-min-chain-fraction` (default `0.5`; set `0` for
+exploratory local-chain discovery), and the seed-frequency filters
+`--syng-seed-max-occurrences` / `--syng-seed-drop-top-fraction`.
+By default syng query drops the top 0.05% most frequent query-local seed
+syncmers, seeds ranges from bounded exact GBWT walk seeds of five
+syncmers (`--syng-seed-walk-anchors`; set `3` for more sensitive seeds),
+and does not use a fixed absolute occurrence cap; set
+`--syng-seed-max-occurrences` only when a hard panel-specific ceiling is
+desired. High-frequency syncmers are ignored only while seeding candidate
+ranges; once a range survives, downstream scoring can still recover all
+syncmers by walking that path range. `query -o gbwt` emits a
+region-specific sub-GBWT. The syng prefix passed to `-a` is resolved
+relative to cwd, so either `cd` to the index directory or pass an absolute
+path. For a focused syng-backed local GFA recipe, see
+[`docs/syng-gfa-query.md`](docs/syng-gfa-query.md).
+
+For graph outputs, `query -o gfa|vcf --render-graph` also renders the final
+1D graph with `gfalook`. The default image is PNG beside the `-O` output prefix
+(`<prefix>.png`); `--render-graph-output` overrides the image path, and
+`--render-graph-format svg` or a `.svg` suffix emits SVG. Add
+`--render-graph-depth` to pass `-m` to `gfalook` for mean-depth coloring. With
+`-b regions.bed` graph output, `-O` is a directory for the graph files and the
+render output is written per BED row using the sanitized BED column 4 name.
+
+If you already have a local GFA, call variants directly with POVU via
+`impg gfa2vcf -g local.gfa -o local.vcf -r ref_path`. This is the same
+GFA-to-VCF conversion used internally by `query -o vcf` and `partition -o vcf`.
+
+## GFA engines
+
+The `graph`, `query -o gfa`, and `partition -o gfa` commands share
+one set of engine implementations, selected via `--gfa-engine`:
+
+| Engine | Pipeline | Use for |
+|---|---|---|
+| `pggb` (default) | sweepga + seqwish + smoothxg-style smoothing + gfaffix | smoothed variation graphs |
+| `seqwish` | sweepga + seqwish + gfaffix | raw (unsmoothed) graphs |
+| `poa` | single-pass SPOA | small regions, quick MSA-based output |
+| `syng` / `syng:blunt` | regional syng syncmer graph with exact zero-overlap path materialization | source-spelling syng graph output from syng indexes |
+| `syng:raw` | regional syng syncmer overlap graph | explicit native overlap graph for debugging or overlap-aware consumers |
+| `syng-local` / `syng-local:blunt` | extract query-selected sequences, build a fresh local syng graph, then exact zero-overlap materialization | experimental regional syncmer parameter sweeps |
+
+For syng-index queries, `--gfa-engine syng` defaults to `syng:blunt`.
+The compact form `-o gfa:syng:blunt,k=63,s=8,seed=7` is accepted as
+shorthand for `-o gfa --gfa-engine syng:blunt,k=63,s=8,seed=7`; the
+`k/s/seed` tail is checked against the loaded syng index.
+Blunt syng output is sequence-preserving when the graph can fetch source DNA
+for non-syncmer spans via `--sequence-files` or the local temporary FASTA used
+by `syng-local`. Without source sequence files, missing gap DNA is emitted as
+`N`, and those paths are explicitly not source-preserving. Use `syng:raw` when
+you want the native syng overlap graph; raw path spelling requires an
+overlap-aware parser and is not the same as concatenating S-line DNA.
+Use `syng-local` when the local graph should be rebuilt from the extracted
+regional sequences with its own syncmer scheme, for example
+`-o gfa:syng-local:blunt,k=127,s=16,seed=7:crush`; in this mode `k/s/seed`
+select the local rebuild parameters rather than asserting the global index.
+Unlike `syng`, `syng-local` does not apply the syng frequency mask unless
+`:mask` is requested explicitly.
+Syng GFA extraction selects the top 0.05% most frequent local syncmer nodes and
+private-splits unsupported high-frequency occurrences before raw or blunt graph
+materialization. Occurrences in supported high-frequency runs or exact spans
+stay shared (`freq-run=10` and `freq-span=1k` by default). The same
+run/span rescue is applied to spectrum-selected dispersed scaffold-glue nodes,
+so there is no second private-split path that bypasses the high-frequency
+support policy. It also splits rare repeated-copy local syncmer contexts by
+default, so high-copy repeats and single-syncmer repeat loops do not become
+global graph glue. Use
+`-o gfa:syng:nomask` to disable this, or
+`-o gfa:syng:mask,top=0.001,max-occ=500,freq-run=10,freq-span=1k:crush` to
+tune it. Use `freq-run-aware=false` or `legacy-freq-mask=true` to reproduce the
+older node-level frequency removal for debugging.
+Add `:cut-ns`, for example `-o gfa:syng:cut-ns:crush`, to drop assembly N-runs
+from fetched gap DNA and split graph paths at those breaks.
+
+For graph builds from query-extracted sequences, add an explicit terminal
+N-run clipping stage before the engine: `-o gfa:cut-n=100:pggb`. This clips
+only leading and trailing `N`/`n` runs whose length is at least the requested
+threshold before graph construction; internal N-runs and shorter terminal
+N-runs are preserved. There is no default clipping threshold, and omitting
+`cut-n=<bp>` leaves extracted sequences unchanged.
+
+The same shorthand works for the other engines: `-o gfa:pggb`,
+`-o gfa:seqwish`, `-o gfa:poa`, and `-o gfa:syng`. Alignment-backed graph
+builds may also include the aligner prefix, for example
+`-o gfa:wfmash:seqwish`, `-o gfa:fastga:pggb`, or
+`-o gfa:sweepga:seqwish`; this is equivalent to setting `--aligner` and
+`--gfa-engine` separately. Add a generic `:crush` stage to run exact
+path-preserving flubble/motif crush resolution over the induced blunt GFA,
+then emit the finalized graph with default self-loop normalization and `Ygs`
+sorting, for example `-o gfa:pggb:crush` or `-o gfa:seqwish:crush`.
+
+For a C4/HPRCv2-style local render where terminal assembly N blocks would
+otherwise become noisy graph tips:
 
 ```bash
-# Disable filtering entirely (much faster, but may produce less clean graphs)
-impg graph --sequence-files sequences.fa -g output.gfa --no-filter
-
-# Control mapping cardinality (default: many:many)
-impg graph --sequence-files sequences.fa -g output.gfa --num-mappings 1:1    # strictest
-impg graph --sequence-files sequences.fa -g output.gfa --num-mappings n:n    # most permissive
-
-# Scaffold-based filtering (chains alignments along diagonal)
-impg graph --sequence-files sequences.fa -g output.gfa --scaffold-jump 50000   # Max gap between chained alignments
-impg graph --sequence-files sequences.fa -g output.gfa --scaffold-mass 10000   # Min total aligned bases in scaffold
-impg graph --sequence-files sequences.fa -g output.gfa --scaffold-filter 1:1   # Scaffold cardinality
-
-# Overlap and identity thresholds
-impg graph --sequence-files sequences.fa -g output.gfa --overlap 0.95      # Max overlap between alignments (0.0-1.0)
-impg graph --sequence-files sequences.fa -g output.gfa --min-aln-identity 0.9  # Min alignment identity (0.0-1.0)
+impg query -a ~/hprcv2/HPRC_r2_assemblies_0.6.1.syng \
+  -r GRCh38#0#chr6:<C4-range> \
+  --sequence-files ~/hprcv2/HPRC_r2_assemblies_0.6.1.agc \
+  -d 100000 \
+  -o gfa:cut-n=100:pggb \
+  -O c4.cutn100.pggb.gfa
 ```
 
-#### POA engine options
+For a C4/HPRCv2-style local render where terminal assembly N blocks would
+otherwise become noisy graph tips:
 
 ```bash
-# Custom POA scoring (match,mismatch,gap_open1,gap_extend1,gap_open2,gap_extend2)
-impg graph --sequence-files sequences.fa -g output.gfa --gfa-engine poa --poa-scoring 5,4,6,2,24,1
+impg query -a ~/hprcv2/HPRC_r2_assemblies_0.6.1.syng \
+  -r GRCh38#0#chr6:<C4-range> \
+  --sequence-files ~/hprcv2/HPRC_r2_assemblies_0.6.1.agc \
+  -d 100000 \
+  -o gfa:cut-n=100:pggb \
+  -O c4.cutn100.pggb.gfa
 ```
 
-#### Temporary files
+VCF output uses the same graph engines and then converts the resulting local
+GFA through POVU. Use `-o vcf --gfa-engine <engine>` or the shorthand
+`-o vcf:<engine>`, for example `-o vcf:syng`.
 
-The aligner writes large intermediate files during graph construction. By default these go to `$TMPDIR` or the current working directory.
+### Partitioned mode
+
+Append `:WINDOW` to any engine to build per-window and lace:
 
 ```bash
-# Use a specific directory for temp files
-impg graph --sequence-files sequences.fa -g output.gfa --temp-dir /scratch/tmp
-
-# Use RAM-backed storage for faster I/O (requires enough free RAM)
-impg graph --sequence-files sequences.fa -g output.gfa --temp-dir ramdisk
+impg query    -a aln.paf -r chr1:0-500000 -o gfa \
+              -d 1000 --gfa-engine pggb:10000 --sequence-files *.fa -O out
+impg graph    --sequence-files *.fa -g out.gfa --gfa-engine seqwish:10000
+impg partition -a aln.paf -w 100000 -d 100000 -o gfa --gfa-engine pggb:10000 \
+               --sequence-files *.fa --output-folder results/
 ```
 
-The `ramdisk` shortcut maps to `/dev/shm` on Linux. Use it only when you have sufficient free memory, as temp files can be several GB for large inputs.
+Window size is in bp (≥ 1000). Partitioned mode is the recommended
+approach for large regions — it caps peak memory and runs one final
+gfaffix pass over the laced graph.
 
-#### query vs graph
+### Tuning
 
-Both `query -o gfa` and `graph` share the same engine implementations and parameter sets. The difference is only in how sequences are obtained:
-
-- **`query -o gfa`**: extracts subsequences from an IMPG index + sequence files for a target region, then builds a graph.
-- **`graph`**: reads FASTA files directly and builds a graph (no alignments or index needed).
-
-All seqwish graph induction options (`--min-match-len`, `--transclose-batch`, `--sparse-factor`, `--disk-backed`, `--repeat-max`, `--min-repeat-dist`) and smoothxg smoothing options (`--target-poa-length`, `--max-node-length`, `--poa-padding-fraction`) are available in both `graph` and `query -o gfa` (and `partition -o gfa`).
-
-### Align
-
-Generate pairwise alignment jobs with sparsification strategies for large cohorts:
+The flags below are available on all three GFA-producing commands.
+Defaults match pggb's conventions; only tune if the default graph
+doesn't meet your need.
 
 ```bash
-# Default: giant-component sparsification (99% edge probability)
-impg align --sequence-files sequences.fa -o alignments -t 16
+# Seqwish induction
+--min-match-len 23            # minimum transitive-match length
+--transclose-batch 10000000   # batch size (reduce for lower memory)
+--sparse-factor 0.0           # drop this fraction of input matches
+--disk-backed                 # use disk-backed interval trees
+--repeat-max / --min-repeat-dist
 
-# No sparsification (all-vs-all)
-impg align --sequence-files sequences.fa -o alignments --sparsify none
+# Smoothxg-style smoothing (pggb only)
+--target-poa-length 700,1100  # one pass per value
+--max-node-length 100
+--poa-padding-fraction 0.001
 
-# Random sparsification (keep 50% of pairs)
-impg align --sequence-files sequences.fa -o alignments --sparsify random:0.5
+# Alignment filtering (sweepga, seqwish + pggb only)
+--no-filter                   # skip post-alignment filtering
+--num-mappings many:many      # plane-sweep cardinality
+--scaffold-jump 50000         # scaffold chaining gap (0 = off)
+--scaffold-mass 10000         # min scaffold chain length
+--overlap 0.95
+--min-aln-identity 0.9
 
-# Tree-based sparsification
-impg align --sequence-files sequences.fa -o alignments --sparsify tree:3:1:0.1
+# Aligner backend
+--aligner wfmash              # default; alt: fastga
+--sparsify auto               # wfmash-only; pair-selection heuristic
+--map-pct-identity 90         # wfmash -p value
+--fastga-frequency / --fastga-frequency-multiplier   # fastga-only
 
-# Output as PAF or 1ALN instead of joblists
-impg align --sequence-files sequences.fa -o alignments --format paf
-impg align --sequence-files sequences.fa -o alignments --format 1aln
-
-# Choose aligner backend (default: wfmash)
-impg align --sequence-files sequences.fa -o alignments --aligner fastga
-
-# fastga-specific: adjust k-mer frequency multiplier (ignored by wfmash)
-impg align --sequence-files sequences.fa -o alignments --aligner fastga --fastga-frequency-multiplier 5
-impg align --sequence-files sequences.fa -o alignments --aligner fastga --fastga-frequency 100
-
-# Batch alignment to limit per-batch resource usage (FastGA: disk, wfmash: memory)
-impg align --sequence-files sequences.fa -o alignments --batch-bytes 2G
-
-# With alignment filtering
-impg align --sequence-files sequences.fa -o alignments --num-mappings 1:1 --scaffold-filter 1:1
+# Temp files (can be large)
+--temp-dir /scratch/tmp       # explicit path
+--temp-dir ramdisk            # → /dev/shm on Linux
 ```
 
-### Index
+Combining `--aligner fastga` with `--sparsify` or `--aligner wfmash`
+with `--fastga-frequency` is rejected at parse time.
 
-Create an IMPG index from alignment files:
+## Common options
 
-```bash
-# Index a single PAF file
-impg index -a alignments.paf
+- `-a / --alignment-files` — one or more PAF/1ALN/TPA files (can be `.gz`).
+- `--alignment-list` — text file, one alignment path per line.
+- `-i / --index` — existing IMPG index.
+- `-f / --force-reindex` — rebuild even if the index is up-to-date.
+- `-t / --threads` — default `4`.
+- `-d / --merge-distance` — required for query/partition/refine/similarity:
+  merge query-gathered ranges within this gap (bp). This is the largest
+  internal gap/SV one query hop can absorb into one reported interval.
+- `--no-merge` — disable merging.
+- `--consider-strandness` — keep strands separate during merge.
+- `--subset-sequence-list` — restrict results to listed sequences.
+- `--unidirectional` — disable bidirectional alignment interpretation.
 
-# Index a single .1aln file
-impg index -a alignments.1aln
+Sequence-requiring outputs (GFA/MAF/FASTA, `similarity`, `lace
+--fill-gaps`) take `--sequence-files` (FASTA or AGC) or
+`--sequence-list`.
 
-# Index multiple alignment files (PAF and .1aln mixed)
-impg index -a file1.paf file2.1aln file3.paf
-
-# Create index with custom name
-impg index -a alignments.paf -i custom.impg
-
-# Index from a list of alignment files (can mix formats)
-impg index --alignment-list alignment_files.txt
-```
-
-#### Indexing Modes
-
-Use `--index-mode` to control how indices are built (`auto` by default):
-
-| Mode | Description |
-|------|-------------|
-| `auto` | Single index when < 100 files, per-file when >= 100 |
-| `single` | Always create a single combined `.impg` index |
-| `per-file` | One `.impg` per alignment file (e.g., `data.paf.impg`) |
+## Tutorial: yeast pangenome graph
 
 ```bash
-# Single combined index (explicit or via -i)
-impg index -a file1.paf file2.1aln -i combined.impg
-impg query -i combined.impg -r chr1:0-1000
-
-# Per-file index
-impg index --alignment-list files.txt --index-mode per-file -t 32
-impg query --alignment-list files.txt --index-mode per-file -r chr1:0-1000
-```
-
-Both modes work with PAF, 1ALN, and TPA files (can be mixed in `--alignment-list`).
-
-**When to use per-file indexing:**
-- Incremental updates (only rebuild changed alignment files)
-- Many alignment files (auto mode switches at 100 files)
-
-**Stale index detection:** impg warns if alignment files are modified after index creation. Use `-f/--force-reindex` to rebuild.
-
-**Note on compressed files**: `impg` works directly with bgzip-compressed PAF files (`.paf.gz`, `.paf.bgz`). For large files, creating a GZI index can speed up initial index creation:
-
-```bash
-bgzip -r alignments.paf.gz  # Creates alignments.paf.gz.gzi (optional)
-```
-
-### Common options
-
-All commands support these options:
-- `-a, --alignment-files`: One or more paths to alignment files in PAF, 1ALN, or TPA format (can be mixed). Files can be gzipped or uncompressed.
-- `--alignment-list`: Path to a plain-text file listing one alignment path per line (PAF, 1ALN, or TPA files can be mixed).
-- `-i, --index`: Path to an existing IMPG index file.
-- `-f, --force-reindex`: Always regenerate the IMPG index even if it already exists.
-- `-t, --threads`: Number of threads (default: 4)
-- `--unidirectional`: Disable bidirectional alignment interpretation.
-- `-v, --verbose`: Verbosity level (0=error/silent, 1=info with progress bar, 2=debug)
-
-### Sequence file options
-
-For GFA/MAF/FASTA output and similarity computation:
-
-- `--sequence-files`: List of sequence files (FASTA or AGC)
-- `--sequence-list`: Text file listing sequence files (FASTA or AGC) (one per line)
-- `--poa-scoring`: POA scoring parameters as `match,mismatch,gap_open1,gap_extend1,gap_open2,gap_extend2` (default: `5,4,6,2,24,1`)
-- `--reverse-complement`: Reverse complement sequences on the reverse strand (for FASTA output)
-
-### Merging behaviour
-
-- `-d, --merge-distance <INT>`: Merge nearby hits within this distance (bp).
-- `--no-merge`: Disable merging entirely for all output formats.
-- `--consider-strandness`: Keep forward and reverse strands separate when merging. By default, strands are merged for BED/GFA/MAF outputs and kept separate for FASTA/FASTA-ALN.
-
-## What does `impg` do?
-
-At its core, `impg` lifts over ranges from a target sequence (used as reference) into the queries (the other sequences aligned to the sequence used as reference) described in alignments.
-In effect, it lets us pick up homologous loci from all genomes mapped onto our specific target region.
-This is particularly useful when you're interested in comparing a specific genomic region across different individuals, strains, or species in a pangenomic or comparative genomic setting.
-The output is provided in BED, BEDPE and PAF formats, making it straightforward to use to extract FASTA sequences for downstream use in multiple sequence alignment (like `mafft`) or pangenome graph building (e.g., `pggb` or `minigraph-cactus`).
-
-## How does it work?
-
-`impg` uses [`coitrees`](https://github.com/dcjones/coitrees) (Cache Oblivious Interval Trees) to provide efficient range lookup over the input alignments.
-CIGAR strings are converted to a compact delta encoding.
-This approach allows for fast and memory-efficient projection of sequence ranges through alignments.
-
-## Tutorial: Building a Yeast Pangenome Graph
-
-This tutorial walks through building a complete pangenome graph from 7 *S. cerevisiae* strains using `impg`'s partition-based workflow. The approach partitions the pangenome into manageable pieces, builds graphs for each partition using sweepga + seqwish, and laces them together into a final graph.
-
-### Prerequisites
-
-- `impg` compiled with all dependencies
-- `odgi` for visualization
-- Yeast pangenome FASTA (PanSN naming: `SAMPLE#HAPLOTYPE#CONTIG`)
-- Pre-computed alignments in PAF format (e.g., from `wfmash`)
-
-### Step 1: Create the IMPG Index
-
-Build an index from your alignment file:
-
-```bash
-# Create working directory
-mkdir -p yeast_pangenome && cd yeast_pangenome
-
-# Build the index from alignments
-impg index -a cerevisiae.paf -i yeast.impg -t 16
-```
-
-### Step 2: Partition the Pangenome
-
-Divide the pangenome into ~100kb regions:
-
-```bash
-# Partition into FASTA files for graph construction
-impg partition -i yeast.impg \
-    -w 100000 \
-    --sequence-files cerevisiae.fa.gz \
-    -o fasta \
-    --separate-files \
-    --output-folder partitions \
-    -t 16
-```
-
-This creates one FASTA file per partition (e.g., `partitions/partition0.fasta`, `partitions/partition1.fasta`, ...).
-
-### Step 3: Build Graphs for Each Partition
-
-Use `impg graph` to build a GFA for each partition. By default, `impg graph` uses the `pggb` engine (seqwish + smoothing + gfaffix normalization) with 1:1 alignment filtering and scaffold-based chaining to remove spurious cross-chromosome alignments from repetitive elements:
-
-```bash
-# Create output directory
-mkdir -p gfas
-
-# Build graphs in parallel (default filtering: 1:1 + scaffolding)
-ls partitions/*.fasta | xargs -P 4 -I {} bash -c '
-    f="{}"; base=$(basename "$f" .fasta)
-    impg graph --sequence-files "$f" -g "gfas/${base}.gfa" -t 4
-    echo "Done: $base"
-'
-```
-
-The k-mer frequency is automatically calculated based on the number of genomes (unique SAMPLE#HAPLOTYPE prefixes), not the total number of sequences. For 7 yeast strains, this means `--fastga-frequency-multiplier 10` results in a frequency of 70 (10 × 7 genomes).
-
-### Step 4: Lace Partition Graphs Together
-
-Combine all partition GFAs into a single pangenome graph:
-
-```bash
-# Create list of valid (non-empty) GFA files
-find gfas -name "*.gfa" -size +0 | sort -V > gfa_list.txt
-
-# Lace together with gap filling
-impg lace \
-    --file-list gfa_list.txt \
-    --sequence-files cerevisiae.fa.gz \
-    -o yeast_pangenome.gfa \
-    --fill-gaps 2 \
-    -t 16
-```
-
-The `--fill-gaps 2` option fills gaps between partitions with the original sequence.
-
-### Step 5: Post-process and Visualize with ODGI
-
-Convert to ODGI format and sort for optimal visualization:
-
-```bash
-# Build ODGI graph
-odgi build -g yeast_pangenome.gfa -o yeast_pangenome.og -t 16
-
-# Sort the graph
-odgi sort -i yeast_pangenome.og -o yeast_pangenome_sorted.og -O -p Ygs -t 16
-
-# Generate 2D layout
-odgi layout -i yeast_pangenome_sorted.og -o yeast_pangenome.lay -t 16 -P
-
-# Create visualizations
-# Linear view (paths as rows, colored by sample)
-odgi viz -i yeast_pangenome_sorted.og -o yeast_pangenome_viz.png -x 4000 -y 1000 -s '#'
-
-# 2D graph drawing
-odgi draw -i yeast_pangenome_sorted.og -c yeast_pangenome.lay -p yeast_pangenome_draw.png -w 4000 -H 2000
-```
-
-### Step 6: Verify the Graph
-
-Check graph statistics:
-
-```bash
-odgi stats -i yeast_pangenome_sorted.og -S
-```
-
-Expected output for 7 yeast strains with 16 chromosomes each:
-- ~35 Mbp total length
-- ~440,000 nodes
-- ~616,000 edges
-- 112 paths (7 strains × 16 chromosomes)
-
-### Complete Pipeline Script
-
-```bash
-#!/bin/bash
-set -euo pipefail
-
 FASTA="cerevisiae.fa.gz"
 PAF="cerevisiae.paf"
 THREADS=16
-WINDOW=100000
 
-# Step 1: Index
+# 1. Index
 impg index -a "$PAF" -i yeast.impg -t "$THREADS"
 
-# Step 2: Partition
+# 2. Partition into 100kb windows, one FASTA per window
 mkdir -p partitions gfas
-impg partition -i yeast.impg -w "$WINDOW" \
-    --sequence-files "$FASTA" -o fasta \
+impg partition -i yeast.impg -w 100000 \
+    -d 100000 --sequence-files "$FASTA" -o fasta \
     --separate-files --output-folder partitions -t "$THREADS"
 
-# Step 3: Build partition graphs
+# 3. Build per-partition GFAs in parallel
 ls partitions/*.fasta | xargs -P 4 -I {} bash -c '
     f="{}"; base=$(basename "$f" .fasta)
     impg graph --sequence-files "$f" -g "gfas/${base}.gfa" -t 4
 '
 
-# Step 4: Lace
+# 4. Lace, filling inter-window gaps with reference sequence
 find gfas -name "*.gfa" -size +0 | sort -V > gfa_list.txt
 impg lace --file-list gfa_list.txt --sequence-files "$FASTA" \
-    -o yeast_pangenome.gfa --fill-gaps 2 -t "$THREADS"
+    -o yeast.gfa --fill-gaps 2 -t "$THREADS"
 
-# Step 5: ODGI post-processing
-odgi build -g yeast_pangenome.gfa -o yeast_pangenome.og -t "$THREADS"
-odgi sort -i yeast_pangenome.og -o yeast_pangenome_sorted.og -O -p Ygs -t "$THREADS"
-odgi layout -i yeast_pangenome_sorted.og -o yeast_pangenome.lay -t "$THREADS"
-odgi viz -i yeast_pangenome_sorted.og -o yeast_pangenome_viz.png -x 4000 -y 1000 -s '#'
-odgi draw -i yeast_pangenome_sorted.og -c yeast_pangenome.lay -p yeast_pangenome_draw.png
-
-echo "Done! Check yeast_pangenome_viz.png and yeast_pangenome_draw.png"
+# 5. Post-process with odgi
+odgi build  -g yeast.gfa          -o yeast.og       -t "$THREADS"
+odgi sort   -i yeast.og           -o yeast.sort.og  -O -p Ygs -t "$THREADS"
+odgi layout -i yeast.sort.og      -o yeast.lay      -t "$THREADS"
+odgi viz    -i yeast.sort.og      -o yeast.viz.png  -x 4000 -y 1000 -s '#'
+odgi draw   -i yeast.sort.og      -c yeast.lay      -p yeast.draw.png
 ```
 
-### Exploration: Effect of Partition Size
+For modern inputs, you can replace steps 1–4 with a single
+`impg graph --sequence-files "$FASTA" -g yeast.gfa --gfa-engine pggb:100000`.
 
-The partition window size (`-w`) affects the resulting graph structure. Smaller partitions create more alignment subproblems but may fragment complex structural variants, while larger partitions allow better representation of larger variations but increase memory usage per partition.
+## Visualizing FASTA alignments
 
-Here's a comparison using the 7-strain yeast pangenome with different partition sizes:
-
-| Partition Size | Partitions | Non-empty GFAs | Graph Length | Nodes | Edges | Steps |
-|---------------|------------|----------------|--------------|-------|-------|-------|
-| 10kb | 1,537 | 1,533 | 63.0 Mb | 164,582 | 221,966 | 243,526 |
-| 50kb | 368 | 367 | 59.5 Mb | 206,982 | 280,259 | 298,275 |
-| 100kb | 227 | 227 | 59.1 Mb | 221,360 | 299,952 | 325,202 |
-
-**Observations:**
-
-- **Smaller partitions (10kb)** produce graphs with fewer nodes and edges but more total sequence length due to gap filling between many partition boundaries
-- **Larger partitions (50-100kb)** create more complex graphs with better variant representation but require more memory per partition
-- All produce 112 paths (7 strains x 16 chromosomes)
-
-**Recommendations:**
-
-- Use **10kb partitions** for small genomes or when memory is constrained
-- Use **50-100kb partitions** for better structural variant representation
-- For human-scale genomes, consider **100kb-500kb partitions**
-
-To experiment with partition sizes:
+`scripts/faln2html.py` renders the `fasta-aln` output into an
+interactive HTML MSA using [react-msa](https://github.com/GMOD/JBrowseMSA)
+or [ProSeqViewer](https://github.com/BioComputingUP/ProSeqViewer).
 
 ```bash
-# Try different window sizes
-for WINDOW in 10000 50000 100000; do
-    mkdir -p partitions_${WINDOW} gfas_${WINDOW}
-
-    impg partition -i index.impg -w $WINDOW \
-        --sequence-files sequences.fa -o fasta \
-        --separate-files --output-folder partitions_${WINDOW}
-
-    ls partitions_${WINDOW}/*.fasta | xargs -P 4 -I {} bash -c '
-        f="{}"; base=$(basename "$f" .fasta)
-        impg graph --sequence-files "$f" -g "gfas_${WINDOW}/${base}.gfa" -t 4
-    '
-
-    find gfas_${WINDOW} -name "*.gfa" -size +0 | sort -V > gfa_list_${WINDOW}.txt
-    impg lace --file-list gfa_list_${WINDOW}.txt --sequence-files sequences.fa \
-        -o pangenome_${WINDOW}.gfa --fill-gaps 2
-done
+impg query -a aln.paf -r chr1:1000-2000 -d 100 -o fasta-aln --sequence-files *.fa \
+  | python scripts/faln2html.py -i - -o alignment.html [--tool proseqviewer]
 ```
 
 ## Authors
 
-Andrea Guarracino <aguarra1@uthsc.edu> \
-Bryce Kille <brycekille@gmail.com> \
-Erik Garrison <erik.garrison@gmail.com>
+Andrea Guarracino <aguarra1@uthsc.edu> · Bryce Kille
+<brycekille@gmail.com> · Erik Garrison <erik.garrison@gmail.com>
 
 ## License
 
-MIT
+MIT.

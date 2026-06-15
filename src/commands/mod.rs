@@ -1,10 +1,14 @@
 pub mod align;
 pub mod depth;
+pub mod genotype;
 pub mod graph;
+pub mod infer;
 pub mod lace;
 pub mod partition;
 pub mod refine;
+pub mod render;
 pub mod similarity;
+pub mod syng2gfa;
 
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -78,7 +82,7 @@ pub fn create_aligner_adaptive(
             Ok(Box::new(wfmash))
         }
         "fastga" => Ok(Box::new(FastGAIntegration::new(
-            Some(kmer_frequency),
+            kmer_frequency,
             num_threads,
             min_aln_length,
             temp_dir,
@@ -271,45 +275,27 @@ pub fn resolve_file_list(
 }
 
 /// Count sequences and genomes across FASTA files (for k-mer frequency calculation).
-///
-/// Uses PanSN naming convention: for names like `SAMPLE#HAPLOTYPE#CONTIG`, genomes
-/// are unique `SAMPLE#HAPLOTYPE` prefixes.
-/// Returns `(num_sequences, num_genomes)`.
 pub fn count_sequences_and_genomes(fasta_files: &[String]) -> io::Result<(usize, usize)> {
-    use std::collections::HashSet;
     use std::fs::File;
 
-    let mut seq_count = 0;
-    let mut genome_prefixes: HashSet<String> = HashSet::new();
+    let paths: Vec<&Path> = fasta_files.iter().map(Path::new).collect();
+    let genome_count = sweepga::pansn::count_haplotypes(&paths)
+        .map_err(|e| io::Error::other(format!("PanSN haplotype count failed: {e}")))?;
 
+    let mut seq_count = 0usize;
     for path in fasta_files {
         let file = File::open(path)?;
         let (reader, _format) = niffler::get_reader(Box::new(file)).map_err(|e| {
             io::Error::other(format!("Failed to open reader for '{}': {}", path, e))
         })?;
         let reader = BufReader::new(reader);
-
         for line in reader.lines() {
             let line: String = line?;
             if line.starts_with('>') {
                 seq_count += 1;
-                let name = line
-                    .strip_prefix('>')
-                    .unwrap_or("")
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("");
-                let parts: Vec<&str> = name.split('#').collect();
-                let prefix = if parts.len() >= 2 {
-                    format!("{}#{}", parts[0], parts[1])
-                } else {
-                    name.to_string()
-                };
-                genome_prefixes.insert(prefix);
             }
         }
     }
 
-    let genome_count = genome_prefixes.len().max(1);
     Ok((seq_count, genome_count))
 }

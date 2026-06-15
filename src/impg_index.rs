@@ -12,7 +12,7 @@ use crate::sequence_index::UnifiedSequenceIndex;
 use crate::subset_filter::SubsetFilter;
 use coitrees::BasicCOITree;
 use rustc_hash::FxHashMap;
-use std::sync::Arc;
+use std::{io, sync::Arc};
 
 /// Raw alignment interval without CIGAR projection, for fast depth computation.
 /// Contains only the coordinate metadata stored in the interval tree nodes.
@@ -44,7 +44,7 @@ pub trait ImpgIndex: Send + Sync {
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
         approximate_mode: bool,
-    ) -> Vec<AdjustedInterval>;
+    ) -> io::Result<Vec<AdjustedInterval>>;
 
     /// Query with pre-populated CIGAR cache for efficiency.
     fn query_with_cache(
@@ -56,7 +56,7 @@ pub trait ImpgIndex: Send + Sync {
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
         cigar_cache: &FxHashMap<(u32, u64), Vec<CigarOp>>,
-    ) -> Vec<AdjustedInterval>;
+    ) -> io::Result<Vec<AdjustedInterval>>;
 
     /// Populate CIGAR cache for a region.
     fn populate_cigar_cache(
@@ -85,7 +85,7 @@ pub trait ImpgIndex: Send + Sync {
         sequence_index: Option<&UnifiedSequenceIndex>,
         approximate_mode: bool,
         subset_filter: Option<&SubsetFilter>,
-    ) -> Vec<AdjustedInterval>;
+    ) -> io::Result<Vec<AdjustedInterval>>;
 
     /// Transitive query using breadth-first search.
     fn query_transitive_bfs(
@@ -103,7 +103,7 @@ pub trait ImpgIndex: Send + Sync {
         sequence_index: Option<&UnifiedSequenceIndex>,
         approximate_mode: bool,
         subset_filter: Option<&SubsetFilter>,
-    ) -> Vec<AdjustedInterval>;
+    ) -> io::Result<Vec<AdjustedInterval>>;
 
     /// Get or load an interval tree for a target sequence.
     fn get_or_load_tree(&self, target_id: u32) -> Option<Arc<BasicCOITree<QueryMetadata, u32>>>;
@@ -123,46 +123,78 @@ pub trait ImpgIndex: Send + Sync {
     fn sequence_files(&self) -> &[String];
 
     /// Query alignments where the specified sequence is the QUERY (reverse direction).
-    /// Returns: Vec of (query_start, query_end, target_id) tuples
-    fn query_reverse_for_depth(&self, query_id: u32) -> Vec<(i64, i64, u32)>;
+    /// Returns: Vec of (query_start, query_end, target_id) tuples.
+    /// Default returns empty (depth is unsupported on non-alignment backends like syng).
+    fn query_reverse_for_depth(&self, _query_id: u32) -> Vec<(i64, i64, u32)> {
+        Vec::new()
+    }
 
-    /// Build a lightweight reverse index: query_id -> [target_ids that have alignments with this query]
-    fn build_query_to_targets_map(&self) -> FxHashMap<u32, Vec<u32>>;
+    /// Build a lightweight reverse index: query_id -> [target_ids that have alignments with this query].
+    /// Default returns an empty map (depth is unsupported on non-alignment backends).
+    fn build_query_to_targets_map(&self) -> FxHashMap<u32, Vec<u32>> {
+        FxHashMap::default()
+    }
 
     /// Query reverse alignments using a pre-built query_to_targets map.
+    /// Default returns empty (depth is unsupported on non-alignment backends).
     fn query_reverse_for_depth_with_map(
         &self,
-        query_id: u32,
-        query_to_targets: &FxHashMap<u32, Vec<u32>>,
-    ) -> Vec<(i64, i64, u32)>;
+        _query_id: u32,
+        _query_to_targets: &FxHashMap<u32, Vec<u32>>,
+    ) -> Vec<(i64, i64, u32)> {
+        Vec::new()
+    }
 
-    /// Clear tree cache to free memory.
-    fn clear_tree_cache(&self);
+    /// Clear tree cache to free memory. Default is a no-op.
+    fn clear_tree_cache(&self) {}
 
     /// Clear sub-index cache (MultiImpg only) to free memory.
     /// For single Impg, this is a no-op.
     /// Useful for depth computation with many alignment files to bound peak memory.
-    fn clear_sub_index_cache(&self);
+    fn clear_sub_index_cache(&self) {}
 
     /// Enable or disable tree caching.
     /// When disabled, trees loaded from disk are not stored in the cache,
-    /// bounding peak memory for transitive queries.
-    fn set_tree_cache_enabled(&self, enabled: bool);
+    /// bounding peak memory for transitive queries. Default is a no-op.
+    fn set_tree_cache_enabled(&self, _enabled: bool) {}
 
     /// Check if this index was built with bidirectional mode.
     /// Bidirectional indices contain both A→B and B→A entries for each alignment,
     /// eliminating the need for a separate reverse index in depth calculations.
-    fn is_bidirectional(&self) -> bool;
+    /// Default returns `false`.
+    fn is_bidirectional(&self) -> bool {
+        false
+    }
 
     /// Iterate all alignment intervals for a target sequence, returning raw coordinates
     /// without CIGAR projection. Much faster than query() for bulk operations like depth.
     /// For MultiImpg, this merges results from all sub-indices that contain the target.
-    fn query_raw_intervals(&self, target_id: u32) -> Vec<RawAlignmentInterval>;
+    /// Default returns empty (depth is unsupported on non-alignment backends).
+    fn query_raw_intervals(&self, _target_id: u32) -> Vec<RawAlignmentInterval> {
+        Vec::new()
+    }
 
     /// Query only alignment intervals that overlap a specific range [start, end) on a target sequence.
     /// Returns raw coordinates without CIGAR projection, using coitrees range query for O(n+k) performance.
     /// Much more efficient than query_raw_intervals() when only a subset of intervals is needed (e.g., BFS).
-    fn query_raw_overlapping(&self, target_id: u32, start: i64, end: i64) -> Vec<RawAlignmentInterval>;
+    /// Default returns empty (depth is unsupported on non-alignment backends).
+    fn query_raw_overlapping(
+        &self,
+        _target_id: u32,
+        _start: i64,
+        _end: i64,
+    ) -> Vec<RawAlignmentInterval> {
+        Vec::new()
+    }
+
+    /// Access the underlying `SyngIndex` if this implementation is
+    /// backed by syng (`SyngImpgWrapper`). Used by the syng-native
+    /// graph engine to re-query anchor chains for anchor-seeded
+    /// gap-only BiWFA. Default returns `None` so alignment-backed
+    /// implementations don't need to implement this.
+    fn syng_index_ref(&self) -> Option<&crate::syng::SyngIndex> {
+        None
+    }
 }
 
 /// Enum wrapper that can hold either a single `Impg` or a `MultiImpg`.
@@ -212,9 +244,9 @@ impl ImpgIndex for ImpgWrapper {
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
         approximate_mode: bool,
-    ) -> Vec<AdjustedInterval> {
+    ) -> io::Result<Vec<AdjustedInterval>> {
         match self {
-            ImpgWrapper::Single(impg) => impg.query(
+            ImpgWrapper::Single(impg) => Ok(impg.query(
                 target_id,
                 range_start,
                 range_end,
@@ -222,8 +254,9 @@ impl ImpgIndex for ImpgWrapper {
                 min_gap_compressed_identity,
                 sequence_index,
                 approximate_mode,
-            ),
-            ImpgWrapper::Multi(multi) => multi.query(
+            )),
+            ImpgWrapper::Multi(multi) => ImpgIndex::query(
+                multi,
                 target_id,
                 range_start,
                 range_end,
@@ -244,9 +277,9 @@ impl ImpgIndex for ImpgWrapper {
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
         cigar_cache: &FxHashMap<(u32, u64), Vec<CigarOp>>,
-    ) -> Vec<AdjustedInterval> {
+    ) -> io::Result<Vec<AdjustedInterval>> {
         match self {
-            ImpgWrapper::Single(impg) => impg.query_with_cache(
+            ImpgWrapper::Single(impg) => Ok(impg.query_with_cache(
                 target_id,
                 range_start,
                 range_end,
@@ -254,8 +287,9 @@ impl ImpgIndex for ImpgWrapper {
                 min_gap_compressed_identity,
                 sequence_index,
                 cigar_cache,
-            ),
-            ImpgWrapper::Multi(multi) => multi.query_with_cache(
+            )),
+            ImpgWrapper::Multi(multi) => ImpgIndex::query_with_cache(
+                multi,
                 target_id,
                 range_start,
                 range_end,
@@ -311,9 +345,9 @@ impl ImpgIndex for ImpgWrapper {
         sequence_index: Option<&UnifiedSequenceIndex>,
         approximate_mode: bool,
         subset_filter: Option<&SubsetFilter>,
-    ) -> Vec<AdjustedInterval> {
+    ) -> io::Result<Vec<AdjustedInterval>> {
         match self {
-            ImpgWrapper::Single(impg) => impg.query_transitive_dfs(
+            ImpgWrapper::Single(impg) => Ok(impg.query_transitive_dfs(
                 target_id,
                 range_start,
                 range_end,
@@ -327,8 +361,9 @@ impl ImpgIndex for ImpgWrapper {
                 sequence_index,
                 approximate_mode,
                 subset_filter,
-            ),
-            ImpgWrapper::Multi(multi) => multi.query_transitive_dfs(
+            )),
+            ImpgWrapper::Multi(multi) => ImpgIndex::query_transitive_dfs(
+                multi,
                 target_id,
                 range_start,
                 range_end,
@@ -361,9 +396,9 @@ impl ImpgIndex for ImpgWrapper {
         sequence_index: Option<&UnifiedSequenceIndex>,
         approximate_mode: bool,
         subset_filter: Option<&SubsetFilter>,
-    ) -> Vec<AdjustedInterval> {
+    ) -> io::Result<Vec<AdjustedInterval>> {
         match self {
-            ImpgWrapper::Single(impg) => impg.query_transitive_bfs(
+            ImpgWrapper::Single(impg) => Ok(impg.query_transitive_bfs(
                 target_id,
                 range_start,
                 range_end,
@@ -377,8 +412,9 @@ impl ImpgIndex for ImpgWrapper {
                 sequence_index,
                 approximate_mode,
                 subset_filter,
-            ),
-            ImpgWrapper::Multi(multi) => multi.query_transitive_bfs(
+            )),
+            ImpgWrapper::Multi(multi) => ImpgIndex::query_transitive_bfs(
+                multi,
                 target_id,
                 range_start,
                 range_end,

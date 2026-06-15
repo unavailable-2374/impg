@@ -2,7 +2,7 @@ use crate::impg::AdjustedInterval;
 use crate::impg_index::ImpgIndex;
 use crate::sequence_index::UnifiedSequenceIndex;
 use crate::subset_filter::{apply_subset_filter, SubsetFilter};
-use clap::ValueEnum;
+
 use coitrees::{COITree, Interval, IntervalTree};
 use log::{debug, info, warn};
 use rayon::prelude::*;
@@ -10,6 +10,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
+use sweepga::pansn::PanSnLevel;
 
 /// Blacklist data structure: sequence name -> interval tree of blacklisted ranges
 pub type Blacklist = FxHashMap<String, COITree<(), u32>>;
@@ -21,8 +22,8 @@ pub struct RefineConfig<'a> {
     pub span_bp: i64,
     /// Maximum per-side expansion; <=1 interpreted as fraction of the locus, >1 as absolute bp.
     pub max_extension: f64,
-    /// Aggregation mode used when counting boundary support.
-    pub support_mode: SupportMode,
+    /// Aggregation level used when counting boundary support (PanSN).
+    pub support_level: PanSnLevel,
     pub extension_step: i64,
     pub merge_distance: i64,
     pub min_identity: Option<f64>,
@@ -58,38 +59,6 @@ pub struct SupportEntity {
     pub end: i64,
 }
 
-/// How to aggregate PanSN identifiers when counting support.
-#[derive(Clone, Copy, Debug)]
-pub enum SupportMode {
-    Sequence,
-    Sample,
-    Haplotype,
-}
-
-/// CLI-level PanSN aggregation mode (sample/haplotype).
-#[derive(Copy, Clone, Debug, ValueEnum)]
-pub enum RefineSupportArg {
-    Sample,
-    Haplotype,
-}
-
-fn support_mode_label(mode: SupportMode) -> &'static str {
-    match mode {
-        SupportMode::Sequence => "sequences",
-        SupportMode::Sample => "samples",
-        SupportMode::Haplotype => "haplotypes",
-    }
-}
-
-impl From<RefineSupportArg> for SupportMode {
-    fn from(value: RefineSupportArg) -> Self {
-        match value {
-            RefineSupportArg::Sample => SupportMode::Sample,
-            RefineSupportArg::Haplotype => SupportMode::Haplotype,
-        }
-    }
-}
-
 struct SampleInterval {
     query_start: i64,
     query_end: i64,
@@ -115,21 +84,21 @@ pub fn run_refine(
     config: RefineConfig<'_>,
 ) -> io::Result<Vec<RefineRecord>> {
     info!(
-        "Refining {} range(s) with support aggregated by {} (span_bp={}, max_extension={}, extension_step={})",
+        "Refining {} range(s) with support aggregated by {:?} (span_bp={}, max_extension={}, extension_step={})",
         ranges.len(),
-        support_mode_label(config.support_mode),
+        config.support_level,
         config.span_bp,
         config.max_extension,
         config.extension_step
     );
 
     if matches!(
-        config.support_mode,
-        SupportMode::Sample | SupportMode::Haplotype
+        config.support_level,
+        PanSnLevel::Sample | PanSnLevel::Haplotype
     ) {
         info!(
-            "Early termination enabled for {} aggregation",
-            support_mode_label(config.support_mode)
+            "Early termination enabled for {:?} aggregation",
+            config.support_level
         );
     }
 
@@ -217,15 +186,13 @@ fn refine_single_range(
 
     // Compute max possible entities once for pansn-mode
     let max_entities = if matches!(
-        config.support_mode,
-        SupportMode::Sample | SupportMode::Haplotype
+        config.support_level,
+        PanSnLevel::Sample | PanSnLevel::Haplotype
     ) {
-        let max = compute_max_entities(impg, target_id, config.support_mode, config.subset_filter);
+        let max = compute_max_entities(impg, target_id, config.support_level, config.subset_filter);
         debug!(
-            "Maximum possible {} for target {}: {}",
-            support_mode_label(config.support_mode),
-            chrom,
-            max
+            "Maximum possible {:?} for target {}: {}",
+            config.support_level, chrom, max
         );
         Some(max)
     } else {
@@ -268,7 +235,7 @@ fn refine_single_range(
         orig_end
     );
 
-    let evaluate = |left: i64, right: i64| -> Option<CandidateResult> {
+    let evaluate = |left: i64, right: i64| -> io::Result<Option<CandidateResult>> {
         evaluate_candidate(
             impg,
             target_id,
@@ -284,6 +251,14 @@ fn refine_single_range(
             &cigar_cache,
         )
     };
+    let reduce_candidates =
+        |candidates: Vec<io::Result<CandidateResult>>| -> io::Result<Option<CandidateResult>> {
+            let mut best = None;
+            for candidate in candidates {
+                best = update_best_candidate(best, candidate?);
+            }
+            Ok(best)
+        };
 
     // Helper to check if candidate has reached maximum support
     let check_max = |candidate: &Option<CandidateResult>| -> bool {
@@ -297,7 +272,7 @@ fn refine_single_range(
     let mut best_candidate: Option<CandidateResult> = None;
 
     // Evaluate baseline (0,0) first
-    let baseline_candidate = evaluate(0, 0);
+    let baseline_candidate = evaluate(0, 0)?;
     let original_support_count = baseline_candidate
         .as_ref()
         .map(|c| c.support_count)
@@ -319,12 +294,17 @@ fn refine_single_range(
         );
     } else {
         // Search for minimal left extension, excluding 0 (already evaluated as baseline)
-        if let Some(candidate) = flanks
-            .par_iter()
-            .filter(|&&left| left > 0)
-            .filter_map(|&left| evaluate(left, 0))
-            .reduce_with(better_candidate)
-        {
+        if let Some(candidate) = reduce_candidates(
+            flanks
+                .par_iter()
+                .filter(|&&left| left > 0)
+                .filter_map(|&left| match evaluate(left, 0) {
+                    Ok(Some(candidate)) => Some(Ok(candidate)),
+                    Ok(None) => None,
+                    Err(err) => Some(Err(err)),
+                })
+                .collect(),
+        )? {
             best_candidate = update_best_candidate(best_candidate, candidate);
         }
 
@@ -345,11 +325,16 @@ fn refine_single_range(
                 .unwrap_or(0);
 
             // Next, keep the chosen left flank fixed and look for the best right expansion.
-            if let Some(candidate) = flanks
-                .par_iter()
-                .filter_map(|&right| evaluate(left_fixed, right))
-                .reduce_with(better_candidate)
-            {
+            if let Some(candidate) = reduce_candidates(
+                flanks
+                    .par_iter()
+                    .filter_map(|&right| match evaluate(left_fixed, right) {
+                        Ok(Some(candidate)) => Some(Ok(candidate)),
+                        Ok(None) => None,
+                        Err(err) => Some(Err(err)),
+                    })
+                    .collect(),
+            )? {
                 best_candidate = update_best_candidate(best_candidate, candidate);
             }
 
@@ -370,11 +355,16 @@ fn refine_single_range(
                     .unwrap_or(0);
 
                 // Finally, re-optimise the left flank while holding the right flank steady to capture asymmetric trade-offs.
-                if let Some(candidate) = flanks
-                    .par_iter()
-                    .filter_map(|&left| evaluate(left, right_fixed))
-                    .reduce_with(better_candidate)
-                {
+                if let Some(candidate) = reduce_candidates(
+                    flanks
+                        .par_iter()
+                        .filter_map(|&left| match evaluate(left, right_fixed) {
+                            Ok(Some(candidate)) => Some(Ok(candidate)),
+                            Ok(None) => None,
+                            Err(err) => Some(Err(err)),
+                        })
+                        .collect(),
+                )? {
                     best_candidate = update_best_candidate(best_candidate, candidate);
                 }
             }
@@ -392,13 +382,13 @@ fn refine_single_range(
     };
 
     debug!(
-        "Selected flanks left={}bp right={}bp for region {}:{}-{} (supporting {}: {} -> {})",
+        "Selected flanks left={}bp right={}bp for region {}:{}-{} (supporting {:?}: {} -> {})",
         best_candidate.left_extension,
         best_candidate.right_extension,
         chrom,
         best_candidate.start,
         best_candidate.end,
-        support_mode_label(config.support_mode),
+        config.support_level,
         original_support_count,
         best_candidate.support_count
     );
@@ -432,7 +422,7 @@ fn evaluate_candidate(
     sequence_index: Option<&UnifiedSequenceIndex>,
     max_entities: Option<usize>,
     cigar_cache: &FxHashMap<(u32, u64), Vec<crate::impg::CigarOp>>,
-) -> Option<CandidateResult> {
+) -> io::Result<Option<CandidateResult>> {
     let tentative_start = orig_start.saturating_sub(left_flank);
     let tentative_end = orig_end.saturating_add(right_flank);
 
@@ -444,7 +434,7 @@ fn evaluate_candidate(
             "Skipping non-positive range {}:{}-{} after applying flanks L{} R{}",
             chrom, start, end, left_flank, right_flank
         );
-        return None;
+        return Ok(None);
     }
 
     let mut overlaps = Vec::new();
@@ -456,13 +446,13 @@ fn evaluate_candidate(
         sequence_index,
         &mut overlaps,
         cigar_cache,
-    );
+    )?;
 
     apply_subset_filter(impg, target_id, &mut overlaps, config.subset_filter);
 
     let stats = compute_supporting_stats(
         impg,
-        config.support_mode,
+        config.support_level,
         target_id,
         &overlaps,
         start,
@@ -485,7 +475,7 @@ fn evaluate_candidate(
         support_entities: stats.survivors,
     };
 
-    Some(candidate)
+    Ok(Some(candidate))
 }
 
 fn query_overlaps(
@@ -496,7 +486,7 @@ fn query_overlaps(
     sequence_index: Option<&UnifiedSequenceIndex>,
     buffer: &mut Vec<AdjustedInterval>,
     cigar_cache: &FxHashMap<(u32, u64), Vec<crate::impg::CigarOp>>,
-) {
+) -> io::Result<()> {
     buffer.clear();
 
     let mut results = if config.use_transitive_bfs {
@@ -514,7 +504,7 @@ fn query_overlaps(
             sequence_index,
             config.approximate_mode,
             config.subset_filter,
-        )
+        )?
     } else if config.use_transitive_dfs {
         impg.query_transitive_dfs(
             target_id,
@@ -530,7 +520,7 @@ fn query_overlaps(
             sequence_index,
             config.approximate_mode,
             config.subset_filter,
-        )
+        )?
     } else {
         let mut res = impg.query_with_cache(
             target_id,
@@ -540,7 +530,7 @@ fn query_overlaps(
             config.min_identity,
             sequence_index,
             cigar_cache,
-        );
+        )?;
 
         // Apply subset filter for non-transitive queries (transitive queries filter during exploration)
         if let Some(filter) = config.subset_filter {
@@ -551,15 +541,7 @@ fn query_overlaps(
     };
 
     buffer.append(&mut results);
-}
-
-/// Return whichever candidate ranks higher according to `compare_candidates`.
-fn better_candidate(a: CandidateResult, b: CandidateResult) -> CandidateResult {
-    if compare_candidates(&a, &b) == Ordering::Greater {
-        a
-    } else {
-        b
-    }
+    Ok(())
 }
 
 /// Maintain the best-so-far candidate when combining sequential passes.
@@ -609,7 +591,7 @@ struct SupportStats {
 fn compute_max_entities(
     impg: &impl ImpgIndex,
     target_id: u32,
-    mode: SupportMode,
+    level: PanSnLevel,
     subset_filter: Option<&SubsetFilter>,
 ) -> usize {
     let mut unique_entities = FxHashSet::default();
@@ -618,7 +600,7 @@ fn compute_max_entities(
     let target_key = impg
         .seq_index()
         .get_name(target_id)
-        .and_then(|name| pansn_key(name, mode));
+        .and_then(|name| sweepga::pansn::extract_pansn_key(name, level));
 
     // Get or load the interval tree for this target (handles lazy loading)
     if let Some(tree) = impg.get_or_load_tree(target_id) {
@@ -636,7 +618,7 @@ fn compute_max_entities(
                     }
                 }
 
-                if let Some(key) = pansn_key(name, mode) {
+                if let Some(key) = sweepga::pansn::extract_pansn_key(name, level) {
                     // Exclude the target's entity key
                     if Some(&key) != target_key.as_ref() {
                         unique_entities.insert(key);
@@ -651,7 +633,7 @@ fn compute_max_entities(
 
 fn compute_supporting_stats(
     impg: &impl ImpgIndex,
-    mode: SupportMode,
+    level: PanSnLevel,
     target_id: u32,
     overlaps: &[AdjustedInterval],
     region_start: i64,
@@ -663,7 +645,7 @@ fn compute_supporting_stats(
 ) -> SupportStats {
     let (aggregated, survivors) = compute_support_sets(
         impg,
-        mode,
+        level,
         target_id,
         overlaps,
         region_start,
@@ -682,7 +664,7 @@ fn compute_supporting_stats(
 
 fn compute_support_sets(
     impg: &impl ImpgIndex,
-    mode: SupportMode,
+    level: PanSnLevel,
     target_id: u32,
     overlaps: &[AdjustedInterval],
     region_start: i64,
@@ -771,7 +753,7 @@ fn compute_support_sets(
                 .or_insert((q_start, q_end));
             entry.0 = entry.0.min(q_start);
             entry.1 = entry.1.max(q_end);
-            if let Some(key) = pansn_key(name, mode) {
+            if let Some(key) = sweepga::pansn::extract_pansn_key(name, level) {
                 aggregated.insert(key);
                 // Early termination: if we've reached the maximum possible entities, stop
                 if let Some(max) = max_possible {
@@ -892,33 +874,6 @@ fn build_flanks(max_extension: i64, step: i64) -> Vec<i64> {
     flanks.dedup();
     flanks
 }
-fn pansn_key(name: &str, mode: SupportMode) -> Option<String> {
-    match mode {
-        SupportMode::Sequence => Some(name.to_string()),
-        SupportMode::Sample => {
-            let base = name.split(':').next().unwrap_or(name);
-            let sample = base.split('#').next().unwrap_or(base).trim();
-            if sample.is_empty() {
-                None
-            } else {
-                Some(sample.to_string())
-            }
-        }
-        SupportMode::Haplotype => {
-            let base = name.split(':').next().unwrap_or(name);
-            let mut parts = base.split('#');
-            let sample = parts.next().unwrap_or("").trim();
-            if sample.is_empty() {
-                return None;
-            }
-            match parts.next() {
-                Some(hap) if !hap.is_empty() => Some(format!("{sample}#{hap}")),
-                _ => Some(sample.to_string()),
-            }
-        }
-    }
-}
-
 /// Parse a BED file to build a blacklist of ranges.
 /// Returns a HashMap where keys are sequence names and values are interval trees.
 pub fn parse_blacklist_bed(path: &str) -> io::Result<Blacklist> {

@@ -1879,15 +1879,17 @@ fn process_anchor_region(
     let mut discovered_regions: Vec<(u32, i64, i64)> = Vec::new();
     discovered_regions.push((anchor_seq_id, region_start, region_end));
 
-    let overlaps = impg.query(
-        anchor_seq_id,
-        region_start,
-        region_end,
-        false,
-        None,
-        None,
-        false,
-    );
+    let overlaps = impg
+        .query(
+            anchor_seq_id,
+            region_start,
+            region_end,
+            false,
+            None,
+            None,
+            false,
+        )
+        .unwrap_or_default();
 
     let mut alignments: Vec<CompactAlignmentInfo> = Vec::new();
 
@@ -2141,7 +2143,8 @@ fn process_anchor_region_transitive_cigar(
             false,
             None,
         )
-    };
+    }
+    .unwrap_or_default();
 
     let mut alignments: Vec<CompactAlignmentInfo> = Vec::new();
 
@@ -3548,7 +3551,7 @@ pub fn query_region_depth(
                 false,
                 None,
             )
-        };
+        }?;
 
         let region_start = target_start;
         let region_end = target_end;
@@ -3751,7 +3754,7 @@ pub fn query_region_depth(
             None,
             sequence_index,
             false,
-        );
+        )?;
 
         for overlap in &overlaps {
             let query_interval = &overlap.0;
