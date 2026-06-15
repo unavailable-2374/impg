@@ -1,3 +1,4 @@
+use log::warn;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
@@ -28,7 +29,21 @@ impl SequenceIndex {
         });
 
         if let Some(len) = length {
-            self.id_to_len.entry(id).or_insert(len);
+            match self.id_to_len.get(&id) {
+                None => {
+                    self.id_to_len.insert(id, len);
+                }
+                Some(&existing) if existing != len => {
+                    warn!(
+                        "Sequence '{}' registered with conflicting lengths: \
+                         keeping existing {} bp, ignoring new {} bp. This \
+                         usually indicates inconsistent inputs across \
+                         alignment files.",
+                        name, existing, len
+                    );
+                }
+                Some(_) => {}
+            }
         }
 
         id

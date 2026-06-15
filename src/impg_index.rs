@@ -11,7 +11,8 @@ use crate::seqidx::SequenceIndex;
 use crate::sequence_index::UnifiedSequenceIndex;
 use crate::subset_filter::SubsetFilter;
 use coitrees::BasicCOITree;
-use rustc_hash::FxHashMap;
+use rayon::prelude::*;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::{io, sync::Arc};
 
 /// Raw alignment interval without CIGAR projection, for fast depth computation.
@@ -122,10 +123,20 @@ pub trait ImpgIndex: Send + Sync {
     /// Get the sequence files (FASTA/AGC) associated with this index.
     fn sequence_files(&self) -> &[String];
 
+    /// Get the alignment files (PAF/.1aln) associated with this index.
+    /// Used for caching by paths (e.g., the depth-degrees sidecar cache).
+    /// Default returns an empty slice (non-alignment backends like syng have none).
+    fn alignment_files(&self) -> &[String] {
+        &[]
+    }
+
     /// Query alignments where the specified sequence is the QUERY (reverse direction).
-    /// Returns: Vec of (query_start, query_end, target_id) tuples.
+    /// Returns: Vec of (our_q_start, our_q_end, other_t_start, other_t_end, other_seq_id)
+    /// - our_q_start/our_q_end: coordinates on our sequence (appears as query in the alignment)
+    /// - other_t_start/other_t_end: coordinates on the other sequence (appears as target)
+    /// - other_seq_id: the other sequence's unified ID
     /// Default returns empty (depth is unsupported on non-alignment backends like syng).
-    fn query_reverse_for_depth(&self, _query_id: u32) -> Vec<(i64, i64, u32)> {
+    fn query_reverse_for_depth(&self, _query_id: u32) -> Vec<(i64, i64, i64, i64, u32)> {
         Vec::new()
     }
 
@@ -141,7 +152,7 @@ pub trait ImpgIndex: Send + Sync {
         &self,
         _query_id: u32,
         _query_to_targets: &FxHashMap<u32, Vec<u32>>,
-    ) -> Vec<(i64, i64, u32)> {
+    ) -> Vec<(i64, i64, i64, i64, u32)> {
         Vec::new()
     }
 
@@ -152,6 +163,16 @@ pub trait ImpgIndex: Send + Sync {
     /// For single Impg, this is a no-op.
     /// Useful for depth computation with many alignment files to bound peak memory.
     fn clear_sub_index_cache(&self) {}
+
+    /// Clear the transient per-file header cache used by `MultiImpg`'s
+    /// chunked Phase 1/2 hot paths (`load_sub_index_transient`). For single
+    /// `Impg` this is a no-op; the default implementation matches that.
+    ///
+    /// Call between distinct phases (e.g. after the global degree pre-scan)
+    /// to release retained `Arc<Impg>` headers that are no longer needed,
+    /// freeing the kernel mmap regions they hold. Independent of
+    /// `clear_sub_index_cache`, which targets the BFS/transitive cache.
+    fn clear_transient_header_cache(&self) {}
 
     /// Enable or disable tree caching.
     /// When disabled, trees loaded from disk are not stored in the cache,
@@ -185,6 +206,113 @@ pub trait ImpgIndex: Send + Sync {
         _end: i64,
     ) -> Vec<RawAlignmentInterval> {
         Vec::new()
+    }
+
+    /// Transient variant of `query_raw_intervals` that MUST NOT populate any
+    /// long-lived sub-index or tree cache. `MultiImpg` overrides this to load
+    /// each sub-index via `load_sub_index_transient` and drop it immediately
+    /// after walking its trees, so peak retained memory per call stays at one
+    /// sub-index + one tree regardless of `forest_map` breadth. The default
+    /// implementation delegates to `query_raw_intervals` (single `Impg` has
+    /// bounded per-file state and does not need the transient path).
+    ///
+    /// Required for the depth command's non-transitive Phase 1/2 hot paths
+    /// when running with `--index-mode per-file` and ≫ 10⁴ alignment files.
+    ///
+    /// Output order is **not** guaranteed to match `query_raw_intervals`: the
+    /// `MultiImpg` override groups locations by sub-index file and iterates the
+    /// group map, which for `FxHashMap` is non-deterministic. Callers that need
+    /// a deterministic order must sort the result themselves (the depth command
+    /// already does so via `sort_unstable_by_key`).
+    fn query_raw_intervals_transient(&self, target_id: u32) -> Vec<RawAlignmentInterval> {
+        self.query_raw_intervals(target_id)
+    }
+
+    /// Transient variant of `query_raw_overlapping`. Same rationale as
+    /// `query_raw_intervals_transient`: `MultiImpg` overrides it to avoid
+    /// writing the sub-index/tree caches. Default delegates to the cached path.
+    ///
+    /// Output order is not guaranteed (see `query_raw_intervals_transient`).
+    fn query_raw_overlapping_transient(
+        &self,
+        target_id: u32,
+        start: i64,
+        end: i64,
+    ) -> Vec<RawAlignmentInterval> {
+        self.query_raw_overlapping(target_id, start, end)
+    }
+
+    /// Batch variant of `query_raw_overlapping_transient`.
+    ///
+    /// Given a slice of `(unified_target_id, start, end)` queries, returns a
+    /// parallel Vec of results — `output[i]` holds the raw intervals for
+    /// `queries[i]`. The key optimisation for `MultiImpg`: every query that
+    /// touches the same alignment file is served by a single transient
+    /// sub-index load, so each file is read from disk at most once per call
+    /// regardless of how many queries reference it. Peak live memory is
+    /// bounded to one sub-index at a time (sequential file processing).
+    ///
+    /// Default: calls `query_raw_overlapping_transient` individually for each
+    /// query — correct for single-file `Impg` which has no file sharing to
+    /// exploit.
+    fn batch_query_raw_overlapping(
+        &self,
+        queries: &[(u32, i64, i64)],
+    ) -> Vec<Vec<RawAlignmentInterval>> {
+        queries
+            .iter()
+            .map(|&(target_id, start, end)| {
+                self.query_raw_overlapping_transient(target_id, start, end)
+            })
+            .collect()
+    }
+
+    /// Pre-scan: for each unified target in `seq_included`, count unique OTHER samples
+    /// directly aligned to it. Used by the depth command to auto-detect hub sequences.
+    ///
+    /// Parameters:
+    /// - `seq_included`: length `num_unified`, true if the sequence participates in this run.
+    /// - `seq_to_sample`: unified_seq_id -> sample_id mapping, length `num_unified`.
+    ///
+    /// Returns a `Vec<u16>` of length `num_unified` giving the degree (unique OTHER samples) per
+    /// sequence; entries for excluded sequences are 0.
+    ///
+    /// The default implementation iterates targets in parallel via `query_raw_intervals`. This
+    /// is fine for single-file `Impg` but explodes memory for `MultiImpg` with hundreds of
+    /// thousands of per-file sub-indices, which is why `MultiImpg` overrides it with a
+    /// file-parallel strategy that bounds retained sub-indices to `num_threads`.
+    fn compute_sample_degrees(&self, seq_included: &[bool], seq_to_sample: &[u16]) -> Vec<u16> {
+        (0..seq_included.len() as u32)
+            .into_par_iter()
+            .map(|seq_id| {
+                if !seq_included.get(seq_id as usize).copied().unwrap_or(false) {
+                    return 0u16;
+                }
+                let raw_alns = self.query_raw_intervals(seq_id);
+                if raw_alns.is_empty() {
+                    return 0;
+                }
+                let self_sample = seq_to_sample.get(seq_id as usize).copied().unwrap_or(0);
+                let mut samples: FxHashSet<u16> = FxHashSet::default();
+                for aln in &raw_alns {
+                    if !seq_included
+                        .get(aln.query_id as usize)
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    let sample_id = seq_to_sample
+                        .get(aln.query_id as usize)
+                        .copied()
+                        .unwrap_or(0);
+                    if sample_id != self_sample {
+                        samples.insert(sample_id);
+                    }
+                }
+                samples.len().min(u16::MAX as usize) as u16
+            })
+            .collect()
     }
 
     /// Access the underlying `SyngIndex` if this implementation is
@@ -467,7 +595,14 @@ impl ImpgIndex for ImpgWrapper {
         }
     }
 
-    fn query_reverse_for_depth(&self, query_id: u32) -> Vec<(i64, i64, u32)> {
+    fn alignment_files(&self) -> &[String] {
+        match self {
+            ImpgWrapper::Single(impg) => impg.alignment_files(),
+            ImpgWrapper::Multi(multi) => multi.alignment_files(),
+        }
+    }
+
+    fn query_reverse_for_depth(&self, query_id: u32) -> Vec<(i64, i64, i64, i64, u32)> {
         match self {
             ImpgWrapper::Single(impg) => impg.query_reverse_for_depth(query_id),
             ImpgWrapper::Multi(multi) => multi.query_reverse_for_depth(query_id),
@@ -485,10 +620,14 @@ impl ImpgIndex for ImpgWrapper {
         &self,
         query_id: u32,
         query_to_targets: &FxHashMap<u32, Vec<u32>>,
-    ) -> Vec<(i64, i64, u32)> {
+    ) -> Vec<(i64, i64, i64, i64, u32)> {
         match self {
-            ImpgWrapper::Single(impg) => impg.query_reverse_for_depth_with_map(query_id, query_to_targets),
-            ImpgWrapper::Multi(multi) => multi.query_reverse_for_depth_with_map(query_id, query_to_targets),
+            ImpgWrapper::Single(impg) => {
+                impg.query_reverse_for_depth_with_map(query_id, query_to_targets)
+            }
+            ImpgWrapper::Multi(multi) => {
+                multi.query_reverse_for_depth_with_map(query_id, query_to_targets)
+            }
         }
     }
 
@@ -503,6 +642,19 @@ impl ImpgIndex for ImpgWrapper {
         match self {
             ImpgWrapper::Single(impg) => impg.clear_sub_index_cache(),
             ImpgWrapper::Multi(multi) => multi.clear_sub_index_cache(),
+        }
+    }
+
+    fn clear_transient_header_cache(&self) {
+        // Without this override, calls on a `&dyn ImpgIndex` / `&impl ImpgIndex`
+        // typed as `ImpgWrapper` would silently use the trait default no-op,
+        // leaking cached `Arc<Impg>` headers across phase boundaries and
+        // exhausting `vm.max_map_count` at large `--index-mode per-file`
+        // alignment-file counts (depth `memory allocation of N bytes failed`
+        // crash long before RSS approaches the host limit).
+        match self {
+            ImpgWrapper::Single(_) => {}
+            ImpgWrapper::Multi(multi) => multi.clear_transient_header_cache(),
         }
     }
 
@@ -527,10 +679,59 @@ impl ImpgIndex for ImpgWrapper {
         }
     }
 
-    fn query_raw_overlapping(&self, target_id: u32, start: i64, end: i64) -> Vec<RawAlignmentInterval> {
+    fn query_raw_overlapping(
+        &self,
+        target_id: u32,
+        start: i64,
+        end: i64,
+    ) -> Vec<RawAlignmentInterval> {
         match self {
             ImpgWrapper::Single(impg) => impg.query_raw_overlapping(target_id, start, end),
             ImpgWrapper::Multi(multi) => multi.query_raw_overlapping(target_id, start, end),
+        }
+    }
+
+    fn query_raw_intervals_transient(&self, target_id: u32) -> Vec<RawAlignmentInterval> {
+        match self {
+            // Single Impg: no per-file sub-index cache, trait default (== cached path) is fine.
+            ImpgWrapper::Single(impg) => impg.query_raw_intervals_transient(target_id),
+            // MultiImpg: override that skips writing the sub-index/tree caches.
+            ImpgWrapper::Multi(multi) => multi.query_raw_intervals_transient(target_id),
+        }
+    }
+
+    fn query_raw_overlapping_transient(
+        &self,
+        target_id: u32,
+        start: i64,
+        end: i64,
+    ) -> Vec<RawAlignmentInterval> {
+        match self {
+            ImpgWrapper::Single(impg) => {
+                impg.query_raw_overlapping_transient(target_id, start, end)
+            }
+            ImpgWrapper::Multi(multi) => {
+                multi.query_raw_overlapping_transient(target_id, start, end)
+            }
+        }
+    }
+
+    fn batch_query_raw_overlapping(
+        &self,
+        queries: &[(u32, i64, i64)],
+    ) -> Vec<Vec<RawAlignmentInterval>> {
+        match self {
+            ImpgWrapper::Single(impg) => impg.batch_query_raw_overlapping(queries),
+            ImpgWrapper::Multi(multi) => multi.batch_query_raw_overlapping(queries),
+        }
+    }
+
+    fn compute_sample_degrees(&self, seq_included: &[bool], seq_to_sample: &[u16]) -> Vec<u16> {
+        match self {
+            // Single Impg: default trait impl (parallel-by-target) is already optimal.
+            ImpgWrapper::Single(impg) => impg.compute_sample_degrees(seq_included, seq_to_sample),
+            // MultiImpg: file-parallel override to bound peak memory.
+            ImpgWrapper::Multi(multi) => multi.compute_sample_degrees(seq_included, seq_to_sample),
         }
     }
 }

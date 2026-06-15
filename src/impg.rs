@@ -75,6 +75,9 @@ pub struct CigarOp {
     val: u32,
 }
 
+/// Maximum length that fits in a single CigarOp (29-bit length field).
+pub const CIGAR_OP_MAX_LEN: i64 = (1i64 << 29) - 1;
+
 impl CigarOp {
     pub fn new(len: i32, op: char) -> Self {
         let val = match op {
@@ -85,9 +88,34 @@ impl CigarOp {
             'M' => 4,
             _ => panic!("Invalid CIGAR operation: {op}"),
         };
+        assert!(
+            len >= 0 && (len as i64) <= CIGAR_OP_MAX_LEN,
+            "CigarOp length {} out of range (max {})",
+            len,
+            CIGAR_OP_MAX_LEN
+        );
         Self {
             val: (val << 29) | (len as u32),
         }
+    }
+
+    /// Build a run of same-op CigarOps whose total length is `len`, splitting
+    /// into chunks of at most `CIGAR_OP_MAX_LEN` so that alignments longer than
+    /// the 29-bit field do not truncate.
+    pub fn new_run(len: i64, op: char) -> Vec<Self> {
+        assert!(len >= 0, "CigarOp run length must be non-negative");
+        if len == 0 {
+            return Vec::new();
+        }
+        let mut out =
+            Vec::with_capacity(((len + CIGAR_OP_MAX_LEN - 1) / CIGAR_OP_MAX_LEN) as usize);
+        let mut remaining = len;
+        while remaining > 0 {
+            let take = remaining.min(CIGAR_OP_MAX_LEN);
+            out.push(Self::new(take as i32, op));
+            remaining -= take;
+        }
+        out
     }
 
     pub fn op(&self) -> char {
@@ -159,6 +187,308 @@ fn invert_cigar_ops(ops: &[CigarOp], strand: Strand) -> Vec<CigarOp> {
     } else {
         inverted
     }
+}
+
+/// Accumulates a CIGAR as same-op runs, merging adjacent equal ops and
+/// splitting flushed runs into `CIGAR_OP_MAX_LEN` chunks via `new_run` so the
+/// 29-bit length field never overflows (never calls `CigarOp::new` directly).
+struct CigarRunEmitter {
+    out: Vec<CigarOp>,
+    cur_len: i64,
+    cur_op: char, // '\0' == nothing pending
+}
+
+impl CigarRunEmitter {
+    fn new() -> Self {
+        Self {
+            out: Vec::new(),
+            cur_len: 0,
+            cur_op: '\0',
+        }
+    }
+
+    fn push(&mut self, len: i64, op: char) {
+        if len <= 0 {
+            return;
+        }
+        if self.cur_op == op {
+            self.cur_len += len;
+        } else {
+            self.flush();
+            self.cur_op = op;
+            self.cur_len = len;
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.cur_len > 0 && self.cur_op != '\0' {
+            self.out.extend(CigarOp::new_run(self.cur_len, self.cur_op));
+        }
+        self.cur_len = 0;
+        self.cur_op = '\0';
+    }
+
+    fn finish(mut self) -> Vec<CigarOp> {
+        self.flush();
+        self.out
+    }
+}
+
+/// Compose two alignments that share a middle sequence B, given:
+/// - `a_to_b`: CIGAR with target=A, query=B (A and B both walked forward)
+/// - `b_to_c`: CIGAR with target=B, query=C (B and C both walked forward)
+///
+/// Returns `a_to_c`: CIGAR with target=A, query=C (both forward). The emitted
+/// ops are direction-agnostic runs (=/X/I/D); strand is the caller's concern
+/// (`strand_AC = anchor_strand XOR strand_BC`), exactly as for hop-0 CIGARs.
+///
+/// Both inputs MUST consume the same total length of B (the caller slices each
+/// to the same B subrange). If they disagree, composition stops at the shorter
+/// side and trailing B-consuming ops on the longer side are dropped.
+///
+/// Op semantics while walking:
+/// - in `a_to_b`: `=`/`X`/`M` consume A&B, `I` consumes B only, `D` consumes A only
+/// - in `b_to_c`: `=`/`X`/`M` consume B&C, `I` consumes C only, `D` consumes B only
+///
+/// Each B position maps to `(consumes_A, consumes_C)`:
+/// - (1,1) → `=` iff both sides are `=`, else `X`
+/// - (1,0) → `D` (A present, C absent)
+/// - (0,1) → `I` (C present, A absent)
+/// - (0,0) → nothing (lossy I∘D: a B base deleted on both sides)
+///
+/// Ordering at each B position: first flush `a_to_b` `D` ops (consume A, not B)
+/// as `D`, then `b_to_c` `I` ops (consume C, not B) as `I`, then the B-consuming
+/// overlap. This makes the output canonical and testable.
+fn compose_cigars_shared_b(a_to_b: &[CigarOp], b_to_c: &[CigarOp]) -> Vec<CigarOp> {
+    let mut emitter = CigarRunEmitter::new();
+
+    let mut i = 0usize;
+    let mut j = 0usize;
+    let mut a_left: i64 = a_to_b.first().map_or(0, |o| o.len() as i64);
+    let mut b_left: i64 = b_to_c.first().map_or(0, |o| o.len() as i64);
+
+    loop {
+        // 1. Flush a_to_b ops that consume A but not B (D) -> emit D.
+        while i < a_to_b.len() && a_to_b[i].op() == 'D' {
+            emitter.push(a_left, 'D');
+            i += 1;
+            a_left = a_to_b.get(i).map_or(0, |o| o.len() as i64);
+        }
+        // 2. Flush b_to_c ops that consume C but not B (I) -> emit I.
+        while j < b_to_c.len() && b_to_c[j].op() == 'I' {
+            emitter.push(b_left, 'I');
+            j += 1;
+            b_left = b_to_c.get(j).map_or(0, |o| o.len() as i64);
+        }
+        // 3. Done when either side has no more B-consuming ops.
+        if i >= a_to_b.len() || j >= b_to_c.len() {
+            break;
+        }
+        // 4. Both cursors now sit on a B-consuming op.
+        //    a_op ∈ {=,X,I,M}; b_op ∈ {=,X,D,M}.
+        let a_op = a_to_b[i].op();
+        let b_op = b_to_c[j].op();
+        let step = a_left.min(b_left);
+
+        let consumes_a = a_op != 'I'; // =,X,M consume A; I does not
+        let consumes_c = b_op != 'D'; // =,X,M consume C; D does not
+        match (consumes_a, consumes_c) {
+            (true, true) => {
+                let op = if a_op == '=' && b_op == '=' { '=' } else { 'X' };
+                emitter.push(step, op);
+            }
+            (true, false) => emitter.push(step, 'D'),
+            (false, true) => emitter.push(step, 'I'),
+            (false, false) => { /* lossy (0,0): emit nothing */ }
+        }
+
+        a_left -= step;
+        b_left -= step;
+        if a_left == 0 {
+            i += 1;
+            a_left = a_to_b.get(i).map_or(0, |o| o.len() as i64);
+        }
+        if b_left == 0 {
+            j += 1;
+            b_left = b_to_c.get(j).map_or(0, |o| o.len() as i64);
+        }
+    }
+
+    emitter.finish()
+}
+
+/// Result of composing a carried frontier CIGAR with one pairwise hit.
+struct ComposedHop {
+    /// `A→C`, target = anchor, query = C. Stored into `overlap.1` so depth's
+    /// `CigarEntry`/`CigarCursor` consume hop≥1 exactly like hop-0.
+    a_to_c: Vec<CigarOp>,
+    /// Anchor (A) span covered by `a_to_c`, normalized start < end.
+    anchor_lo: i64,
+    anchor_hi: i64,
+    /// `C→A`, target = C, query = anchor — carried into the next hop so the
+    /// `target = hub` invariant holds.
+    c_to_a: Vec<CigarOp>,
+    /// Composite strand of C relative to anchor (`anchor_strand XOR strand_bc`).
+    strand_ac: Strand,
+}
+
+/// Synthesize anchor↔C alignments for one transitive hop. Given the carried
+/// frontier item (`B→A`, target = hub B) and one pairwise hit (`B→C`, target =
+/// hub B) over the pairwise's B overlap `[pw_b_first, pw_b_last]`, produce the
+/// composite `A→C` (result) and `C→A` (next frontier). See §3 of the plan.
+///
+/// Returns `None` when the slice/compose collapses to an empty or degenerate
+/// (zero anchor- or C-span) alignment — such hits are skipped, never pushed as
+/// zero-length or None-CIGAR (which would silently mask a bug, §8.4).
+fn compose_hop(
+    tr: &TransitiveRange,
+    pw_b_first: i64,
+    pw_b_last: i64,
+    pairwise_b_to_c: &[CigarOp],
+    strand_bc: Strand,
+) -> Option<ComposedHop> {
+    // 1. Slice carried B→A to the pairwise B overlap (target-range primitive).
+    let record = (
+        tr.start,
+        tr.end,
+        tr.anchor_span.0,
+        tr.anchor_span.1,
+        tr.anchor_strand,
+    );
+    let (aq_start, aq_end, sliced_b_to_a, _b_start, _b_end) =
+        project_target_range_through_alignment(
+            (pw_b_first, pw_b_last),
+            record,
+            &tr.hub_to_anchor_cigar,
+        )?;
+
+    // 2. Transpose sliced B→A to A→B (target = A, query = B), swapping I↔D
+    //    ONLY (no order reversal). The shared axis B must be walked forward in
+    //    BOTH `a_to_b` and the pairwise `b_to_c` for composition; reversing the
+    //    op order here (as a strand-aware transpose would) puts B backward in
+    //    `a_to_b` while `b_to_c` walks B forward, misaligning the two axes and
+    //    misplacing indels on reverse-strand chains. So always pass Forward.
+    //    When `anchor_strand` is Reverse, A is therefore traversed backward in
+    //    the B-forward walk, and the composed ops come out in A-decreasing
+    //    order — we re-orient them to anchor-forward below.
+    let a_to_b = invert_cigar_ops(&sliced_b_to_a, Strand::Forward);
+
+    // 3. Compose A→B ∘ B→C → A→C (emitted in B-forward / A-`anchor_strand` order).
+    let mut a_to_c = compose_cigars_shared_b(&a_to_b, pairwise_b_to_c);
+    if a_to_c.is_empty() {
+        return None;
+    }
+    // Re-orient to target = anchor forward. Reversing the column order alone
+    // (no I↔D swap) keeps target=A / query=C roles intact while flipping which
+    // end is the start; the C direction relative to A is carried by `strand_ac`.
+    if tr.anchor_strand == Strand::Reverse {
+        a_to_c.reverse();
+    }
+    assert!(
+        a_to_c.len() <= MAX_SYNTHESIZED_CIGAR_OPS,
+        "synthesized transitive CIGAR has {} ops, exceeding cap {} — chain too deep/fragmented",
+        a_to_c.len(),
+        MAX_SYNTHESIZED_CIGAR_OPS
+    );
+
+    // 4. Composite strand; transpose A→C to next-frontier C→A.
+    let strand_ac = if tr.anchor_strand == strand_bc {
+        Strand::Forward
+    } else {
+        Strand::Reverse
+    };
+    let c_to_a = invert_cigar_ops(&a_to_c, strand_ac);
+
+    // Anchor (A) span: A is the target of a_to_c, walked forward from the lower
+    // A coordinate of the slice. Recompute the length from the *emitted* ops so
+    // lossy (0,0) columns cannot inflate it (§3 anchor_span recompute).
+    let anchor_lo = aq_start.min(aq_end);
+    let anchor_len: i64 = a_to_c.iter().map(|o| o.target_delta() as i64).sum();
+    let anchor_hi = anchor_lo + anchor_len;
+    if anchor_len == 0 {
+        return None;
+    }
+    // C span must be non-zero too, else there is nothing to project.
+    let c_len: i64 = a_to_c
+        .iter()
+        .map(|o| match o.op() {
+            '=' | 'X' | 'I' | 'M' => o.len() as i64,
+            _ => 0,
+        })
+        .sum();
+    if c_len == 0 {
+        return None;
+    }
+
+    Some(ComposedHop {
+        a_to_c,
+        anchor_lo,
+        anchor_hi,
+        c_to_a,
+        strand_ac,
+    })
+}
+
+/// Hard cap on the number of ops in a synthesized transitive CIGAR. Set very
+/// wide: only pathologically deep / fragmented chains approach it. Hitting it
+/// aborts the whole depth/query task (see §5.7) rather than silently degrading.
+const MAX_SYNTHESIZED_CIGAR_OPS: usize = 64 * 1024 * 1024;
+
+/// A frontier item for CIGAR-precise transitive search. Each item carries a
+/// CIGAR oriented `target = current hub (B)`, `query = anchor (A)` (i.e. `B→A`),
+/// so that the next hop's pairwise CIGAR (`target = B`, `query = C`) shares the
+/// target axis B and can be sliced/composed with the existing target-range
+/// primitives. See `notes/PLAN_hop_ge1_cigar_precise_IMPL.md` §2.
+///
+/// When carry is disabled (non-`--use-BFS` / approximate), the CIGAR fields are
+/// dummy and ignored; only `seq_id/start/end` matter, preserving byte-identical
+/// behavior of the existing fast path.
+#[derive(Clone)]
+struct TransitiveRange {
+    seq_id: u32,
+    start: i64,
+    end: i64,
+    /// `B→A`, target = `seq_id` (hub), query = anchor. `Arc` so frontier splits
+    /// share without cloning; re-slicing produces a fresh `Vec`.
+    hub_to_anchor_cigar: Arc<Vec<CigarOp>>,
+    /// Accumulated strand of anchor (A) relative to this hub (B).
+    anchor_strand: Strand,
+    anchor_id: u32,
+    /// Anchor (A) span this range projects from, normalized start < end.
+    anchor_span: (i64, i64),
+}
+
+/// Per-hit output of one transitive depth, ready for sequential result-push and
+/// next-frontier construction. In the fast (non-carry) path, `result_cigar` is
+/// the raw pairwise CIGAR, the `t_*` fields are hub coords, and `next_carry` is
+/// `None`. In the carry path, `result_cigar` is the synthesized `A→C`, the
+/// `t_*` fields are anchor coords, and `next_carry` holds the `C→A` to slice.
+struct BfsHit {
+    query_id: u32,
+    /// C (query) coords, signed so first > last iff the C↔target strand is reverse.
+    query_first: i64,
+    query_last: i64,
+    result_cigar: Vec<CigarOp>,
+    /// `overlap.2` coords + id: hub (fast) or anchor (carry).
+    t_first: i64,
+    t_last: i64,
+    t_id: u32,
+    /// Immediate parent hub id, for the "different sequence" recursion guard.
+    parent_id: u32,
+    next_carry: Option<NextCarry>,
+}
+
+/// Carry needed to extend a hit into the next hop: the `C→A` alignment plus its
+/// C (target) and anchor (query) spans and composite strand, so each new C
+/// subrange from the frontier split can be re-sliced (§5.5).
+struct NextCarry {
+    c_to_a: Arc<Vec<CigarOp>>,
+    strand_ac: Strand,
+    anchor_id: u32,
+    c_lo: i64,
+    c_hi: i64,
+    anchor_lo: i64,
+    anchor_hi: i64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -410,6 +740,10 @@ pub struct Impg {
     /// This bounds memory usage for commands like `depth` where transitive BFS
     /// would otherwise cache all trees simultaneously.
     tree_cache_enabled: std::sync::atomic::AtomicBool,
+    /// True iff this index was built in bidirectional mode (IMPGIDX2 format).
+    /// V1 indices only store forward-direction entries; depth queries on V1
+    /// must scan the reverse direction separately.
+    is_bidirectional: bool,
 }
 
 impl Impg {
@@ -839,8 +1173,7 @@ impl Impg {
 
         // if there are no differences, we can shortcut to a perfect match CIGAR
         if alignment.differences == 0 {
-            let match_len = (query_end - query_start) as i32;
-            return vec![CigarOp::new(match_len, '=')];
+            return CigarOp::new_run(query_end - query_start, '=');
         }
 
         // Fetch query sequence (not cached)
@@ -1317,6 +1650,147 @@ impl Impg {
         }
     }
 
+    fn project_overlapping_interval_coords(
+        &self,
+        metadata: &QueryMetadata,
+        target_id: u32,
+        range_start: i64,
+        range_end: i64,
+        sequence_index: Option<&UnifiedSequenceIndex>,
+    ) -> Option<(Interval<u32>, Interval<u32>)> {
+        let file_index = metadata.alignment_file_index as usize;
+        let alignment_file = &self.alignment_files[file_index];
+        let is_tracepoint_file =
+            alignment_file.ends_with(".1aln") || alignment_file.ends_with(".tpa");
+
+        if let (true, Some(sequence_index)) = (is_tracepoint_file, sequence_index) {
+            if metadata.target_start >= range_end || metadata.target_end <= range_start {
+                return None;
+            }
+
+            let alignment = match self.get_tracepoint_alignment(metadata) {
+                Ok(a) => a,
+                Err(e) => {
+                    debug!("Cannot fetch tracepoint alignment for target_id={}, file_index={}: {}, skipping",
+                        target_id, metadata.alignment_file_index, e);
+                    return None;
+                }
+            };
+
+            let subset = match self.scan_overlapping_tracepoints(
+                &alignment,
+                metadata,
+                range_start,
+                range_end,
+                metadata.is_reversed(),
+            ) {
+                Some(s) => s,
+                None => {
+                    debug!(
+                        "No overlapping tracepoint segments for range {}-{} (target_id={}, file_index={}), skipping",
+                        range_start, range_end, target_id, metadata.alignment_file_index
+                    );
+                    return None;
+                }
+            };
+
+            let cigar_ops = self.process_subset_tracepoints(
+                &alignment,
+                metadata,
+                target_id,
+                &subset,
+                sequence_index,
+            );
+            let cigar_ops = if metadata.is_reversed() {
+                invert_cigar_ops(&cigar_ops, metadata.strand())
+            } else {
+                cigar_ops
+            };
+
+            let is_reverse = metadata.strand() == Strand::Reverse;
+            let subset_query_start = subset.first_query_pos;
+            let subset_query_end = if subset.last_idx == alignment.tracepoints.len() - 1 {
+                if metadata.is_reversed() && is_reverse {
+                    metadata.query_start
+                } else {
+                    metadata.query_end
+                }
+            } else {
+                subset.last_query_pos
+            };
+
+            let (_, _, first_seg_start, first_seg_end, _, _) = subset.first_segment_info;
+            let (_, _, last_seg_start, last_seg_end, _, _) = subset.last_segment_info;
+            let subset_target_start = first_seg_start
+                .min(first_seg_end)
+                .min(last_seg_start.min(last_seg_end));
+            let subset_target_end = if subset.last_idx == alignment.tracepoints.len() - 1 {
+                metadata.target_end
+            } else {
+                first_seg_start
+                    .max(first_seg_end)
+                    .max(last_seg_start.max(last_seg_end))
+            };
+
+            let (
+                adjusted_query_start,
+                adjusted_query_end,
+                adjusted_target_start,
+                adjusted_target_end,
+            ) = project_target_range_coords_through_alignment(
+                (range_start, range_end),
+                (
+                    subset_target_start,
+                    subset_target_end,
+                    subset_query_start.min(subset_query_end),
+                    subset_query_start.max(subset_query_end),
+                    metadata.strand(),
+                ),
+                &cigar_ops,
+            )?;
+
+            return Some((
+                Interval {
+                    first: adjusted_query_start,
+                    last: adjusted_query_end,
+                    metadata: metadata.query_id,
+                },
+                Interval {
+                    first: adjusted_target_start,
+                    last: adjusted_target_end,
+                    metadata: target_id,
+                },
+            ));
+        }
+
+        let cigar_ops = self.get_cigar_ops(metadata, target_id, sequence_index);
+        let (adjusted_query_start, adjusted_query_end, adjusted_target_start, adjusted_target_end) =
+            project_target_range_coords_through_alignment(
+                (range_start, range_end),
+                (
+                    metadata.target_start,
+                    metadata.target_end,
+                    metadata.query_start,
+                    metadata.query_end,
+                    metadata.strand(),
+                ),
+                &cigar_ops,
+            )?;
+
+        Some((
+            Interval {
+                first: adjusted_query_start,
+                last: adjusted_query_end,
+                metadata: metadata.query_id,
+            },
+            Interval {
+                first: adjusted_target_start,
+                last: adjusted_target_end,
+                metadata: target_id,
+            },
+        ))
+    }
+
     /// Fast approximate projection using tracepoints without CIGAR computation or sequence fetching.
     /// Returns approximate intervals with identity metrics calculated from tracepoint statistics.
     fn project_overlapping_interval_fast(
@@ -1559,10 +2033,7 @@ impl Impg {
                 continue;
             }
 
-            let missing_cigar_count = records
-                .iter()
-                .filter(|r| r.data_bytes == 0)
-                .count();
+            let missing_cigar_count = records.iter().filter(|r| r.data_bytes == 0).count();
 
             if missing_cigar_count > 0 {
                 return Err(io::Error::new(
@@ -1682,6 +2153,7 @@ impl Impg {
             sequence_files: sequence_files.map(|s| s.to_vec()).unwrap_or_default(),
             trace_spacing_cache: RwLock::new(vec![None; num_files]),
             tree_cache_enabled: std::sync::atomic::AtomicBool::new(true),
+            is_bidirectional: true, // new() always produces a V2 (bidirectional) index
         })
     }
 
@@ -1789,7 +2261,10 @@ impl Impg {
             let arc_tree = Arc::new(tree);
 
             // Only cache if tree caching is enabled
-            if self.tree_cache_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            if self
+                .tree_cache_enabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 self.trees
                     .write()
                     .unwrap()
@@ -1822,10 +2297,7 @@ impl Impg {
     /// Load a tree from disk WITHOUT caching it
     /// This is useful for parallel processing where each thread loads trees independently
     /// to avoid write lock contention on the shared tree cache
-    pub fn load_tree_no_cache(
-        &self,
-        target_id: u32,
-    ) -> Option<BasicCOITree<QueryMetadata, u32>> {
+    pub fn load_tree_no_cache(&self, target_id: u32) -> Option<BasicCOITree<QueryMetadata, u32>> {
         if let Some(tree_offset) = self.forest_map.get_tree_offset(target_id) {
             let mut file = File::open(&self.index_file_path).ok()?;
             file.seek(std::io::SeekFrom::Start(tree_offset)).ok()?;
@@ -1874,7 +2346,8 @@ impl Impg {
     /// This bounds peak memory for workloads like transitive depth where BFS would
     /// otherwise cache every tree it visits.
     pub fn set_tree_cache_enabled(&self, enabled: bool) {
-        self.tree_cache_enabled.store(enabled, std::sync::atomic::Ordering::Relaxed);
+        self.tree_cache_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Get the number of trees currently cached in memory
@@ -1937,6 +2410,7 @@ impl Impg {
                 })?;
 
         let num_files = alignment_files.len();
+        let is_bidirectional = magic_buf == MAGIC_V2;
         Ok(Self {
             trees: RwLock::new(FxHashMap::default()),
             seq_index,
@@ -1946,6 +2420,7 @@ impl Impg {
             sequence_files: sequence_files.map(|s| s.to_vec()).unwrap_or_default(),
             trace_spacing_cache: RwLock::new(vec![None; num_files]),
             tree_cache_enabled: std::sync::atomic::AtomicBool::new(true),
+            is_bidirectional,
         })
     }
 
@@ -1968,7 +2443,7 @@ impl Impg {
                 metadata: target_id,
             },
             if store_cigar {
-                vec![CigarOp::new((range_end - range_start) as i32, '=')]
+                CigarOp::new_run(range_end - range_start, '=')
             } else {
                 Vec::new()
             },
@@ -1996,6 +2471,21 @@ impl Impg {
         if let Some(tree) = self.get_or_load_tree(target_id) {
             tree.query(range_start, range_end, |interval| {
                 let metadata = &interval.metadata;
+                if !approximate_mode && !store_cigar && min_gap_compressed_identity.is_none() {
+                    if let Some((query_interval, target_interval)) = self
+                        .project_overlapping_interval_coords(
+                            metadata,
+                            target_id,
+                            range_start,
+                            range_end,
+                            sequence_index,
+                        )
+                    {
+                        results.push((query_interval, Vec::new(), target_interval));
+                    }
+                    return;
+                }
+
                 let projection = if approximate_mode {
                     // Approximate mode: fast projection without sequence I/O
                     self.project_overlapping_interval_fast(
@@ -2031,10 +2521,7 @@ impl Impg {
     /// This finds alignments where query_id matches, scanning all trees.
     /// Returns: Vec of (target_interval, query_interval, original_target_id) tuples
     /// Note: This is O(N) where N is total alignments - use sparingly.
-    pub fn query_reverse_for_depth(
-        &self,
-        query_id: u32,
-    ) -> Vec<(i64, i64, u32)> {
+    pub fn query_reverse_for_depth(&self, query_id: u32) -> Vec<(i64, i64, i64, i64, u32)> {
         let mut results = Vec::new();
 
         // Iterate through all target_ids in the forest map
@@ -2049,10 +2536,11 @@ impl Impg {
                 for interval in tree.iter() {
                     // Check if this alignment has our sequence as query
                     if interval.metadata.query_id == query_id {
-                        // Return the query coordinates (which is our ref in reverse direction)
                         let query_start = interval.metadata.query_start;
                         let query_end = interval.metadata.query_end;
-                        results.push((query_start, query_end, target_id));
+                        let target_start = interval.first as i64;
+                        let target_end = interval.last as i64;
+                        results.push((query_start, query_end, target_start, target_end, target_id));
                     }
                 }
             }
@@ -2100,7 +2588,7 @@ impl Impg {
         &self,
         query_id: u32,
         query_to_targets: &FxHashMap<u32, Vec<u32>>,
-    ) -> Vec<(i64, i64, u32)> {
+    ) -> Vec<(i64, i64, i64, i64, u32)> {
         let mut results = Vec::new();
 
         // Only query trees that we know have alignments with this query_id
@@ -2111,7 +2599,15 @@ impl Impg {
                         if interval.metadata.query_id == query_id {
                             let query_start = interval.metadata.query_start;
                             let query_end = interval.metadata.query_end;
-                            results.push((query_start, query_end, target_id));
+                            let target_start = interval.first as i64;
+                            let target_end = interval.last as i64;
+                            results.push((
+                                query_start,
+                                query_end,
+                                target_start,
+                                target_end,
+                                target_id,
+                            ));
                         }
                     }
                 }
@@ -2159,7 +2655,7 @@ impl Impg {
                 metadata: target_id,
             },
             if store_cigar {
-                vec![CigarOp::new((range_end - range_start) as i32, '=')]
+                CigarOp::new_run(range_end - range_start, '=')
             } else {
                 Vec::new()
             },
@@ -2244,27 +2740,31 @@ impl Impg {
         approximate_mode: bool,
         subset_filter: Option<&crate::subset_filter::SubsetFilter>,
     ) -> Vec<AdjustedInterval> {
-        // Initialize visited ranges from masked regions if provided
+        // Initialize visited ranges from masked regions if provided.  The
+        // common depth --use-BFS path has no mask and invokes this once per
+        // chunk; prebuilding a SortedRanges for every sequence per chunk is
+        // pure overhead, so allocate entries lazily as the BFS reaches them.
         let mut visited_ranges: FxHashMap<u32, SortedRanges> = if let Some(m) = masked_regions {
             m.iter().map(|(&k, v)| (k, (*v).clone())).collect()
         } else {
-            (0..self.seq_index.len() as u32)
-                .into_par_iter() // Use parallel iterator
-                .map(|id| {
-                    let len = self.seq_index.get_len_from_id(id).unwrap();
-                    (id, SortedRanges::new(len as i64, 0))
-                })
-                .collect()
+            FxHashMap::default()
         };
 
         // Filter input range
+        let target_len = self.seq_index.get_len_from_id(target_id).unwrap_or(0) as i64;
         let filtered_input_range = visited_ranges
             .entry(target_id)
-            .or_default()
+            .or_insert_with(|| SortedRanges::new(target_len, 0))
             .insert((range_start, range_end));
 
+        // See query_transitive_bfs: carry the per-hop synthesized CIGAR only on
+        // the CIGAR-precise path (store_cigar && !approximate). Plan §2.
+        let carry = store_cigar && !approximate_mode;
+
         let mut results = Vec::new();
-        let mut stack = Vec::new();
+        // Stack of (frontier item, depth). The CIGAR fields of the item are
+        // dummy/ignored when `carry` is false.
+        let mut stack: Vec<(TransitiveRange, u16)> = Vec::new();
 
         for (filtered_start, filtered_end) in filtered_input_range {
             // Add the filtered input range(s) to the results
@@ -2275,7 +2775,7 @@ impl Impg {
                     metadata: target_id,
                 },
                 if store_cigar {
-                    vec![CigarOp::new((filtered_end - filtered_start) as i32, '=')]
+                    CigarOp::new_run(filtered_end - filtered_start, '=')
                 } else {
                     Vec::new()
                 },
@@ -2288,17 +2788,33 @@ impl Impg {
 
             // Add the filtered input range(s) to the stack
             if (filtered_start - filtered_end).abs() >= min_transitive_len {
-                stack.push((target_id, filtered_start, filtered_end, 0u16));
+                let seed_cigar = if carry {
+                    Arc::new(CigarOp::new_run((filtered_end - filtered_start).abs(), '='))
+                } else {
+                    Arc::new(Vec::new())
+                };
+                stack.push((
+                    TransitiveRange {
+                        seq_id: target_id,
+                        start: filtered_start,
+                        end: filtered_end,
+                        hub_to_anchor_cigar: seed_cigar,
+                        anchor_strand: Strand::Forward,
+                        anchor_id: target_id,
+                        anchor_span: (
+                            filtered_start.min(filtered_end),
+                            filtered_start.max(filtered_end),
+                        ),
+                    },
+                    0u16,
+                ));
             }
         }
 
-        while let Some((
-            current_target_id,
-            current_target_start,
-            current_target_end,
-            current_depth,
-        )) = stack.pop()
-        {
+        while let Some((tr, current_depth)) = stack.pop() {
+            let current_target_id = tr.seq_id;
+            let current_target_start = tr.start;
+            let current_target_end = tr.end;
             // Check if we've reached max depth
             if max_depth > 0 && current_depth >= max_depth {
                 continue;
@@ -2325,7 +2841,7 @@ impl Impg {
                     }
                 });
 
-                let processed_results: Vec<_> = intervals
+                let processed_results: Vec<BfsHit> = intervals
                     .into_par_iter()
                     .filter_map(|(metadata, overlap_range)| {
                         let projection_result = if approximate_mode {
@@ -2335,6 +2851,19 @@ impl Impg {
                                 overlap_range.0,
                                 overlap_range.1,
                                 min_gap_compressed_identity,
+                            )
+                        } else if !store_cigar && min_gap_compressed_identity.is_none() {
+                            self.project_overlapping_interval_coords(
+                                &metadata,
+                                current_target_id,
+                                overlap_range.0,
+                                overlap_range.1,
+                                sequence_index,
+                            )
+                            .map(
+                                |(query_interval, target_interval)| {
+                                    (query_interval, Vec::new(), target_interval)
+                                },
                             )
                         } else {
                             self.project_overlapping_interval(
@@ -2360,23 +2889,64 @@ impl Impg {
                                 } else {
                                     true
                                 };
+                                if !should_keep {
+                                    return None;
+                                }
 
-                                if should_keep {
-                                    let adjusted_query_start = query_interval.first;
-                                    let adjusted_query_end = query_interval.last;
+                                if carry {
+                                    let strand_bc = if query_interval.first <= query_interval.last {
+                                        Strand::Forward
+                                    } else {
+                                        Strand::Reverse
+                                    };
+                                    let composed = compose_hop(
+                                        &tr,
+                                        target_interval.first,
+                                        target_interval.last,
+                                        &cigar_ops,
+                                        strand_bc,
+                                    )?;
+                                    let c_lo = query_interval.first.min(query_interval.last);
+                                    let c_hi = query_interval.first.max(query_interval.last);
+                                    let (query_first, query_last) =
+                                        if composed.strand_ac == Strand::Forward {
+                                            (c_lo, c_hi)
+                                        } else {
+                                            (c_hi, c_lo)
+                                        };
+                                    Some(BfsHit {
+                                        query_id,
+                                        query_first,
+                                        query_last,
+                                        result_cigar: composed.a_to_c,
+                                        t_first: composed.anchor_lo,
+                                        t_last: composed.anchor_hi,
+                                        t_id: tr.anchor_id,
+                                        parent_id: current_target_id,
+                                        next_carry: Some(NextCarry {
+                                            c_to_a: Arc::new(composed.c_to_a),
+                                            strand_ac: composed.strand_ac,
+                                            anchor_id: tr.anchor_id,
+                                            c_lo,
+                                            c_hi,
+                                            anchor_lo: composed.anchor_lo,
+                                            anchor_hi: composed.anchor_hi,
+                                        }),
+                                    })
+                                } else {
                                     let cigar_vec =
                                         if store_cigar { cigar_ops } else { Vec::new() };
-
-                                    Some((
-                                        query_interval,
-                                        cigar_vec,
-                                        target_interval,
+                                    Some(BfsHit {
                                         query_id,
-                                        adjusted_query_start,
-                                        adjusted_query_end,
-                                    ))
-                                } else {
-                                    None
+                                        query_first: query_interval.first,
+                                        query_last: query_interval.last,
+                                        result_cigar: cigar_vec,
+                                        t_first: target_interval.first,
+                                        t_last: target_interval.last,
+                                        t_id: current_target_id,
+                                        parent_id: current_target_id,
+                                        next_carry: None,
+                                    })
                                 }
                             },
                         )
@@ -2384,16 +2954,8 @@ impl Impg {
                     .collect();
 
                 // Process results sequentially to maintain deterministic behavior
-                for (
-                    query_interval,
-                    cigar,
-                    target_interval,
-                    query_id,
-                    adjusted_query_start,
-                    adjusted_query_end,
-                ) in processed_results
-                {
-                    let length = (query_interval.last - query_interval.first).abs();
+                for hit in processed_results {
+                    let length = (hit.query_last - hit.query_first).abs();
 
                     // Add to results only if it passes min_output_length filter
                     let should_add_to_output = if let Some(min_len) = min_output_length {
@@ -2402,21 +2964,36 @@ impl Impg {
                         true
                     };
                     if should_add_to_output {
-                        results.push((query_interval, cigar.clone(), target_interval));
+                        results.push((
+                            Interval {
+                                first: hit.query_first,
+                                last: hit.query_last,
+                                metadata: hit.query_id,
+                            },
+                            hit.result_cigar,
+                            Interval {
+                                first: hit.t_first,
+                                last: hit.t_last,
+                                metadata: hit.t_id,
+                            },
+                        ));
                     }
 
                     // Only add non-overlapping portions to the stack for further exploration
-                    if query_id != current_target_id {
-                        let ranges = visited_ranges.entry(query_id).or_default();
+                    if hit.query_id != hit.parent_id {
+                        let ranges = visited_ranges.entry(hit.query_id).or_insert_with(|| {
+                            let len = self.seq_index.get_len_from_id(hit.query_id).unwrap_or(0);
+                            SortedRanges::new(len as i64, 0)
+                        });
 
                         let mut should_add = true;
 
                         // Check if the range is too close to any existing ranges
                         if min_distance_between_ranges > 0 {
-                            let (new_min, new_max) = if adjusted_query_start <= adjusted_query_end {
-                                (adjusted_query_start, adjusted_query_end)
+                            let (new_min, new_max) = if hit.query_first <= hit.query_last {
+                                (hit.query_first, hit.query_last)
                             } else {
-                                (adjusted_query_end, adjusted_query_start)
+                                (hit.query_last, hit.query_first)
                             };
 
                             // Find insertion point in sorted ranges
@@ -2446,13 +3023,63 @@ impl Impg {
                         }
 
                         if should_add {
-                            let new_ranges =
-                                ranges.insert((adjusted_query_start, adjusted_query_end));
+                            let new_ranges = ranges.insert((hit.query_first, hit.query_last));
 
                             // Add non-overlapping portions to stack
                             for (new_start, new_end) in new_ranges {
-                                if (new_end - new_start).abs() >= min_transitive_len {
-                                    stack.push((query_id, new_start, new_end, current_depth + 1));
+                                if (new_end - new_start).abs() < min_transitive_len {
+                                    continue;
+                                }
+                                match &hit.next_carry {
+                                    Some(nc) => {
+                                        let rec = (
+                                            nc.c_lo,
+                                            nc.c_hi,
+                                            nc.anchor_lo,
+                                            nc.anchor_hi,
+                                            nc.strand_ac,
+                                        );
+                                        if let Some((sq_start, sq_end, sliced, ns, ne)) =
+                                            project_target_range_through_alignment(
+                                                (new_start, new_end),
+                                                rec,
+                                                &nc.c_to_a,
+                                            )
+                                        {
+                                            stack.push((
+                                                TransitiveRange {
+                                                    seq_id: hit.query_id,
+                                                    start: ns,
+                                                    end: ne,
+                                                    hub_to_anchor_cigar: Arc::new(sliced),
+                                                    anchor_strand: nc.strand_ac,
+                                                    anchor_id: nc.anchor_id,
+                                                    anchor_span: (
+                                                        sq_start.min(sq_end),
+                                                        sq_start.max(sq_end),
+                                                    ),
+                                                },
+                                                current_depth + 1,
+                                            ));
+                                        }
+                                    }
+                                    None => {
+                                        stack.push((
+                                            TransitiveRange {
+                                                seq_id: hit.query_id,
+                                                start: new_start,
+                                                end: new_end,
+                                                hub_to_anchor_cigar: Arc::new(Vec::new()),
+                                                anchor_strand: Strand::Forward,
+                                                anchor_id: hit.query_id,
+                                                anchor_span: (
+                                                    new_start.min(new_end),
+                                                    new_start.max(new_end),
+                                                ),
+                                            },
+                                            current_depth + 1,
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -2460,27 +3087,27 @@ impl Impg {
                 }
             }
 
-            //debug!("Collected {} results", results.len() - prec_num_results);
+            // Merge contiguous/overlapping ranges with same sequence_id. As in
+            // BFS, this collapses ranges from different parents and would orphan
+            // the carried CIGAR, so it only runs on the non-carry path (§5.6).
+            if !carry {
+                stack.par_sort_by_key(|(item, _)| (item.seq_id, item.start));
 
-            // Merge contiguous/overlapping ranges with same sequence_id
-            //let stack_size = stack.len();
-            stack.par_sort_by_key(|(id, start, _, _)| (*id, *start));
-
-            let mut write = 0;
-            for read in 1..stack.len() {
-                if stack[write].0 == stack[read].0 &&   // Same sequence_id 
-                    stack[write].2 >= stack[read].1
-                // Overlapping or contiguous
-                {
-                    // Merge by extending end
-                    stack[write].2 = stack[write].2.max(stack[read].2);
-                } else {
-                    write += 1;
-                    stack.swap(write, read);
+                let mut write = 0;
+                for read in 1..stack.len() {
+                    if stack[write].0.seq_id == stack[read].0.seq_id &&   // Same sequence_id
+                        stack[write].0.end >= stack[read].0.start
+                    // Overlapping or contiguous
+                    {
+                        // Merge by extending end
+                        stack[write].0.end = stack[write].0.end.max(stack[read].0.end);
+                    } else {
+                        write += 1;
+                        stack.swap(write, read);
+                    }
                 }
+                stack.truncate(write + 1);
             }
-            stack.truncate(write + 1);
-            //debug!("Merged stack size from {} to {}", stack_size, stack.len());
         }
 
         results
@@ -2502,23 +3129,21 @@ impl Impg {
         approximate_mode: bool,
         subset_filter: Option<&crate::subset_filter::SubsetFilter>,
     ) -> Vec<AdjustedInterval> {
-        // Initialize visited ranges from masked regions if provided
+        // Initialize visited ranges from masked regions if provided.  The
+        // common depth --use-BFS path has no mask and invokes this once per
+        // chunk; prebuilding a SortedRanges for every sequence per chunk is
+        // pure overhead, so allocate entries lazily as the BFS reaches them.
         let mut visited_ranges: FxHashMap<u32, SortedRanges> = if let Some(m) = masked_regions {
             m.iter().map(|(&k, v)| (k, (*v).clone())).collect()
         } else {
-            (0..self.seq_index.len() as u32)
-                .into_par_iter() // Use parallel iterator
-                .map(|id| {
-                    let len = self.seq_index.get_len_from_id(id).unwrap();
-                    (id, SortedRanges::new(len as i64, 0))
-                })
-                .collect()
+            FxHashMap::default()
         };
 
         // Filter input range
+        let target_len = self.seq_index.get_len_from_id(target_id).unwrap_or(0) as i64;
         let filtered_input_range = visited_ranges
             .entry(target_id)
-            .or_default()
+            .or_insert_with(|| SortedRanges::new(target_len, 0))
             .insert((range_start, range_end));
 
         let mut results = Vec::new();
@@ -2532,7 +3157,7 @@ impl Impg {
                     metadata: target_id,
                 },
                 if store_cigar {
-                    vec![CigarOp::new((filtered_end - filtered_start) as i32, '=')]
+                    CigarOp::new_run(filtered_end - filtered_start, '=')
                 } else {
                     Vec::new()
                 },
@@ -2544,13 +3169,38 @@ impl Impg {
             ));
         }
 
+        // When `carry` is on (the `--use-BFS` CIGAR-precise path), every frontier
+        // item carries a synthesized `B→A` CIGAR so hop≥1 coordinates are walked
+        // base-by-base. Approximate mode never has a real CIGAR to compose, so it
+        // stays on the legacy (linear) path. See plan §2.
+        let carry = store_cigar && !approximate_mode;
+
         // Initialize ranges for first depth
         let mut current_depth = 0;
-        let mut current_ranges = Vec::new();
+        let mut current_ranges: Vec<TransitiveRange> = Vec::new();
 
         for (filtered_start, filtered_end) in filtered_input_range {
             if (filtered_start - filtered_end).abs() >= min_transitive_len {
-                current_ranges.push((target_id, filtered_start, filtered_end));
+                // Seed identity B→A over the anchor's own region (hop-0 base case):
+                // compose(identity, pairwise) == pairwise, so hop-0 output is
+                // byte-identical to the legacy path (§5.2).
+                let seed_cigar = if carry {
+                    Arc::new(CigarOp::new_run((filtered_end - filtered_start).abs(), '='))
+                } else {
+                    Arc::new(Vec::new())
+                };
+                current_ranges.push(TransitiveRange {
+                    seq_id: target_id,
+                    start: filtered_start,
+                    end: filtered_end,
+                    hub_to_anchor_cigar: seed_cigar,
+                    anchor_strand: Strand::Forward,
+                    anchor_id: target_id,
+                    anchor_span: (
+                        filtered_start.min(filtered_end),
+                        filtered_start.max(filtered_end),
+                    ),
+                });
             }
         }
 
@@ -2563,105 +3213,153 @@ impl Impg {
             // );
 
             // Process current depth ranges in parallel
-            let query_results: Vec<Vec<(u32, i64, i64, Vec<CigarOp>, i64, i64, u32)>> =
-                current_ranges
-                    .par_iter()
-                    .map(
-                        |(current_target_id, current_target_start, current_target_end)| {
-                            let mut local_results = Vec::new();
+            let query_results: Vec<Vec<BfsHit>> = current_ranges
+                .par_iter()
+                .map(|tr| {
+                    let current_target_id = tr.seq_id;
+                    let current_target_start = tr.start;
+                    let current_target_end = tr.end;
+                    let mut local_results: Vec<BfsHit> = Vec::new();
 
-                            // Get or load the tree - if None, no overlaps exist for this target
-                            if let Some(tree) = self.get_or_load_tree(*current_target_id) {
-                                tree.query(
-                                    *current_target_start,
-                                    *current_target_end,
-                                    |interval| {
-                                        let metadata = &interval.metadata;
-                                        let overlap_start =
-                                            (*current_target_start).max(interval.first);
-                                        let overlap_end = (*current_target_end).min(interval.last);
-                                        if overlap_start >= overlap_end {
-                                            return;
-                                        }
-
-                                        let projection_result = if approximate_mode {
-                                            self.project_overlapping_interval_fast(
-                                                metadata,
-                                                *current_target_id,
-                                                overlap_start,
-                                                overlap_end,
-                                                min_gap_compressed_identity,
-                                            )
-                                        } else {
-                                            self.project_overlapping_interval(
-                                                metadata,
-                                                *current_target_id,
-                                                overlap_start,
-                                                overlap_end,
-                                                sequence_index,
-                                                min_gap_compressed_identity,
-                                            )
-                                        };
-
-                                        if let Some((query_interval, cigar_ops, target_interval)) =
-                                            projection_result
-                                        {
-                                            let query_id = query_interval.metadata;
-
-                                            // Apply subset filter: keep if it's the target or matches the filter
-                                            let should_keep = if let Some(filter) = subset_filter {
-                                                query_id == target_id
-                                                    || self
-                                                        .seq_index
-                                                        .get_name(query_id)
-                                                        .is_some_and(|name| filter.matches(name))
-                                            } else {
-                                                true
-                                            };
-
-                                            if should_keep {
-                                                let cigar_vec = if store_cigar {
-                                                    cigar_ops
-                                                } else {
-                                                    Vec::new()
-                                                };
-
-                                                local_results.push((
-                                                    query_id,
-                                                    query_interval.first,
-                                                    query_interval.last,
-                                                    cigar_vec,
-                                                    target_interval.first,
-                                                    target_interval.last,
-                                                    *current_target_id,
-                                                ));
-                                            }
-                                        }
-                                    },
-                                );
+                    // Get or load the tree - if None, no overlaps exist for this target
+                    if let Some(tree) = self.get_or_load_tree(current_target_id) {
+                        tree.query(current_target_start, current_target_end, |interval| {
+                            let metadata = &interval.metadata;
+                            let overlap_start = current_target_start.max(interval.first);
+                            let overlap_end = current_target_end.min(interval.last);
+                            if overlap_start >= overlap_end {
+                                return;
                             }
 
-                            local_results
-                        },
-                    )
-                    .collect();
+                            let projection_result = if approximate_mode {
+                                self.project_overlapping_interval_fast(
+                                    metadata,
+                                    current_target_id,
+                                    overlap_start,
+                                    overlap_end,
+                                    min_gap_compressed_identity,
+                                )
+                            } else if !store_cigar && min_gap_compressed_identity.is_none() {
+                                self.project_overlapping_interval_coords(
+                                    metadata,
+                                    current_target_id,
+                                    overlap_start,
+                                    overlap_end,
+                                    sequence_index,
+                                )
+                                .map(
+                                    |(query_interval, target_interval)| {
+                                        (query_interval, Vec::new(), target_interval)
+                                    },
+                                )
+                            } else {
+                                self.project_overlapping_interval(
+                                    metadata,
+                                    current_target_id,
+                                    overlap_start,
+                                    overlap_end,
+                                    sequence_index,
+                                    min_gap_compressed_identity,
+                                )
+                            };
+
+                            if let Some((query_interval, cigar_ops, target_interval)) =
+                                projection_result
+                            {
+                                let query_id = query_interval.metadata;
+
+                                // Apply subset filter: keep if it's the target or matches the filter
+                                let should_keep = if let Some(filter) = subset_filter {
+                                    query_id == target_id
+                                        || self
+                                            .seq_index
+                                            .get_name(query_id)
+                                            .is_some_and(|name| filter.matches(name))
+                                } else {
+                                    true
+                                };
+                                if !should_keep {
+                                    return;
+                                }
+
+                                if carry {
+                                    // Pairwise B→C: strand is encoded by query_interval ordering.
+                                    let strand_bc = if query_interval.first <= query_interval.last {
+                                        Strand::Forward
+                                    } else {
+                                        Strand::Reverse
+                                    };
+                                    let composed = match compose_hop(
+                                        tr,
+                                        target_interval.first,
+                                        target_interval.last,
+                                        &cigar_ops,
+                                        strand_bc,
+                                    ) {
+                                        Some(c) => c,
+                                        // Degenerate slice/compose: skip rather than
+                                        // emit a None-CIGAR hit (§8.4).
+                                        None => return,
+                                    };
+                                    let c_lo = query_interval.first.min(query_interval.last);
+                                    let c_hi = query_interval.first.max(query_interval.last);
+                                    // overlap.0: first > last iff strand_ac is reverse (§5.4).
+                                    let (query_first, query_last) =
+                                        if composed.strand_ac == Strand::Forward {
+                                            (c_lo, c_hi)
+                                        } else {
+                                            (c_hi, c_lo)
+                                        };
+                                    let c_to_a = Arc::new(composed.c_to_a);
+                                    local_results.push(BfsHit {
+                                        query_id,
+                                        query_first,
+                                        query_last,
+                                        result_cigar: composed.a_to_c,
+                                        t_first: composed.anchor_lo,
+                                        t_last: composed.anchor_hi,
+                                        t_id: tr.anchor_id,
+                                        parent_id: current_target_id,
+                                        next_carry: Some(NextCarry {
+                                            c_to_a,
+                                            strand_ac: composed.strand_ac,
+                                            anchor_id: tr.anchor_id,
+                                            c_lo,
+                                            c_hi,
+                                            anchor_lo: composed.anchor_lo,
+                                            anchor_hi: composed.anchor_hi,
+                                        }),
+                                    });
+                                } else {
+                                    let cigar_vec =
+                                        if store_cigar { cigar_ops } else { Vec::new() };
+                                    local_results.push(BfsHit {
+                                        query_id,
+                                        query_first: query_interval.first,
+                                        query_last: query_interval.last,
+                                        result_cigar: cigar_vec,
+                                        t_first: target_interval.first,
+                                        t_last: target_interval.last,
+                                        t_id: current_target_id,
+                                        parent_id: current_target_id,
+                                        next_carry: None,
+                                    });
+                                }
+                            }
+                        });
+                    }
+
+                    local_results
+                })
+                .collect();
 
             // Prepare for next depth
-            let mut next_depth_ranges = Vec::new();
+            let mut next_depth_ranges: Vec<TransitiveRange> = Vec::new();
 
             // Process results sequentially to update visited_ranges and results
             for query_result in query_results {
-                for (
-                    query_id,
-                    adjusted_query_start,
-                    adjusted_query_end,
-                    adjusted_cigar,
-                    adjusted_target_start,
-                    adjusted_target_end,
-                    current_target_id,
-                ) in query_result
-                {
-                    let length = (adjusted_query_end - adjusted_query_start).abs();
+                for hit in query_result {
+                    let length = (hit.query_last - hit.query_first).abs();
 
                     // Add to results only if it passes min_output_length filter
                     let should_add_to_output = if let Some(min_len) = min_output_length {
@@ -2672,31 +3370,34 @@ impl Impg {
                     if should_add_to_output {
                         results.push((
                             Interval {
-                                first: adjusted_query_start,
-                                last: adjusted_query_end,
-                                metadata: query_id,
+                                first: hit.query_first,
+                                last: hit.query_last,
+                                metadata: hit.query_id,
                             },
-                            adjusted_cigar.clone(),
+                            hit.result_cigar,
                             Interval {
-                                first: adjusted_target_start,
-                                last: adjusted_target_end,
-                                metadata: current_target_id,
+                                first: hit.t_first,
+                                last: hit.t_last,
+                                metadata: hit.t_id,
                             },
                         ));
                     }
 
                     // Only consider for next depth if it's a different sequence
-                    if query_id != current_target_id {
-                        let ranges = visited_ranges.entry(query_id).or_default();
+                    if hit.query_id != hit.parent_id {
+                        let ranges = visited_ranges.entry(hit.query_id).or_insert_with(|| {
+                            let len = self.seq_index.get_len_from_id(hit.query_id).unwrap_or(0);
+                            SortedRanges::new(len as i64, 0)
+                        });
 
                         let mut should_add = true;
 
                         // Check proximity to existing ranges
                         if min_distance_between_ranges > 0 {
-                            let (new_min, new_max) = if adjusted_query_start <= adjusted_query_end {
-                                (adjusted_query_start, adjusted_query_end)
+                            let (new_min, new_max) = if hit.query_first <= hit.query_last {
+                                (hit.query_first, hit.query_last)
                             } else {
-                                (adjusted_query_end, adjusted_query_start)
+                                (hit.query_last, hit.query_first)
                             };
 
                             // Find insertion point in sorted ranges
@@ -2727,13 +3428,59 @@ impl Impg {
                         }
 
                         if should_add {
-                            let new_ranges =
-                                ranges.insert((adjusted_query_start, adjusted_query_end));
+                            let new_ranges = ranges.insert((hit.query_first, hit.query_last));
 
                             // Add non-overlapping portions to next depth
                             for (new_start, new_end) in new_ranges {
-                                if (new_end - new_start).abs() >= min_transitive_len {
-                                    next_depth_ranges.push((query_id, new_start, new_end));
+                                if (new_end - new_start).abs() < min_transitive_len {
+                                    continue;
+                                }
+                                match &hit.next_carry {
+                                    Some(nc) => {
+                                        // Carry path: slice C→A to this C subrange so the
+                                        // next hop keeps the target=hub invariant (§5.5).
+                                        let rec = (
+                                            nc.c_lo,
+                                            nc.c_hi,
+                                            nc.anchor_lo,
+                                            nc.anchor_hi,
+                                            nc.strand_ac,
+                                        );
+                                        if let Some((sq_start, sq_end, sliced, ns, ne)) =
+                                            project_target_range_through_alignment(
+                                                (new_start, new_end),
+                                                rec,
+                                                &nc.c_to_a,
+                                            )
+                                        {
+                                            next_depth_ranges.push(TransitiveRange {
+                                                seq_id: hit.query_id,
+                                                start: ns,
+                                                end: ne,
+                                                hub_to_anchor_cigar: Arc::new(sliced),
+                                                anchor_strand: nc.strand_ac,
+                                                anchor_id: nc.anchor_id,
+                                                anchor_span: (
+                                                    sq_start.min(sq_end),
+                                                    sq_start.max(sq_end),
+                                                ),
+                                            });
+                                        }
+                                    }
+                                    None => {
+                                        next_depth_ranges.push(TransitiveRange {
+                                            seq_id: hit.query_id,
+                                            start: new_start,
+                                            end: new_end,
+                                            hub_to_anchor_cigar: Arc::new(Vec::new()),
+                                            anchor_strand: Strand::Forward,
+                                            anchor_id: hit.query_id,
+                                            anchor_span: (
+                                                new_start.min(new_end),
+                                                new_start.max(new_end),
+                                            ),
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -2744,31 +3491,29 @@ impl Impg {
             // Move to next depth
             current_depth += 1;
 
-            // Prepare ranges for next depth
-            if !next_depth_ranges.is_empty() {
+            // Prepare ranges for next depth. The cross-parent merge collapses
+            // ranges from different parents, which would orphan the carried
+            // CIGAR, so it only runs on the non-carry (legacy) path (§5.6).
+            if !carry && !next_depth_ranges.is_empty() {
                 // Sort and merge contiguous/overlapping ranges
-                next_depth_ranges.par_sort_by_key(|(id, start, _)| (*id, *start));
+                next_depth_ranges.par_sort_by_key(|tr| (tr.seq_id, tr.start));
 
                 let mut write = 0;
                 for read in 1..next_depth_ranges.len() {
-                    if next_depth_ranges[write].0 == next_depth_ranges[read].0 &&  // Same sequence_id 
-                       next_depth_ranges[write].2 >= next_depth_ranges[read].1
+                    if next_depth_ranges[write].seq_id == next_depth_ranges[read].seq_id &&  // Same sequence_id
+                       next_depth_ranges[write].end >= next_depth_ranges[read].start
                     // Overlapping or contiguous
                     {
                         // Merge by extending end
-                        next_depth_ranges[write].2 =
-                            next_depth_ranges[write].2.max(next_depth_ranges[read].2);
+                        next_depth_ranges[write].end = next_depth_ranges[write]
+                            .end
+                            .max(next_depth_ranges[read].end);
                     } else {
                         write += 1;
                         next_depth_ranges.swap(write, read);
                     }
                 }
                 next_depth_ranges.truncate(write + 1);
-
-                // debug!(
-                //     "Next depth will process {} ranges after merging",
-                //     next_depth_ranges.len()
-                // );
             }
 
             // Set up for next iteration
@@ -2938,7 +3683,11 @@ impl ImpgIndex for Impg {
         &self.sequence_files
     }
 
-    fn query_reverse_for_depth(&self, query_id: u32) -> Vec<(i64, i64, u32)> {
+    fn alignment_files(&self) -> &[String] {
+        &self.alignment_files
+    }
+
+    fn query_reverse_for_depth(&self, query_id: u32) -> Vec<(i64, i64, i64, i64, u32)> {
         Impg::query_reverse_for_depth(self, query_id)
     }
 
@@ -2950,7 +3699,7 @@ impl ImpgIndex for Impg {
         &self,
         query_id: u32,
         query_to_targets: &FxHashMap<u32, Vec<u32>>,
-    ) -> Vec<(i64, i64, u32)> {
+    ) -> Vec<(i64, i64, i64, i64, u32)> {
         Impg::query_reverse_for_depth_with_map(self, query_id, query_to_targets)
     }
 
@@ -2967,10 +3716,7 @@ impl ImpgIndex for Impg {
     }
 
     fn is_bidirectional(&self) -> bool {
-        // Check the magic bytes stored during load
-        // For now, assume all Impg instances are bidirectional unless explicitly marked otherwise
-        // This will be properly tracked when we add the is_bidirectional field
-        true
+        self.is_bidirectional
     }
 
     fn query_raw_intervals(&self, target_id: u32) -> Vec<RawAlignmentInterval> {
@@ -2990,7 +3736,12 @@ impl ImpgIndex for Impg {
         }
     }
 
-    fn query_raw_overlapping(&self, target_id: u32, start: i64, end: i64) -> Vec<RawAlignmentInterval> {
+    fn query_raw_overlapping(
+        &self,
+        target_id: u32,
+        start: i64,
+        end: i64,
+    ) -> Vec<RawAlignmentInterval> {
         if let Some(tree) = self.get_or_load_tree(target_id) {
             let mut results = Vec::new();
             tree.query(start, end, |interval| {
@@ -3056,7 +3807,10 @@ fn project_target_range_through_alignment(
             break;
         }
 
-        match (cigar_op.target_delta() as i64, cigar_op.query_delta(strand) as i64) {
+        match (
+            cigar_op.target_delta() as i64,
+            cigar_op.query_delta(strand) as i64,
+        ) {
             (0, query_delta) => {
                 // Insertion in query (deletions in target)
                 if target_pos >= requested_target_range.0 {
@@ -3135,13 +3889,110 @@ fn project_target_range_through_alignment(
         }
         // Adjust last operation length
         if last_op_remaining < 0 {
-            projected_cigar_ops[last_op_idx - first_op_idx - 1].adjust_len(last_op_remaining as i32);
+            projected_cigar_ops[last_op_idx - first_op_idx - 1]
+                .adjust_len(last_op_remaining as i32);
         }
 
         Some((
             projected_query_start,
             projected_query_end,
             projected_cigar_ops,
+            projected_target_start,
+            projected_target_end,
+        ))
+    } else {
+        None
+    }
+}
+
+fn project_target_range_coords_through_alignment(
+    requested_target_range: (i64, i64),
+    record: (i64, i64, i64, i64, Strand),
+    cigar_ops: &[CigarOp],
+) -> Option<(i64, i64, i64, i64)> {
+    let (target_start, target_end, query_start, query_end, strand) = record;
+    let dir: i64 = if strand == Strand::Forward { 1 } else { -1 };
+    let mut query_pos: i64 = if strand == Strand::Forward {
+        query_start
+    } else {
+        query_end
+    };
+    let mut target_pos: i64 = target_start;
+
+    let mut found_overlap = false;
+    let mut projected_query_start: i64 = -1;
+    let mut projected_query_end: i64 = -1;
+    let mut projected_target_start: i64 = -1;
+    let mut projected_target_end: i64 = -1;
+    let last_target_pos = min(target_end, requested_target_range.1);
+
+    for cigar_op in cigar_ops {
+        if target_pos > last_target_pos {
+            break;
+        }
+
+        match (
+            cigar_op.target_delta() as i64,
+            cigar_op.query_delta(strand) as i64,
+        ) {
+            (0, query_delta) => {
+                if target_pos >= requested_target_range.0 {
+                    if !found_overlap {
+                        projected_query_start = query_pos;
+                        projected_target_start = target_pos;
+                        found_overlap = true;
+                    }
+                    projected_query_end = query_pos + query_delta;
+                    projected_target_end = target_pos;
+                }
+                query_pos += query_delta;
+            }
+            (target_delta, 0) => {
+                let overlap_start = target_pos.max(requested_target_range.0);
+                let overlap_end = (target_pos + target_delta).min(last_target_pos);
+
+                if overlap_start < overlap_end {
+                    if !found_overlap {
+                        projected_query_start = query_pos;
+                        projected_target_start = overlap_start;
+                        found_overlap = true;
+                    }
+                    projected_query_end = query_pos;
+                    projected_target_end = overlap_end;
+                }
+                target_pos += target_delta;
+            }
+            (target_delta, query_delta) => {
+                let overlap_start = target_pos.max(requested_target_range.0);
+                let overlap_end = (target_pos + target_delta).min(requested_target_range.1);
+
+                if overlap_start < overlap_end {
+                    let overlap_length = overlap_end - overlap_start;
+                    let query_overlap_start = query_pos + (overlap_start - target_pos) * dir;
+                    let query_overlap_end = query_overlap_start + overlap_length * dir;
+
+                    if !found_overlap {
+                        projected_query_start = query_overlap_start;
+                        projected_target_start = overlap_start;
+                        found_overlap = true;
+                    }
+                    projected_query_end = query_overlap_end;
+                    projected_target_end = overlap_end;
+                }
+
+                target_pos += target_delta;
+                query_pos += query_delta;
+            }
+        }
+    }
+
+    if found_overlap
+        && projected_query_start != projected_query_end
+        && projected_target_start != projected_target_end
+    {
+        Some((
+            projected_query_start,
+            projected_query_end,
             projected_target_start,
             projected_target_end,
         ))
@@ -3195,6 +4046,245 @@ mod tests {
     use super::*;
     use crate::paf::parse_paf;
     use std::io::BufReader;
+
+    /// Collapse a CIGAR into readable (len, op) runs, merging adjacent equal
+    /// ops (so `new_run` chunking does not break equality assertions).
+    fn runs(ops: &[CigarOp]) -> Vec<(i64, char)> {
+        let mut out: Vec<(i64, char)> = Vec::new();
+        for o in ops {
+            let op = o.op();
+            let len = o.len() as i64;
+            if let Some(last) = out.last_mut() {
+                if last.1 == op {
+                    last.0 += len;
+                    continue;
+                }
+            }
+            out.push((len, op));
+        }
+        out
+    }
+
+    fn cigar(spec: &[(i64, char)]) -> Vec<CigarOp> {
+        spec.iter()
+            .flat_map(|&(len, op)| CigarOp::new_run(len, op))
+            .collect()
+    }
+
+    #[test]
+    fn test_compose_identity_passes_through() {
+        // a_to_b all '=' over B=10; b_to_c carries the structure.
+        let a = cigar(&[(10, '=')]);
+        let b = cigar(&[(5, '='), (2, 'X'), (3, '=')]);
+        let out = compose_cigars_shared_b(&a, &b);
+        assert_eq!(runs(&out), vec![(5, '='), (2, 'X'), (3, '=')]);
+    }
+
+    #[test]
+    fn test_compose_identity_on_b_side() {
+        // b_to_c all '=' over B=10; output should equal a_to_b structure.
+        let a = cigar(&[(4, '='), (2, 'X'), (4, '=')]);
+        let b = cigar(&[(10, '=')]);
+        let out = compose_cigars_shared_b(&a, &b);
+        assert_eq!(runs(&out), vec![(4, '='), (2, 'X'), (4, '=')]);
+    }
+
+    #[test]
+    fn test_compose_deletion_in_a() {
+        // a_to_b has D (A present, B absent) -> propagates as D (A present, C absent).
+        let a = cigar(&[(3, '='), (2, 'D'), (3, '=')]); // B consumed = 6
+        let b = cigar(&[(6, '=')]);
+        let out = compose_cigars_shared_b(&a, &b);
+        assert_eq!(runs(&out), vec![(3, '='), (2, 'D'), (3, '=')]);
+    }
+
+    #[test]
+    fn test_compose_insertion_in_a() {
+        // a_to_b has I (B present, A absent) over a region where C is present -> I in output.
+        let a = cigar(&[(3, '='), (2, 'I'), (3, '=')]); // B consumed = 8
+        let b = cigar(&[(8, '=')]);
+        let out = compose_cigars_shared_b(&a, &b);
+        assert_eq!(runs(&out), vec![(3, '='), (2, 'I'), (3, '=')]);
+    }
+
+    #[test]
+    fn test_compose_deletion_in_b_to_c() {
+        // b_to_c has D (B present, C absent) -> D in output (A present, C absent).
+        let a = cigar(&[(8, '=')]); // B = 8
+        let b = cigar(&[(3, '='), (2, 'D'), (3, '=')]); // B consumed = 8
+        let out = compose_cigars_shared_b(&a, &b);
+        assert_eq!(runs(&out), vec![(3, '='), (2, 'D'), (3, '=')]);
+    }
+
+    #[test]
+    fn test_compose_insertion_in_b_to_c() {
+        // b_to_c has I (C present, B absent) -> I in output (C present, A absent).
+        let a = cigar(&[(6, '=')]); // B = 6
+        let b = cigar(&[(3, '='), (2, 'I'), (3, '=')]); // B consumed = 6
+        let out = compose_cigars_shared_b(&a, &b);
+        assert_eq!(runs(&out), vec![(3, '='), (2, 'I'), (3, '=')]);
+    }
+
+    #[test]
+    fn test_compose_lossy_i_then_d_emits_nothing() {
+        // a_to_b inserts B (I), b_to_c deletes the same B (D) -> (0,0): vanishes.
+        let a = cigar(&[(3, '='), (2, 'I'), (3, '=')]); // B = 8
+        let b = cigar(&[(3, '='), (2, 'D'), (3, '=')]); // B = 8
+        let out = compose_cigars_shared_b(&a, &b);
+        // The 2 B bases disappear; the two '=' runs merge.
+        assert_eq!(runs(&out), vec![(6, '=')]);
+    }
+
+    #[test]
+    fn test_compose_mismatch_propagation() {
+        // A=B is '=' but B=C is 'X' over the same column -> A=C unknown -> 'X'.
+        let a = cigar(&[(5, '=')]);
+        let b = cigar(&[(2, '='), (1, 'X'), (2, '=')]);
+        let out = compose_cigars_shared_b(&a, &b);
+        assert_eq!(runs(&out), vec![(2, '='), (1, 'X'), (2, '=')]);
+        // And X over '=' on the a side also yields X.
+        let a2 = cigar(&[(2, '='), (1, 'X'), (2, '=')]);
+        let b2 = cigar(&[(5, '=')]);
+        let out2 = compose_cigars_shared_b(&a2, &b2);
+        assert_eq!(runs(&out2), vec![(2, '='), (1, 'X'), (2, '=')]);
+    }
+
+    #[test]
+    fn test_compose_chunking_no_overflow() {
+        // Runs longer than CIGAR_OP_MAX_LEN must be split, never panic.
+        let big = CIGAR_OP_MAX_LEN + 10;
+        let a = cigar(&[(big, '=')]);
+        let b = cigar(&[(big, '=')]);
+        let out = compose_cigars_shared_b(&a, &b);
+        assert!(out.iter().all(|o| (o.len() as i64) <= CIGAR_OP_MAX_LEN));
+        let total: i64 = out.iter().map(|o| o.len() as i64).sum();
+        assert_eq!(total, big);
+        assert!(out.iter().all(|o| o.op() == '='));
+    }
+
+    #[test]
+    fn test_compose_run_merge_across_op_boundaries() {
+        let a = cigar(&[(3, '='), (3, '=')]);
+        let b = cigar(&[(2, '='), (4, '=')]);
+        let out = compose_cigars_shared_b(&a, &b);
+        assert_eq!(runs(&out), vec![(6, '=')]);
+    }
+
+    #[test]
+    fn test_compose_two_hop_indels_beats_linear() {
+        // A->B: A has a 2bp deletion (gap in A); B->C: C has a 3bp insertion.
+        // Hand-composed expectation walking shared B.
+        // a_to_b: =4 (A&B), I2 (B only, A absent), =4 (A&B)  => B = 10
+        // b_to_c: =3 (B&C), =3 (B&C) ... let's place a C insertion.
+        // b_to_c: =5 (B&C), I3 (C only), =5 (B&C) => B = 10, C has +3.
+        let a = cigar(&[(4, '='), (2, 'I'), (4, '=')]); // B = 10
+        let b = cigar(&[(5, '='), (3, 'I'), (5, '=')]); // B = 10
+        let out = compose_cigars_shared_b(&a, &b);
+        // Walk B 0..10:
+        //  B0-4: a '=' (A yes), b '=' (C yes) -> '='x4
+        //  B4-5: a '=' (A yes), b '=' (C yes) -> '='x1   (b still in first =5)
+        //  at B5 (before consuming): b emits I3 (C present, A absent) -> 'I'x3
+        //  B5-6: a 'I' (A absent), b '=' (C yes) -> 'I'x1
+        //  B6-8: a 'I'(rest 1?) -- a I2 spans B4-6. Recompute carefully below.
+        // Let's just assert via independent reference walk.
+        let expected = reference_compose(&a, &b);
+        assert_eq!(runs(&out), runs(&expected));
+        // Sanity: output consumes A = 8 and C = 8+3=11.
+        let a_consumed: i64 = out
+            .iter()
+            .filter(|o| matches!(o.op(), '=' | 'X' | 'D' | 'M'))
+            .map(|o| o.len() as i64)
+            .sum();
+        let c_consumed: i64 = out
+            .iter()
+            .filter(|o| matches!(o.op(), '=' | 'X' | 'I' | 'M'))
+            .map(|o| o.len() as i64)
+            .sum();
+        // A = 4+4 = 8; C = 5 (=) + 3 (I) + 5 (=) = 13. No lossy column here.
+        assert_eq!(a_consumed, 8);
+        assert_eq!(c_consumed, 13);
+    }
+
+    /// Brute-force reference: expand both CIGARs base-by-base along B and
+    /// compose. Only used in small tests.
+    fn reference_compose(a_to_b: &[CigarOp], b_to_c: &[CigarOp]) -> Vec<CigarOp> {
+        // Build per-B-column views. Each B column records whether A/C is present
+        // plus the op char on each side. Non-B-consuming ops are attached as
+        // "pending" emissions ordered before the next B column.
+        #[derive(Clone)]
+        enum Ev {
+            BCol(char), // op char on this side for a B-consuming column
+            NoB,        // a column that does not consume B (D on a-side, I on b-side)
+        }
+        fn expand(ops: &[CigarOp], a_side: bool) -> Vec<Ev> {
+            let mut v = Vec::new();
+            for o in ops {
+                let op = o.op();
+                let consumes_b = if a_side {
+                    // a_to_b: B is query -> =,X,I,M consume B; D does not
+                    op != 'D'
+                } else {
+                    // b_to_c: B is target -> =,X,D,M consume B; I does not
+                    op != 'I'
+                };
+                for _ in 0..o.len() {
+                    if consumes_b {
+                        v.push(Ev::BCol(op));
+                    } else {
+                        v.push(Ev::NoB);
+                    }
+                }
+            }
+            v
+        }
+        let av = expand(a_to_b, true);
+        let bv = expand(b_to_c, false);
+        let mut emitter = CigarRunEmitter::new();
+        let mut ai = 0;
+        let mut bi = 0;
+        loop {
+            // flush a NoB (D) -> D
+            while ai < av.len() {
+                if let Ev::NoB = av[ai] {
+                    emitter.push(1, 'D');
+                    ai += 1;
+                } else {
+                    break;
+                }
+            }
+            // flush b NoB (I) -> I
+            while bi < bv.len() {
+                if let Ev::NoB = bv[bi] {
+                    emitter.push(1, 'I');
+                    bi += 1;
+                } else {
+                    break;
+                }
+            }
+            if ai >= av.len() || bi >= bv.len() {
+                break;
+            }
+            let aop = match av[ai] {
+                Ev::BCol(c) => c,
+                _ => unreachable!(),
+            };
+            let bop = match bv[bi] {
+                Ev::BCol(c) => c,
+                _ => unreachable!(),
+            };
+            let consumes_a = aop != 'I';
+            let consumes_c = bop != 'D';
+            match (consumes_a, consumes_c) {
+                (true, true) => emitter.push(1, if aop == '=' && bop == '=' { '=' } else { 'X' }),
+                (true, false) => emitter.push(1, 'D'),
+                (false, true) => emitter.push(1, 'I'),
+                (false, false) => {}
+            }
+            ai += 1;
+            bi += 1;
+        }
+        emitter.finish()
+    }
 
     #[test]
     fn test_project_target_range_through_alignment_forward() {
@@ -3269,6 +4359,35 @@ mod tests {
             let result =
                 project_target_range_through_alignment((70, 95), base, &cigar_ops).unwrap();
             assert_eq!(result, (170, 195, vec![CigarOp::new(25, '=')], 70, 95));
+        }
+    }
+
+    #[test]
+    fn test_project_target_range_coords_matches_full_projection() {
+        let cigar_ops = vec![
+            CigarOp::new(10, '='),
+            CigarOp::new(5, 'I'),
+            CigarOp::new(5, 'D'),
+            CigarOp::new(50, '='),
+            CigarOp::new(50, 'I'),
+            CigarOp::new(35, '='),
+        ];
+        let cases = [
+            ((0, 100), (0, 100, 50, 200, Strand::Forward)),
+            ((50, 55), (0, 100, 50, 200, Strand::Forward)),
+            ((50, 66), (0, 100, 50, 200, Strand::Forward)),
+            ((70, 95), (0, 100, 50, 200, Strand::Forward)),
+            ((0, 100), (0, 100, 50, 200, Strand::Reverse)),
+            ((50, 66), (0, 100, 50, 200, Strand::Reverse)),
+        ];
+
+        for (target_range, record) in cases {
+            let full =
+                project_target_range_through_alignment(target_range, record, &cigar_ops).unwrap();
+            let coords =
+                project_target_range_coords_through_alignment(target_range, record, &cigar_ops)
+                    .unwrap();
+            assert_eq!((full.0, full.1, full.3, full.4), coords);
         }
     }
 
