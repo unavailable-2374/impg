@@ -98,7 +98,7 @@ compile_error!(
      `--features jemalloc` (default) or `--no-default-features --features system-alloc`"
 );
 
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 use coitrees::{Interval, IntervalTree};
 use impg::alignment_record::{AlignmentFormat, AlignmentRecord, Strand};
 use impg::commands::{align, depth, graph, lace, partition, refine, similarity};
@@ -424,7 +424,11 @@ struct EngineCliOpts {
     /// Append ':WINDOW' to enable partitioned mode, e.g. 'pggb:10000'
     /// splits into 10kb windows, builds per-window, laces, and normalizes.
     #[arg(help_heading = "Output options")]
-    #[clap(long = "gfa-engine", default_value = "pggb", value_name = "ENGINE[:WINDOW]")]
+    #[clap(
+        long = "gfa-engine",
+        default_value = "pggb",
+        value_name = "ENGINE[:WINDOW]"
+    )]
     engine_raw: String,
 
     /// POA alignment scores as match,mismatch,gap_open1,gap_extend1,gap_open2,gap_extend2
@@ -534,10 +538,7 @@ impl EngineCliOpts {
     }
 
     /// Resolve and build an `EngineOpts`.
-    fn build(
-        &self,
-        num_threads: usize,
-    ) -> io::Result<EngineOpts> {
+    fn build(&self, num_threads: usize) -> io::Result<EngineOpts> {
         let (engine, partition_size) = self.parse_engine()?;
         self.validate_engine_params(engine)?;
 
@@ -1367,6 +1368,10 @@ enum Args {
     ///
     /// Add-on:
     ///   --stats       Produce summary statistics and per-depth BED files
+    // `--cigar-precise` only makes sense in transitive mode, which is enabled by
+    // either `-x` (BFS) or `--transitive-dfs` (DFS); the group lets `requires`
+    // accept either one.
+    #[command(group(ArgGroup::new("transitive_mode").args(["transitive", "transitive_dfs"])))]
     Depth {
         #[clap(flatten)]
         alignment: AlignmentOpts,
@@ -1386,7 +1391,12 @@ enum Args {
 
         /// Comma-separated list of reference sequence names in processing order
         #[arg(help_heading = "Reference order")]
-        #[clap(long, value_parser, value_delimiter = ',', conflicts_with = "ref_order_file")]
+        #[clap(
+            long,
+            value_parser,
+            value_delimiter = ',',
+            conflicts_with = "ref_order_file"
+        )]
         ref_order: Option<Vec<String>>,
 
         /// Path to a text file containing paths to FAI index files (one per line)
@@ -1422,12 +1432,20 @@ enum Args {
         #[clap(long, action)]
         merge_adjacent: bool,
 
-        /// Use CIGAR-precise BFS for transitive depth (slower but base-level precision).
-        /// Default uses raw-interval BFS with linear interpolation, which is faster
-        /// and sufficient for region-level conservation depth.
+        /// Compute CIGAR-precise transitive depth: the `positions` column is
+        /// projected base-by-base through synthesized per-hop CIGARs (exact at
+        /// indels). Slower and higher memory. The default transitive path uses
+        /// raw-interval BFS with linear interpolation — faster, lower memory, and
+        /// sufficient when you only need region-level depth counts. Requires a
+        /// transitive mode (`-x` or `--transitive-dfs`). (Alias: `--use-BFS`.)
         #[arg(help_heading = "Performance")]
-        #[clap(long = "use-BFS", action)]
-        use_bfs: bool,
+        #[clap(
+            long = "cigar-precise",
+            visible_alias = "use-BFS",
+            action,
+            requires = "transitive_mode"
+        )]
+        cigar_precise: bool,
 
         /// Separator for PanSN format (default: #)
         #[arg(help_heading = "Output options")]
@@ -1445,10 +1463,14 @@ enum Args {
         window_size: Option<i64>,
 
         // === NEW OPTIONS FOR REDESIGNED DEPTH ===
-
         /// Comma-separated list of sample names to include in depth calculation
         #[arg(help_heading = "Sample filtering")]
-        #[clap(long, value_parser, value_delimiter = ',', conflicts_with = "samples_file")]
+        #[clap(
+            long,
+            value_parser,
+            value_delimiter = ',',
+            conflicts_with = "samples_file"
+        )]
         samples: Option<Vec<String>>,
 
         /// File containing sample names to include (one per line)
@@ -1495,8 +1517,8 @@ enum Args {
         ///
         /// Supported on the global `impg depth` pipeline:
         ///   - non-transitive (default) path
-        ///   - transitive raw BFS path (`-x` / `--transitive-dfs`)
-        ///   - transitive CIGAR-precise BFS path (`-x --use-BFS`)
+        ///   - transitive raw-interval path (`-x` / `--transitive-dfs`)
+        ///   - transitive CIGAR-precise path (`-x --cigar-precise`)
         ///
         /// Not supported: `-r` / `-b` region queries and `--stats`.
         /// `--output-prefix` is required.
@@ -2033,9 +2055,7 @@ fn run() -> io::Result<()> {
                         )?;
                     }
                     "gfa" => {
-                        let engine_opts = engine_cli.build(
-                            common.threads.get(),
-                        )?;
+                        let engine_opts = engine_cli.build(common.threads.get())?;
                         if let Some(ps) = engine_opts.partition_size {
                             // Partitioned mode: split query region into sub-windows
                             output_results_gfa_partitioned(
@@ -2172,7 +2192,11 @@ fn run() -> io::Result<()> {
                     target_range.0,
                     target_range.1,
                     &name,
-                    refine.query.transitive_opts.effective_min_transitive_len().into(),
+                    refine
+                        .query
+                        .transitive_opts
+                        .effective_min_transitive_len()
+                        .into(),
                 )?;
                 vec![(target_name, target_range, name)]
             } else if let Some(target_bed) = &refine.query.target_bed {
@@ -2184,7 +2208,11 @@ fn run() -> io::Result<()> {
                         start,
                         end,
                         &name,
-                        refine.query.transitive_opts.effective_min_transitive_len().into(),
+                        refine
+                            .query
+                            .transitive_opts
+                            .effective_min_transitive_len()
+                            .into(),
                     )?;
                     validated.push((seq_name, (start, end), name));
                 }
@@ -2216,7 +2244,11 @@ fn run() -> io::Result<()> {
                 use_transitive_bfs: refine.query.transitive,
                 use_transitive_dfs: refine.query.transitive_opts.transitive_dfs,
                 max_transitive_depth: refine.query.transitive_opts.max_depth,
-                min_transitive_len: refine.query.transitive_opts.effective_min_transitive_len().into(),
+                min_transitive_len: refine
+                    .query
+                    .transitive_opts
+                    .effective_min_transitive_len()
+                    .into(),
                 min_distance_between_ranges: refine
                     .query
                     .transitive_opts
@@ -2674,7 +2706,8 @@ fn run() -> io::Result<()> {
                                 common.threads.get(),
                             )?;
                         } else {
-                            let mut out = BufWriter::with_capacity(1024 * 1024, File::create(&output)?);
+                            let mut out =
+                                BufWriter::with_capacity(1024 * 1024, File::create(&output)?);
                             graph::run_graph_build_poa(
                                 fasta_files,
                                 &mut out,
@@ -2700,7 +2733,8 @@ fn run() -> io::Result<()> {
                                 engine_cli.smooth.poa_padding_fraction,
                             )?;
                         } else {
-                            let mut out = BufWriter::with_capacity(1024 * 1024, File::create(&output)?);
+                            let mut out =
+                                BufWriter::with_capacity(1024 * 1024, File::create(&output)?);
                             graph::run_graph_build_pggb(
                                 fasta_files,
                                 &mut out,
@@ -2792,14 +2826,14 @@ fn run() -> io::Result<()> {
             alignment,
             transitive,
             transitive_opts,
-            ref_order_file: _,  // Not used in sample-based mode
-            ref_order: _,       // Not used in sample-based mode
+            ref_order_file: _, // Not used in sample-based mode
+            ref_order: _,      // Not used in sample-based mode
             fai_list,
             ref_sample,
             ref_only,
             min_seq_length,
             merge_adjacent,
-            use_bfs,
+            cigar_precise,
             separator,
             output_prefix,
             window_size,
@@ -2837,7 +2871,7 @@ fn run() -> io::Result<()> {
                 min_transitive_len: transitive_opts.effective_min_transitive_len() as i64,
                 min_distance_between_ranges: transitive_opts.min_distance_between_ranges as i64,
                 merge_adjacent,
-                use_cigar_bfs: use_bfs,
+                use_cigar_bfs: cigar_precise,
             };
 
             // Region query mode: depth for specific genomic regions
@@ -2864,7 +2898,8 @@ fn run() -> io::Result<()> {
 
                 // Collect all results
                 let mut all_results: Vec<depth::RegionDepthResult> = Vec::new();
-                let mut all_samples: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+                let mut all_samples: rustc_hash::FxHashSet<String> =
+                    rustc_hash::FxHashSet::default();
 
                 for (seq_name, start, end) in &regions {
                     let results = depth::query_region_depth(
@@ -4348,10 +4383,8 @@ fn output_results_gfa_partitioned(
             );
 
             // Extract query intervals
-            let query_intervals: Vec<Interval<u32>> = results
-                .drain(..)
-                .map(|(qi, _, _)| qi)
-                .collect();
+            let query_intervals: Vec<Interval<u32>> =
+                results.drain(..).map(|(qi, _, _)| qi).collect();
 
             partitions.push(query_intervals);
         }
@@ -4698,78 +4731,79 @@ fn merge_adjusted_intervals(results: &mut Vec<AdjustedInterval>, merge_distance:
                     continue;
                 }
 
-                // Handle overlap case
+                // Handle overlap case.
+                //
+                // Records are sorted ascending by query start (forward: `first`;
+                // reverse: `last`). For two pieces of the same alignment that
+                // overlap, the shared region is `current`'s high-coordinate end
+                // and `next`'s low-coordinate end:
+                //   - forward: overlap = suffix(current) == prefix(next); keep
+                //     current, append next with its prefix trimmed.
+                //   - reverse: walking target forward, query decreases, so the
+                //     overlap is current's PREFIX (low target / high query) and
+                //     next's SUFFIX (high target / low query); keep next, append
+                //     current with its prefix trimmed.
+                // The overlap-length sign must therefore be `current - next`
+                // (forward) / `current.first - next.last` (reverse); the earlier
+                // `next - current` form was always negative for a real overlap,
+                // so this whole branch was dead for both orientations.
                 if query_overlap && target_overlap {
-                    // Calculate overlap lengths
                     let (query_overlap_len, target_overlap_len) = if query_forward {
                         (
-                            next_query.first - current_query.last,
-                            next_target.first - current_target.last,
+                            current_query.last - next_query.first,
+                            current_target.last - next_target.first,
                         )
                     } else {
-                        // Reverse orientation (remember that first > last in reverse, so we swap first/last)
                         (
-                            next_query.last - current_query.first,
-                            current_target.first - next_target.last,
+                            current_query.first - next_query.last,
+                            next_target.last - current_target.first,
                         )
                     };
 
-                    // Check if overlaps are proportional (same alignment)
                     if query_overlap_len > 0 && target_overlap_len > 0 {
-                        // Check if CIGAR strings are identical in the overlap region
-                        let overlap_matches = check_cigar_overlap_match(
-                            &current_cigar,
-                            &next_cigar,
-                            query_overlap_len,
-                            query_forward,
-                        );
-
-                        if overlap_matches {
-                            // debug!(
-                            //     "Merge overlapping! Overlap: query={}, target={}, Query: current {}:{}-{}({}), next {}:{}-{}({}); Target: current {}:{}-{}({}), next {}:{}-{}({})",
-                            //     query_overlap_len,
-                            //     target_overlap_len,
-                            //     current_query.metadata,
-                            //     current_query.first,
-                            //     current_query.last,
-                            //     if query_forward { "+" } else { "-" },
-                            //     next_query.metadata,
-                            //     next_query.first,
-                            //     next_query.last,
-                            //     if next_query_forward { "+" } else { "-" },
-                            //     current_target.metadata,
-                            //     current_target.first,
-                            //     current_target.last,
-                            //     if target_forward { "+" } else { "-" },
-                            //     next_target.metadata,
-                            //     next_target.first,
-                            //     next_target.last,
-                            //     if next_target_forward { "+" } else { "-" },
-                            // );
-
-                            // Trim the overlap from the next interval and merge
-                            let trimmed_next_cigar = trim_cigar_prefix(
+                        if query_forward {
+                            // Compare suffix(current) vs prefix(next).
+                            if check_cigar_overlap_match(
+                                &current_cigar,
                                 &next_cigar,
                                 query_overlap_len,
-                                target_overlap_len,
-                            );
-
-                            if query_forward {
+                                true,
+                            ) {
+                                let trimmed_next = trim_cigar_prefix(
+                                    &next_cigar,
+                                    query_overlap_len,
+                                    target_overlap_len,
+                                );
                                 current_query.last = next_query.last;
                                 current_target.last = next_target.last;
-                                current_cigar.extend(trimmed_next_cigar);
-                            } else {
+                                current_cigar.extend(trimmed_next);
+                                merge_consecutive_cigar_ops(&mut current_cigar);
+                                continue;
+                            }
+                        } else {
+                            // Compare prefix(current) vs suffix(next): swap the
+                            // args so check computes suffix(next) vs prefix(current).
+                            if check_cigar_overlap_match(
+                                &next_cigar,
+                                &current_cigar,
+                                query_overlap_len,
+                                false,
+                            ) {
+                                let trimmed_current = trim_cigar_prefix(
+                                    &current_cigar,
+                                    query_overlap_len,
+                                    target_overlap_len,
+                                );
                                 current_query.first = next_query.first;
                                 current_target.first = next_target.first;
-
-                                let mut new_cigar = Vec::with_capacity(
-                                    trimmed_next_cigar.len() + current_cigar.len(),
-                                );
-                                new_cigar.extend(trimmed_next_cigar);
-                                new_cigar.extend_from_slice(&current_cigar);
+                                let mut new_cigar =
+                                    Vec::with_capacity(next_cigar.len() + trimmed_current.len());
+                                new_cigar.extend_from_slice(&next_cigar);
+                                new_cigar.extend(trimmed_current);
                                 current_cigar = new_cigar;
+                                merge_consecutive_cigar_ops(&mut current_cigar);
+                                continue;
                             }
-                            continue;
                         }
                     }
                 }
@@ -4993,27 +5027,27 @@ fn trim_cigar_prefix(cigar: &[CigarOp], query_len: i64, target_len: i64) -> Vec<
         let t_delta = op.target_delta() as i64;
 
         if query_consumed + q_delta > query_len || target_consumed + t_delta > target_len {
-            // This operation partially overlaps - need to trim it
+            // This operation straddles the trim boundary — skip exactly the part
+            // inside the boundary using integer math (no float rounding, so no
+            // off-by-one on large ops). For =,X,M the op consumes 1 query + 1
+            // target per base, so query_remaining == target_remaining; for I/D
+            // only the consuming dimension bounds the skip.
             let query_remaining = query_len - query_consumed;
             let target_remaining = target_len - target_consumed;
-
-            // Calculate how much of this operation to skip
-            let skip_ratio = if q_delta > 0 && t_delta > 0 {
-                (query_remaining as f32 / q_delta as f32)
-                    .min(target_remaining as f32 / t_delta as f32)
+            let skip_len = if q_delta > 0 && t_delta > 0 {
+                query_remaining.min(target_remaining)
             } else if q_delta > 0 {
-                query_remaining as f32 / q_delta as f32
+                query_remaining
             } else if t_delta > 0 {
-                target_remaining as f32 / t_delta as f32
+                target_remaining
             } else {
-                0.0
-            };
+                0
+            }
+            .min(op.len() as i64);
 
-            let skip_len = (op.len() as f32 * skip_ratio) as i32;
-
-            if skip_len < op.len() {
-                // Create partial operation with remaining length
-                let partial_op = CigarOp::new(op.len() - skip_len, op.op());
+            if skip_len < op.len() as i64 {
+                // Keep the part of this operation past the boundary.
+                let partial_op = CigarOp::new(op.len() - skip_len as i32, op.op());
                 result.push(partial_op);
             }
 
@@ -5222,5 +5256,162 @@ mod tests {
         assert_eq!(name, "chr1");
         assert_eq!(start, 45803);
         assert_eq!(end, 45861);
+    }
+
+    // ---- merge_adjusted_intervals on REVERSE composed records ----
+    //
+    // Verify that query's output stitching (merge_adjusted_intervals →
+    // trim_cigar_prefix) does NOT introduce coordinate offset for reverse-strand
+    // composed transitive records. The detector is base-level: a correct merge
+    // must preserve the exact target→query base correspondence of the inputs.
+
+    fn ai(
+        q_first: i64,
+        q_last: i64,
+        q_id: u32,
+        cigar: &[(i32, char)],
+        t_first: i64,
+        t_last: i64,
+        t_id: u32,
+    ) -> (Interval<u32>, Vec<CigarOp>, Interval<u32>) {
+        (
+            Interval {
+                first: q_first,
+                last: q_last,
+                metadata: q_id,
+            },
+            cigar.iter().map(|&(l, o)| CigarOp::new(l, o)).collect(),
+            Interval {
+                first: t_first,
+                last: t_last,
+                metadata: t_id,
+            },
+        )
+    }
+
+    /// target_pos -> aligned query base, walking target forward; query advances
+    /// forward if q_first<=q_last else backward from the high end.
+    fn base_map_rec(
+        rec: &(Interval<u32>, Vec<CigarOp>, Interval<u32>),
+    ) -> std::collections::BTreeMap<i64, i64> {
+        let (q, cig, t) = rec;
+        let fwd = q.first <= q.last;
+        let (qlo, qhi) = (q.first.min(q.last), q.first.max(q.last));
+        let mut tp = t.first.min(t.last);
+        let mut qp = if fwd { qlo } else { qhi };
+        let mut m = std::collections::BTreeMap::new();
+        for op in cig {
+            let n = op.len() as i64;
+            match op.op() {
+                '=' | 'X' | 'M' => {
+                    for _ in 0..n {
+                        let qb = if fwd { qp } else { qp - 1 };
+                        m.insert(tp, qb);
+                        tp += 1;
+                        qp += if fwd { 1 } else { -1 };
+                    }
+                }
+                'D' => tp += n,
+                'I' => qp += if fwd { n } else { -n },
+                _ => {}
+            }
+        }
+        m
+    }
+
+    fn merged_map(
+        recs: Vec<(Interval<u32>, Vec<CigarOp>, Interval<u32>)>,
+    ) -> (std::collections::BTreeMap<i64, i64>, usize) {
+        let mut v = recs;
+        merge_adjusted_intervals(&mut v, 0);
+        let n = v.len();
+        let mut m = std::collections::BTreeMap::new();
+        for r in &v {
+            for (k, val) in base_map_rec(r) {
+                // On a correct merge, overlapping inputs must agree.
+                if let Some(prev) = m.insert(k, val) {
+                    assert_eq!(prev, val, "conflicting query base for target {k}");
+                }
+            }
+        }
+        (m, n)
+    }
+
+    #[test]
+    fn merge_reverse_contiguous_preserves_base_map() {
+        // Full reverse alignment: target A[0,100] fwd, query C reverse, cigar
+        // 40= 20D 40= (C span 80, query first=80 last=0). Split contiguously at A=70.
+        let full = ai(80, 0, 1, &[(40, '='), (20, 'D'), (40, '=')], 0, 100, 0);
+        let expect = base_map_rec(&full);
+
+        let piece1 = ai(80, 30, 1, &[(40, '='), (20, 'D'), (10, '=')], 0, 70, 0);
+        let piece2 = ai(30, 0, 1, &[(30, '=')], 70, 100, 0);
+
+        let (got, n) = merged_map(vec![piece1, piece2]);
+        assert_eq!(got, expect, "reverse contiguous merge shifted the base map");
+        // Contiguous reverse records DO stitch (concatenate) into one record.
+        assert_eq!(
+            n, 1,
+            "reverse contiguous records should merge to a single record"
+        );
+    }
+
+    #[test]
+    fn merge_reverse_overlapping_no_offset() {
+        // Same full alignment, split with a 20bp OVERLAP on A[60,80] where both
+        // pieces carry an identical `20=` (so the overlap-trim branch is eligible).
+        let full = ai(80, 0, 1, &[(40, '='), (20, 'D'), (40, '=')], 0, 100, 0);
+        let expect = base_map_rec(&full);
+
+        // piece1: A[0,80] -> 40= 20D 20=  (C [20,80], query first=80 last=20)
+        let piece1 = ai(80, 20, 1, &[(40, '='), (20, 'D'), (20, '=')], 0, 80, 0);
+        // piece2: A[60,100] -> 40=        (C [0,40],  query first=40 last=0)
+        let piece2 = ai(40, 0, 1, &[(40, '=')], 60, 100, 0);
+
+        // The overlap-trim path now stitches the two reverse pieces back into a
+        // single record, and the base map must equal the full alignment — no
+        // offset from trim_cigar_prefix.
+        let (got, n) = merged_map(vec![piece1, piece2]);
+        assert_eq!(
+            got, expect,
+            "reverse overlapping merge introduced a coordinate offset"
+        );
+        assert_eq!(n, 1, "reverse overlapping records should stitch into one");
+    }
+
+    #[test]
+    fn merge_reverse_partial_op_trim_no_offset() {
+        // Overlap boundary lands mid-match so trim_cigar_prefix must split a
+        // partial `=` op; a deletion sits elsewhere (not at the seam). Verifies
+        // the integer partial-op trim stitches exactly with no offset.
+        // Full: A[0,100] fwd, C reverse, cigar 20= 10D 70=  (C span 90 -> first=90 last=0).
+        let full = ai(90, 0, 1, &[(20, '='), (10, 'D'), (70, '=')], 0, 100, 0);
+        let expect = base_map_rec(&full);
+
+        // piece1 = A[0,75]: 20= 10D 45=  (C [25,90], query first=90 last=25)
+        let piece1 = ai(90, 25, 1, &[(20, '='), (10, 'D'), (45, '=')], 0, 75, 0);
+        // piece2 = A[55,100]: 45= (mid the 70= run; C [0,45], query first=45 last=0)
+        let piece2 = ai(45, 0, 1, &[(45, '=')], 55, 100, 0);
+
+        let (got, n) = merged_map(vec![piece1, piece2]);
+        assert_eq!(got, expect, "reverse partial-op trim shifted the base map");
+        assert_eq!(n, 1, "should stitch into one record (mid-match overlap)");
+    }
+
+    #[test]
+    fn merge_forward_overlapping_no_offset() {
+        // Forward analogue: the sign fix must also make forward overlap-merge work.
+        // Full: A[0,100] fwd, C forward [0,90], cigar 40= 10D 50=.
+        let full = ai(0, 90, 1, &[(40, '='), (10, 'D'), (50, '=')], 0, 100, 0);
+        let expect = base_map_rec(&full);
+
+        // piece1 = A[0,70]: 40= 10D 20=  (C [0,60], query first=0 last=60)
+        let piece1 = ai(0, 60, 1, &[(40, '='), (10, 'D'), (20, '=')], 0, 70, 0);
+        // piece2 = A[50,100]: 50=        (C [40,90], query first=40 last=90)
+        let piece2 = ai(40, 90, 1, &[(50, '=')], 50, 100, 0);
+
+        let (got, n) = merged_map(vec![piece1, piece2]);
+        assert_eq!(got, expect, "forward overlapping merge shifted base map");
+        assert_eq!(n, 1, "forward overlapping records should stitch into one");
     }
 }

@@ -136,10 +136,7 @@ fn transient_raw_queries_match_cached_and_do_not_populate_cache() {
         let paf_path = tmp_path.join(name);
         write_paf(&paf_path, lines);
         let idx_path = tmp_path.join(format!("{}.impg", name));
-        build_per_file_index(
-            paf_path.to_str().unwrap(),
-            idx_path.to_str().unwrap(),
-        );
+        build_per_file_index(paf_path.to_str().unwrap(), idx_path.to_str().unwrap());
         index_paths.push(idx_path);
         alignment_files.push(paf_path.to_string_lossy().into_owned());
     }

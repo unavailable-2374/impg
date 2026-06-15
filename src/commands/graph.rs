@@ -1041,10 +1041,8 @@ pub fn align_sequences(
         let paf_temp = match &config.sparsify {
             SparsificationStrategy::None | SparsificationStrategy::WfmashDensity(_) => {
                 let segment_length = None;
-                let wfmash_density = sweepga::orchestrator::resolve_wfmash_density(
-                    &config.sparsify,
-                    num_genomes,
-                );
+                let wfmash_density =
+                    sweepga::orchestrator::resolve_wfmash_density(&config.sparsify, num_genomes);
 
                 if config.show_progress {
                     if let Some(f) = wfmash_density {
@@ -1081,7 +1079,9 @@ pub fn align_sequences(
                     config.batch_bytes.as_deref(),
                     !config.show_progress,
                 )
-                .map_err(|e| io::Error::other(format!("{} alignment failed: {}", config.aligner, e)))?
+                .map_err(|e| {
+                    io::Error::other(format!("{} alignment failed: {}", config.aligner, e))
+                })?
             }
             _ => {
                 let sequences = read_sequences_from_fasta(combined_fasta.path())?;
@@ -1227,16 +1227,23 @@ pub fn run_graph_build_partitioned(
         &mut seq_index,
     )?;
 
-    let records_with_file: Vec<(Vec<AlignmentRecord>, String)> =
-        vec![(records, paf_path.clone())];
+    let records_with_file: Vec<(Vec<AlignmentRecord>, String)> = vec![(records, paf_path.clone())];
     let impg = Impg::from_multi_alignment_records(&records_with_file, seq_index, None, true)?;
 
     // 3. Build UnifiedSequenceIndex from the combined FASTA
-    let combined_fasta_path = aln_result.combined_fasta.path().to_str().unwrap().to_string();
+    let combined_fasta_path = aln_result
+        .combined_fasta
+        .path()
+        .to_str()
+        .unwrap()
+        .to_string();
     let sequence_index = UnifiedSequenceIndex::from_files(&[combined_fasta_path.clone()])?;
 
     // 4. Partition: split all sequences into windows and query each
-    info!("[partitioned-graph] Partitioning with window size {}", partition_size);
+    info!(
+        "[partitioned-graph] Partitioning with window size {}",
+        partition_size
+    );
     let mut partitions: Vec<Vec<coitrees::Interval<u32>>> = Vec::new();
     let seq_index = impg.seq_index();
     let num_seqs = seq_index.len();
@@ -1257,22 +1264,20 @@ pub fn run_graph_build_partitioned(
                 window_start,
                 window_end,
                 None,
-                2,    // max_depth
-                101,  // min_transitive_len
-                10,   // min_distance_between_ranges
-                None, // min_output_length
+                2,     // max_depth
+                101,   // min_transitive_len
+                10,    // min_distance_between_ranges
+                None,  // min_output_length
                 false, // store_cigar
-                None, // min_identity
+                None,  // min_identity
                 Some(&sequence_index),
                 false, // approximate_mode
                 None,  // subset_filter
             );
 
             if !results.is_empty() {
-                let intervals: Vec<coitrees::Interval<u32>> = results
-                    .into_iter()
-                    .map(|(qi, _, _)| qi)
-                    .collect();
+                let intervals: Vec<coitrees::Interval<u32>> =
+                    results.into_iter().map(|(qi, _, _)| qi).collect();
                 partitions.push(intervals);
             }
 

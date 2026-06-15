@@ -77,8 +77,12 @@ impl UnifiedSequenceIndex {
 impl SequenceIndex for UnifiedSequenceIndex {
     fn fetch_sequence(&self, seq_name: &str, start: i64, end: i64) -> io::Result<Vec<u8>> {
         match self {
-            UnifiedSequenceIndex::Fasta(index) => index.fetch_sequence(seq_name, start as i32, end as i32),
-            UnifiedSequenceIndex::Agc(index) => index.fetch_sequence(seq_name, start as i32, end as i32),
+            UnifiedSequenceIndex::Fasta(index) => {
+                index.fetch_sequence(seq_name, start as i32, end as i32)
+            }
+            UnifiedSequenceIndex::Agc(index) => {
+                index.fetch_sequence(seq_name, start as i32, end as i32)
+            }
         }
     }
 

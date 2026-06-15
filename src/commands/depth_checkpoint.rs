@@ -40,8 +40,22 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Bumped on any breaking layout change to the ckpt blob or work-log format.
-pub const CKPT_SCHEMA_VERSION: u32 = 1;
+/// Bumped on any breaking layout change to the ckpt blob or work-log format,
+/// OR on any change that alters the on-disk TSV row contents so v1 rows and
+/// v2 rows would mix in a resumed run.
+///
+/// v2 (2026-05-19): `--use-BFS` now emits CIGAR-precise `positions` for
+/// hop-0 hits (notes/PLAN_cigar_precise_depth_positions.md, Method A). v1
+/// rows are linear-interpolated; mixing the two in the same TSV would
+/// produce inconsistent coordinates, so v1 checkpoints are rejected on
+/// resume.
+///
+/// v3 (2026-06-15): `--use-BFS` now also emits CIGAR-precise `positions` for
+/// hop≥1 (transitive) hits by synthesizing the anchor→query CIGAR along each
+/// chain (notes/PLAN_hop_ge1_cigar_precise_IMPL.md, Part A). v2 rows have
+/// linear-interpolated hop≥1 coordinates; mixing them with v3 rows on resume
+/// would produce inconsistent coordinates, so v2 checkpoints are rejected.
+pub const CKPT_SCHEMA_VERSION: u32 = 3;
 
 /// Bumped on any breaking layout change to the work-log binary format.
 pub const WORKLOG_VERSION: u16 = 1;
@@ -317,11 +331,7 @@ pub struct WorkRecord {
 ///
 /// The expected_end_offset is the `work_byte_offset` from the ckpt; bytes
 /// past it (already truncated by the resume entry path) must not exist.
-pub fn replay_work_log<F>(
-    path: &Path,
-    expected_end_offset: u64,
-    mut cb: F,
-) -> io::Result<u64>
+pub fn replay_work_log<F>(path: &Path, expected_end_offset: u64, mut cb: F) -> io::Result<u64>
 where
     F: FnMut(WorkRecord) -> io::Result<()>,
 {
@@ -424,13 +434,19 @@ where
 //
 // Layout:
 //   bits 63..62 : phase tag (00 = boundary / sentinel, 01 = Phase 1,
-//                 10 = Phase 2, 11 = reserved sentinels)
+//                 10 = legacy Phase 2 gap chunks, 11 = Phase 2 fixed tiles /
+//                 reserved sentinels)
 //   Phase 1 (tag = 01): bits 61..0 = chunk index in the deterministic
 //                       phase1_chunks order.
-//   Phase 2 (tag = 10): bits 61..36 = seq_id (low 26 bits; supports up to
-//                       ~67 M unique sequences), bits 35..0 = chunk_start
-//                       in bp (36 bits → up to 64 Gbp per seq, comfortably
-//                       above any plausible chromosome).
+//   Phase 2 (tag = 10): legacy gap-start chunks. Kept for replaying older
+//                       checkpoints; new Phase 2 code should prefer fixed
+//                       tiles below.
+//   Phase2T (tag = 11): bit 61 = 0 (keeps this namespace disjoint from the
+//                       u64::MAX FAI-done sentinel), bits 60..36 = seq_id
+//                       (low 25 bits; supports ~33 M unique sequences),
+//                       bits 35..0 = fixed tile_start in bp (36 bits → up to
+//                       64 Gbp per seq, comfortably above any plausible
+//                       chromosome).
 //   Boundary  (tag = 00): always 0.
 //   FAI-done  (tag = 11): u64::MAX. Marks "the post-Phase-2 unaligned-FAI
 //                       loop has been committed"; consulted on resume to
@@ -446,6 +462,7 @@ pub const CHUNK_ID_BOUNDARY: u64 = 0;
 pub const CHUNK_ID_FAI_DONE: u64 = u64::MAX;
 const PHASE1_TAG: u64 = 1u64 << 62;
 const PHASE2_TAG: u64 = 2u64 << 62;
+const PHASE2_TILE_TAG: u64 = 3u64 << 62;
 
 pub fn encode_chunk_id_phase1(idx: usize) -> u64 {
     PHASE1_TAG | ((idx as u64) & ((1u64 << 62) - 1))
@@ -455,6 +472,12 @@ pub fn encode_chunk_id_phase2(seq_id: u32, chunk_start: i64) -> u64 {
     let seq = ((seq_id as u64) & ((1u64 << 26) - 1)) << 36;
     let start = (chunk_start as u64) & ((1u64 << 36) - 1);
     PHASE2_TAG | seq | start
+}
+
+pub fn encode_chunk_id_phase2_tile(seq_id: u32, tile_start: i64) -> u64 {
+    let seq = ((seq_id as u64) & ((1u64 << 25) - 1)) << 36;
+    let start = (tile_start as u64) & ((1u64 << 36) - 1);
+    PHASE2_TILE_TAG | seq | start
 }
 
 // ---------------------------------------------------------------------------
@@ -541,10 +564,7 @@ mod tests {
 
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&encode_worklog_header());
-        bytes.extend(encode_work_record(
-            1,
-            &[(0, 0, 100), (1, 50, 150)],
-        ));
+        bytes.extend(encode_work_record(1, &[(0, 0, 100), (1, 50, 150)]));
         bytes.extend(encode_work_record(2, &[(2, 200, 300)]));
         bytes.extend(encode_work_record(3, &[]));
         std::fs::write(&path, &bytes).unwrap();
@@ -581,12 +601,11 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
 
         let mut chunk_ids = Vec::new();
-        let consumed =
-            replay_work_log(&path, stop_at, |rec| {
-                chunk_ids.push(rec.chunk_id);
-                Ok(())
-            })
-            .unwrap();
+        let consumed = replay_work_log(&path, stop_at, |rec| {
+            chunk_ids.push(rec.chunk_id);
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(consumed, stop_at);
         assert_eq!(chunk_ids, vec![1u64]);
     }
@@ -606,17 +625,23 @@ mod tests {
     fn chunk_id_encodings_disjoint() {
         let p1 = encode_chunk_id_phase1(42);
         let p2 = encode_chunk_id_phase2(7, 5_000_000);
+        let p2_tile = encode_chunk_id_phase2_tile(7, 5_000_000);
         let bd = CHUNK_ID_BOUNDARY;
         let fai = CHUNK_ID_FAI_DONE;
         assert_ne!(p1, p2);
+        assert_ne!(p1, p2_tile);
+        assert_ne!(p2, p2_tile);
         assert_ne!(p1, bd);
         assert_ne!(p2, bd);
+        assert_ne!(p2_tile, bd);
         assert_ne!(p1, fai);
         assert_ne!(p2, fai);
+        assert_ne!(p2_tile, fai);
         assert_ne!(bd, fai);
         // Phase tag bits
         assert_eq!(p1 >> 62, 1);
         assert_eq!(p2 >> 62, 2);
+        assert_eq!(p2_tile >> 62, 3);
         assert_eq!(bd >> 62, 0);
         assert_eq!(fai >> 62, 3);
         // Phase 2 round-trip
@@ -624,13 +649,23 @@ mod tests {
         assert_eq!(p2, p2b);
         // Different start bp → different id
         assert_ne!(p2, encode_chunk_id_phase2(7, 10_000_000));
+        assert_ne!(p2_tile, encode_chunk_id_phase2_tile(7, 10_000_000));
         // Different seq → different id
         assert_ne!(p2, encode_chunk_id_phase2(8, 5_000_000));
+        assert_ne!(p2_tile, encode_chunk_id_phase2_tile(8, 5_000_000));
         // 36-bit chunk_start covers >4Gbp without truncation collisions.
         let big1 = encode_chunk_id_phase2(7, 4_500_000_000);
         let big2 = encode_chunk_id_phase2(7, 4_500_000_000 + 5_000_000);
         assert_ne!(big1, big2);
         assert_ne!(big1, encode_chunk_id_phase2(7, 5_000_000));
+        let big_tile1 = encode_chunk_id_phase2_tile(7, 4_500_000_000);
+        let big_tile2 = encode_chunk_id_phase2_tile(7, 4_500_000_000 + 5_000_000);
+        assert_ne!(big_tile1, big_tile2);
+        assert_ne!(big_tile1, encode_chunk_id_phase2_tile(7, 5_000_000));
+        assert_ne!(
+            encode_chunk_id_phase2_tile((1u32 << 25) - 1, (1i64 << 36) - 1),
+            CHUNK_ID_FAI_DONE
+        );
     }
 
     #[test]

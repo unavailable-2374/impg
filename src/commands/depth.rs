@@ -1,3 +1,4 @@
+use crate::alignment_record::Strand;
 use crate::impg::{CigarOp, SortedRanges};
 use crate::impg_index::{ImpgIndex, RawAlignmentInterval};
 use crate::sequence_index::UnifiedSequenceIndex;
@@ -14,9 +15,10 @@ use std::sync::mpsc::{sync_channel, SyncSender};
 use std::thread::JoinHandle;
 
 use crate::commands::depth_checkpoint::{
-    compute_invalidation_hash, encode_chunk_id_phase1, encode_chunk_id_phase2, encode_work_record,
-    encode_worklog_header, replay_work_log, truncate_to, DepthCheckpoint, HashInputs, ResumeState,
-    CHUNK_ID_BOUNDARY, CHUNK_ID_FAI_DONE, TSV_SUFFIX, WORKLOG_SUFFIX,
+    compute_invalidation_hash, encode_chunk_id_phase1, encode_chunk_id_phase2,
+    encode_chunk_id_phase2_tile, encode_work_record, encode_worklog_header, replay_work_log,
+    truncate_to, DepthCheckpoint, HashInputs, ResumeState, CHUNK_ID_BOUNDARY, CHUNK_ID_FAI_DONE,
+    TSV_SUFFIX, WORKLOG_SUFFIX,
 };
 
 // ============================================================================
@@ -783,10 +785,18 @@ pub(crate) struct CompactAlignmentInfo {
     pub target_end: i64,
     /// True if alignment is on reverse strand
     pub is_reverse: bool,
+    /// Index into the per-region `CigarEntry` side-table. `u32::MAX` means
+    /// "no CIGAR available" — the sweep falls back to linear interpolation.
+    /// Only populated for hop-0 hits under `--use-BFS`; hop≥1 stays `MAX`
+    /// (Method A from `notes/PLAN_cigar_precise_depth_positions.md`).
+    pub cigar_idx: u32,
 }
 
 impl CompactAlignmentInfo {
-    /// Create a new compact alignment info
+    /// Sentinel: no CIGAR registered for this alignment.
+    pub const NO_CIGAR: u32 = u32::MAX;
+
+    /// Create a new compact alignment info (no CIGAR side-table entry).
     pub fn new(
         sample_id: u16,
         query_id: u32,
@@ -804,8 +814,228 @@ impl CompactAlignmentInfo {
             target_start,
             target_end,
             is_reverse,
+            cigar_idx: Self::NO_CIGAR,
         }
     }
+
+    /// Create a new compact alignment info with a CIGAR side-table index.
+    /// Used by the hop-0 CIGAR-precise path in `--use-BFS`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_cigar(
+        sample_id: u16,
+        query_id: u32,
+        query_start: i64,
+        query_end: i64,
+        target_start: i64,
+        target_end: i64,
+        is_reverse: bool,
+        cigar_idx: u32,
+    ) -> Self {
+        Self {
+            sample_id,
+            query_id,
+            query_start,
+            query_end,
+            target_start,
+            target_end,
+            is_reverse,
+            cigar_idx,
+        }
+    }
+}
+
+/// Side-table entry holding a CIGAR + its alignment record for cursor-based
+/// target→query projection inside the sweep. One entry per hop-0 hit in
+/// `--use-BFS` mode.
+#[derive(Debug, Clone)]
+pub(crate) struct CigarEntry {
+    pub ops: Vec<CigarOp>,
+    pub target_start: i64,
+    pub target_end: i64,
+    pub query_start: i64,
+    pub query_end: i64,
+    pub strand: Strand,
+}
+
+/// Forward-only cursor for projecting target sub-ranges through a CIGAR.
+/// Designed for sweep-line use: consecutive `project()` calls must have
+/// non-decreasing `t_start` so the cursor amortizes O(1) per window instead
+/// of O(|CIGAR|).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CigarCursor {
+    /// Index of the next op to inspect.
+    next_op: usize,
+    /// Target position at the start of `ops[next_op]`.
+    target_at_next: i64,
+    /// Query position at the start of `ops[next_op]`, in CIGAR-walk direction.
+    /// For Forward strand this increases; for Reverse it decreases.
+    query_at_next: i64,
+}
+
+impl CigarCursor {
+    pub fn new(entry: &CigarEntry) -> Self {
+        Self {
+            next_op: 0,
+            target_at_next: entry.target_start,
+            query_at_next: match entry.strand {
+                Strand::Forward => entry.query_start,
+                Strand::Reverse => entry.query_end,
+            },
+        }
+    }
+
+    /// Project the target half-open range [t_start, t_end) through `entry`
+    /// using the cursor's persistent state.
+    ///
+    /// Returns `Some((q_min, q_max))` (always q_min < q_max) for non-empty
+    /// projections. Returns `None` if the range falls entirely inside a `D`
+    /// op (so the caller can fall back to linear interpolation).
+    ///
+    /// Pre: across consecutive calls, `t_start` must be non-decreasing.
+    pub fn project(&mut self, entry: &CigarEntry, t_start: i64, t_end: i64) -> Option<(i64, i64)> {
+        let t_start = t_start.max(entry.target_start);
+        let t_end = t_end.min(entry.target_end);
+        if t_start >= t_end {
+            return None;
+        }
+        let ops = &entry.ops;
+        let strand = entry.strand;
+        let dir: i64 = if strand == Strand::Forward { 1 } else { -1 };
+
+        // Phase 1: advance cursor past ops that end at or before t_start.
+        // Cursor state is mutated here (forward-only).
+        while self.next_op < ops.len() {
+            let op = &ops[self.next_op];
+            let td = op.target_delta() as i64;
+            if td > 0 {
+                if self.target_at_next + td <= t_start {
+                    self.target_at_next += td;
+                    self.query_at_next += op.query_delta(strand) as i64;
+                    self.next_op += 1;
+                } else {
+                    break;
+                }
+            } else {
+                // I op (td == 0). Consume only if strictly before t_start so
+                // that I ops sitting exactly at t_start are still considered
+                // by the probe (they contribute to the projection).
+                if self.target_at_next < t_start {
+                    self.query_at_next += op.query_delta(strand) as i64;
+                    self.next_op += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        if self.next_op >= ops.len() {
+            return None;
+        }
+
+        // Phase 2: probe forward computing projection. Cursor is NOT mutated
+        // (a later window's t_start might still need to revisit some ops we
+        // looked at here).
+        let mut probe_op = self.next_op;
+        let mut probe_t = self.target_at_next;
+        let mut probe_q = self.query_at_next;
+        let mut q_min: i64 = i64::MAX;
+        let mut q_max: i64 = i64::MIN;
+        let mut have_any = false;
+
+        while probe_op < ops.len() && probe_t < t_end {
+            let op = &ops[probe_op];
+            let td = op.target_delta() as i64;
+            let qd_dir = op.query_delta(strand) as i64;
+
+            if td == 0 {
+                // I op: inserted at target position `probe_t`. Include if
+                // probe_t in [t_start, t_end).
+                if probe_t >= t_start && probe_t < t_end {
+                    let q0 = probe_q;
+                    let q1 = probe_q + qd_dir;
+                    let lo = q0.min(q1);
+                    let hi = q0.max(q1);
+                    if lo < q_min {
+                        q_min = lo;
+                    }
+                    if hi > q_max {
+                        q_max = hi;
+                    }
+                    have_any = true;
+                }
+                probe_q += qd_dir;
+                probe_op += 1;
+            } else if qd_dir == 0 {
+                // D op: consumes target only; no query coverage.
+                probe_t += td;
+                probe_op += 1;
+            } else {
+                // =/X/M (both consumed): linear within the op.
+                let op_t_end = probe_t + td;
+                let ov_start = t_start.max(probe_t);
+                let ov_end = t_end.min(op_t_end);
+                if ov_start < ov_end {
+                    let in_off = ov_start - probe_t;
+                    let out_off = ov_end - probe_t;
+                    let q0 = probe_q + in_off * dir;
+                    let q1 = probe_q + out_off * dir;
+                    let lo = q0.min(q1);
+                    let hi = q0.max(q1);
+                    if lo < q_min {
+                        q_min = lo;
+                    }
+                    if hi > q_max {
+                        q_max = hi;
+                    }
+                    have_any = true;
+                }
+                probe_t = op_t_end;
+                probe_q += qd_dir;
+                probe_op += 1;
+            }
+        }
+
+        if have_any && q_min < q_max {
+            Some((q_min, q_max))
+        } else {
+            None
+        }
+    }
+}
+
+/// Sweep-line helper: pick CIGAR-precise (via cursor) or linear projection
+/// for a single (alignment, window) pair. The `cursors` slice is sized
+/// `alignments.len()` and lazily-initialized; each alignment's cursor is
+/// advanced forward across calls. Falls back to linear interpolation when
+/// the alignment has no CIGAR or the window lands entirely in a `D` op.
+#[inline]
+fn project_window_for_sweep(
+    aln: &CompactAlignmentInfo,
+    cigars: &[CigarEntry],
+    cursors: &mut [Option<CigarCursor>],
+    aln_idx: usize,
+    window_target_start: i64,
+    window_target_end: i64,
+) -> (i64, i64) {
+    if aln.cigar_idx != CompactAlignmentInfo::NO_CIGAR && (aln.cigar_idx as usize) < cigars.len() {
+        let entry = &cigars[aln.cigar_idx as usize];
+        let cursor = cursors[aln_idx].get_or_insert_with(|| CigarCursor::new(entry));
+        if let Some((qs, qe)) = cursor.project(entry, window_target_start, window_target_end) {
+            return (qs, qe);
+        }
+        // Cursor returned None (e.g., window fully inside a D op) — fall
+        // through to linear interpolation so the TSV row stays populated.
+    }
+    map_target_to_query_linear(
+        &[],
+        aln.target_start,
+        aln.target_end,
+        aln.query_start,
+        aln.query_end,
+        window_target_start,
+        window_target_end,
+        aln.is_reverse,
+    )
 }
 
 /// Bitmap for tracking active samples in sweep-line algorithm
@@ -2757,7 +2987,7 @@ fn process_anchor_region_transitive_raw_with_hits(
             unique.len()
         );
     }
-    let seq_intervals = sweep_line_depth(&alignments, num_samples, region_start, region_end);
+    let seq_intervals = sweep_line_depth(&alignments, &[], num_samples, region_start, region_end);
 
     AnchorRegionResult {
         intervals: seq_intervals,
@@ -3103,7 +3333,7 @@ fn process_anchor_region_transitive_raw(
         );
     }
     // Sweep-line to compute depth intervals
-    let seq_intervals = sweep_line_depth(&alignments, num_samples, region_start, region_end);
+    let seq_intervals = sweep_line_depth(&alignments, &[], num_samples, region_start, region_end);
 
     AnchorRegionResult {
         intervals: seq_intervals,
@@ -3265,7 +3495,7 @@ fn process_anchor_region(
     }
 
     // Sweep-line to compute depth intervals
-    let seq_intervals = sweep_line_depth(&alignments, num_samples, region_start, region_end);
+    let seq_intervals = sweep_line_depth(&alignments, &[], num_samples, region_start, region_end);
 
     AnchorRegionResult {
         intervals: seq_intervals,
@@ -3418,7 +3648,7 @@ fn process_anchor_region_raw(
     }
 
     // Sweep-line to compute depth intervals
-    let seq_intervals = sweep_line_depth(&alignments, num_samples, region_start, region_end);
+    let seq_intervals = sweep_line_depth(&alignments, &[], num_samples, region_start, region_end);
 
     AnchorRegionResult {
         intervals: seq_intervals,
@@ -3464,7 +3694,9 @@ fn process_anchor_region_transitive_cigar(
             config.min_transitive_len,
             config.min_distance_between_ranges,
             None,
-            false,
+            // store_cigar=true → carry per-hop CIGAR so hop-0 hits feed the
+            // CIGAR-precise sweep cursor (Plan §5 / Method A).
+            true,
             None,
             None,
             false,
@@ -3480,7 +3712,7 @@ fn process_anchor_region_transitive_cigar(
             config.min_transitive_len,
             config.min_distance_between_ranges,
             None,
-            false,
+            true,
             None,
             None,
             false,
@@ -3489,6 +3721,14 @@ fn process_anchor_region_transitive_cigar(
     };
 
     let mut alignments: Vec<CompactAlignmentInfo> = Vec::new();
+    // Per-region CIGAR side-table. With the CIGAR-precise carry BFS/DFS
+    // (store_cigar=true), EVERY hit — hop-0 and hop≥1 alike — arrives with its
+    // `overlap.2` target on the anchor and a synthesized anchor→query CIGAR
+    // (impg.rs `compose_hop`). So all hits register a CigarEntry here and the
+    // sweep projects them precisely; linear fallback only kicks in per-window
+    // when a window lands inside a deletion (project_window_for_sweep). See
+    // notes/PLAN_hop_ge1_cigar_precise_IMPL.md §6.
+    let mut cigars: Vec<CigarEntry> = Vec::new();
 
     // Self alignment (anchor covers itself)
     alignments.push(CompactAlignmentInfo::new(
@@ -3501,7 +3741,11 @@ fn process_anchor_region_transitive_cigar(
         false,
     ));
 
-    // Pass 1: Build anchor coverage map from hop 0 results (target on anchor)
+    // Pass 1: Build anchor coverage map from hop-0 results (target on anchor).
+    // In carry mode this is vestigial — every hit already targets the anchor, so
+    // `is_hop0` is always true in pass-2 and `project_hop0_coords` (which reads
+    // this map) is never reached. It is kept only so the function stays correct
+    // should a hit ever arrive with a non-anchor target (e.g. future callers).
     let mut seq_anchor_coverage: FxHashMap<u32, Vec<HopZeroSeg>> = FxHashMap::default();
     for overlap in &overlaps {
         let query_interval = &overlap.0;
@@ -3558,7 +3802,8 @@ fn process_anchor_region_transitive_cigar(
         // Compute full anchor coordinates for this overlap (existing logic)
         let hit_t_start = target_interval.first.min(target_interval.last) as i64;
         let hit_t_end = target_interval.first.max(target_interval.last) as i64;
-        let (full_a_start, full_a_end) = if target_interval.metadata == anchor_seq_id {
+        let is_hop0 = target_interval.metadata == anchor_seq_id;
+        let (full_a_start, full_a_end) = if is_hop0 {
             (hit_t_start.max(region_start), hit_t_end.min(region_end))
         } else {
             let p = project_hop0_coords(
@@ -3596,7 +3841,32 @@ fn process_anchor_region_transitive_cigar(
             is_reverse,
         );
         if ua_start < ua_end {
-            alignments.push(CompactAlignmentInfo::new(
+            // Register a CigarEntry so the sweep projects windows via
+            // CigarCursor. In carry mode `is_hop0` is true for hop≥1 hits too
+            // (their target was rewritten to the anchor with a composed CIGAR),
+            // so this path now drives base-precise projection for the whole
+            // transitive chain, not just direct alignments. Hits without a
+            // CIGAR (empty ops) keep cigar_idx = NO_CIGAR and fall back to
+            // linear interpolation.
+            let cigar_idx = if is_hop0 && !overlap.1.is_empty() {
+                let idx = cigars.len() as u32;
+                cigars.push(CigarEntry {
+                    ops: overlap.1.clone(),
+                    target_start: hit_t_start,
+                    target_end: hit_t_end,
+                    query_start,
+                    query_end,
+                    strand: if is_reverse {
+                        Strand::Reverse
+                    } else {
+                        Strand::Forward
+                    },
+                });
+                idx
+            } else {
+                CompactAlignmentInfo::NO_CIGAR
+            };
+            alignments.push(CompactAlignmentInfo::new_with_cigar(
                 query_sample_id,
                 query_id,
                 query_start,
@@ -3604,6 +3874,7 @@ fn process_anchor_region_transitive_cigar(
                 ua_start,
                 ua_end,
                 is_reverse,
+                cigar_idx,
             ));
         }
 
@@ -3653,7 +3924,8 @@ fn process_anchor_region_transitive_cigar(
         );
     }
     // Sweep-line to compute depth intervals
-    let seq_intervals = sweep_line_depth(&alignments, num_samples, region_start, region_end);
+    let seq_intervals =
+        sweep_line_depth(&alignments, &cigars, num_samples, region_start, region_end);
 
     AnchorRegionResult {
         intervals: seq_intervals,
@@ -3692,8 +3964,13 @@ fn interval_union_length(intervals: &mut Vec<(i64, i64)>) -> i64 {
 /// Sweep-line algorithm: given alignments, produce depth intervals with sample tracking.
 /// Callers must include the anchor sample as an alignment covering [region_start, region_end]
 /// so that depth naturally counts all samples (including the anchor itself).
+///
+/// `cigars` is the per-region CIGAR side-table referenced by
+/// `CompactAlignmentInfo::cigar_idx`. Pass `&[]` when no CIGAR is available
+/// (the sweep falls back to linear interpolation for every window).
 fn sweep_line_depth(
     alignments: &[CompactAlignmentInfo],
+    cigars: &[CigarEntry],
     num_samples: usize,
     region_start: i64,
     region_end: i64,
@@ -3723,6 +4000,9 @@ fn sweep_line_depth(
     let mut prev_pos: Option<i64> = None;
     // Hoisted to avoid repeated HashMap allocation; cleared before each per-sample use.
     let mut query_intervals_by_contig: FxHashMap<u32, Vec<(i64, i64)>> = FxHashMap::default();
+    // Per-alignment monotonic cursors for CIGAR-precise projection. Lazily
+    // populated; cursors[idx] stays None until alignment `idx` first projects.
+    let mut cursors: Vec<Option<CigarCursor>> = vec![None; alignments.len()];
 
     for event in events {
         if let Some(prev) = prev_pos {
@@ -3761,15 +4041,13 @@ fn sweep_line_depth(
                                 continue;
                             }
 
-                            let (q_start, q_end) = map_target_to_query_linear(
-                                &[],
-                                aln.target_start,
-                                aln.target_end,
-                                aln.query_start,
-                                aln.query_end,
+                            let (q_start, q_end) = project_window_for_sweep(
+                                aln,
+                                cigars,
+                                &mut cursors,
+                                idx,
                                 clipped_start,
                                 clipped_end,
-                                aln.is_reverse,
                             );
                             query_intervals_by_contig
                                 .entry(aln.query_id)
@@ -3834,6 +4112,7 @@ fn sweep_line_depth(
 /// rather than O(K × N_samples) for the full result set.
 fn sweep_line_depth_streaming(
     alignments: &[CompactAlignmentInfo],
+    cigars: &[CigarEntry],
     num_samples: usize,
     region_start: i64,
     region_end: i64,
@@ -3862,6 +4141,7 @@ fn sweep_line_depth_streaming(
     let mut prev_pos: Option<i64> = None;
     // Hoisted to avoid repeated HashMap allocation; cleared before each per-sample use.
     let mut query_intervals_by_contig: FxHashMap<u32, Vec<(i64, i64)>> = FxHashMap::default();
+    let mut cursors: Vec<Option<CigarCursor>> = vec![None; alignments.len()];
 
     for event in events {
         if let Some(prev) = prev_pos {
@@ -3891,15 +4171,13 @@ fn sweep_line_depth_streaming(
                                 continue;
                             }
 
-                            let (q_start, q_end) = map_target_to_query_linear(
-                                &[],
-                                aln.target_start,
-                                aln.target_end,
-                                aln.query_start,
-                                aln.query_end,
+                            let (q_start, q_end) = project_window_for_sweep(
+                                aln,
+                                cigars,
+                                &mut cursors,
+                                idx,
                                 clipped_start,
                                 clipped_end,
-                                aln.is_reverse,
                             );
                             query_intervals_by_contig
                                 .entry(aln.query_id)
@@ -4081,7 +4359,14 @@ fn process_anchor_region_raw_streaming(
         }
     }
 
-    sweep_line_depth_streaming(&alignments, num_samples, region_start, region_end, emit);
+    sweep_line_depth_streaming(
+        &alignments,
+        &[],
+        num_samples,
+        region_start,
+        region_end,
+        emit,
+    );
 
     discovered_regions
 }
@@ -5626,70 +5911,58 @@ pub fn compute_depth_global(
     };
 
     if !is_transitive {
-        // Precompute (seq_id, chunk_start, chunk_end) tuples by scanning the
-        // current unprocessed gaps for every Phase 2 sequence and slicing each
-        // gap at TRANSITIVE_CHUNK_SIZE. Phase 1 has already finished, so the
-        // tracker state is stable when this runs.
-        //
-        // Two-pass build (count then fill) so the Vec is allocated exactly
-        // once at its final capacity. With pangenome-scale workloads this
-        // collect can return tens of millions of chunks (≥56M observed at
-        // 581-sample VGP scale); the doubling growth pattern from a default
-        // `flat_map().collect()` would create a transient ~2× peak right at
-        // the Phase-1 → Phase-2 boundary, which on hosts already pressed up
-        // against `vm.max_map_count` from the transient header cache was
-        // enough to trip the allocator.
-        let mut phase2_chunk_count_pre: usize = 0;
+        // Phase 2 must use deterministic fixed tiles, not current gap starts,
+        // as its checkpoint unit. On resume, replaying hundreds of millions of
+        // query-side discovered regions can fragment `tracker` into tiny gaps;
+        // slicing those gaps directly produced 100M+ "chunks" and made resume
+        // spend wall time rebuilding/skipping work instead of advancing. A
+        // fixed tile processes whatever unprocessed gaps still exist inside
+        // [tile_start, tile_end), and commits one stable tile id when done.
+        let mut phase2_tiles: Vec<(u32, i64, i64)> = Vec::new();
+        let mut completed_tiles_skipped: usize = 0;
         for &seq_id in &phase2_seqs {
             let seq_len = compact_lengths.get_length(seq_id);
             if seq_len <= 0 {
                 continue;
             }
-            for (region_start, region_end) in tracker.get_unprocessed(seq_id, 0, seq_len) {
-                let gap = region_end - region_start;
-                if gap > 0 {
-                    // ceil(gap / chunk_size)
-                    phase2_chunk_count_pre +=
-                        ((gap + TRANSITIVE_CHUNK_SIZE - 1) / TRANSITIVE_CHUNK_SIZE) as usize;
+            let mut tile_start = 0i64;
+            while tile_start < seq_len {
+                let tile_end = (tile_start + TRANSITIVE_CHUNK_SIZE).min(seq_len);
+                let tile_id = encode_chunk_id_phase2_tile(seq_id, tile_start);
+                if work_log_active && completed_chunks.contains(&tile_id) {
+                    completed_tiles_skipped += 1;
+                } else if !tracker
+                    .get_unprocessed(seq_id, tile_start, tile_end)
+                    .is_empty()
+                {
+                    phase2_tiles.push((seq_id, tile_start, tile_end));
                 }
+                tile_start = tile_end;
             }
         }
-
-        let mut phase2_chunks: Vec<(u32, i64, i64)> = Vec::with_capacity(phase2_chunk_count_pre);
-        for &seq_id in &phase2_seqs {
-            let seq_len = compact_lengths.get_length(seq_id);
-            if seq_len <= 0 {
-                continue;
-            }
-            for (region_start, region_end) in tracker.get_unprocessed(seq_id, 0, seq_len) {
-                let mut start = region_start;
-                while start < region_end {
-                    let end = (start + TRANSITIVE_CHUNK_SIZE).min(region_end);
-                    phase2_chunks.push((seq_id, start, end));
-                    start = end;
-                }
-            }
-        }
-        debug_assert_eq!(phase2_chunks.len(), phase2_chunk_count_pre);
 
         info!(
-            "Phase 2: {} sequences split into {} {}-MB chunks, chunk-level parallelism",
+            "Phase 2: {} sequences split into {} active fixed {}-MB tiles ({} already committed)",
             phase2_seqs.len(),
-            phase2_chunks.len(),
+            phase2_tiles.len(),
             TRANSITIVE_CHUNK_SIZE / 1_000_000,
+            completed_tiles_skipped,
         );
 
-        let pb_depth = ProgressBar::new(phase2_chunks.len() as u64);
+        let pb_depth = ProgressBar::new((phase2_tiles.len() + completed_tiles_skipped) as u64);
         pb_depth.set_style(
             ProgressStyle::default_bar()
                 .template(&format!(
-                    "{{spinner:.green}} [{{elapsed_precise}}] [{{wide_bar:.cyan/blue}}] {{pos}}/{{len}} chunks ({{eta}}) | {}remaining sequences",
+                    "{{spinner:.green}} [{{elapsed_precise}}] [{{wide_bar:.cyan/blue}}] {{pos}}/{{len}} tiles ({{eta}}) | {}remaining sequences",
                     phase2_label
                 ))
                 .unwrap()
                 .progress_chars("#>-")
         );
-        let phase2_chunk_count = AtomicUsize::new(0);
+        let phase2_tile_count = AtomicUsize::new(completed_tiles_skipped);
+        if completed_tiles_skipped > 0 {
+            pb_depth.set_position(completed_tiles_skipped as u64);
+        }
 
         // Two-phase batched architecture mirroring Phase 1 transitive
         // (`batch_depth_bfs`):
@@ -5716,21 +5989,16 @@ pub fn compute_depth_global(
         const PHASE2_BATCH_SIZE: usize = 65_536;
         let phase2_batch_size = checkpoint_ctrl.checkpoint_batch_size(PHASE2_BATCH_SIZE);
 
-        for batch in phase2_chunks.chunks(phase2_batch_size) {
-            // Resume filter: drop chunks whose chunk_id is already in
-            // `completed_chunks` BEFORE running the heavy batch query, so
-            // partial-Phase-2 resumes don't pay for sub-index loads on work
-            // that's already on disk. After Phase 1's replay, `tracker.get_
-            // unprocessed` should already exclude these — this is defensive
-            // against any chunk that slipped through (e.g., a chunk whose
-            // discovered_regions only covered query-side ranges and not the
-            // full anchor extent).
+        for batch in phase2_tiles.chunks(phase2_batch_size) {
+            // Defensive re-filter: a tile may have been committed by a newer
+            // checkpoint format even if it was present in an older replay-built
+            // active list.
             let live_batch: Vec<(u32, i64, i64)> = if work_log_active {
                 batch
                     .iter()
                     .copied()
-                    .filter(|&(seq_id, chunk_start, _)| {
-                        !completed_chunks.contains(&encode_chunk_id_phase2(seq_id, chunk_start))
+                    .filter(|&(seq_id, tile_start, _)| {
+                        !completed_chunks.contains(&encode_chunk_id_phase2_tile(seq_id, tile_start))
                     })
                     .collect()
             } else {
@@ -5738,8 +6006,8 @@ pub fn compute_depth_global(
             };
             let skipped = batch.len() - live_batch.len();
             if skipped > 0 {
-                phase2_chunk_count.fetch_add(skipped, Ordering::Relaxed);
-                pb_depth.set_position(phase2_chunk_count.load(Ordering::Relaxed) as u64);
+                let count = phase2_tile_count.fetch_add(skipped, Ordering::Relaxed) + skipped;
+                pb_depth.set_position(count as u64);
             }
             if live_batch.is_empty() {
                 continue;
@@ -5756,7 +6024,7 @@ pub fn compute_depth_global(
                 .par_iter()
                 .zip(all_alns.into_par_iter())
                 .try_for_each(
-                    |(&(seq_id, chunk_start, chunk_end), mut raw_alns)| -> io::Result<()> {
+                    |(&(seq_id, tile_start, tile_end), mut raw_alns)| -> io::Result<()> {
                         // Hold the chunk-in-flight read guard for the duration
                         // during which mid-chunk TSV bytes may enter the writer
                         // channel; released before `note_chunk_done` so a
@@ -5781,74 +6049,83 @@ pub fn compute_depth_global(
                             true
                         };
 
-                        let mut emitter = StreamingDepthEmitter {
-                            buf: Vec::new(),
-                            writer: &writer,
-                            seq_name,
-                            anchor_sample_id: sample_id,
-                            num_samples,
-                            seq_index: impg.seq_index(),
-                            row_counter: &row_counter,
-                            intervals_counter: &intervals_counter,
-                            should_output,
-                            stats_mode,
-                            local_stats: if stats_accumulator.is_some() {
-                                Some(DepthStats::new())
-                            } else {
-                                None
-                            },
-                            local_combined: if stats_combined_acc.is_some() {
-                                Some(DepthStatsWithSamples::new())
-                            } else {
-                                None
-                            },
-                            sample_index: &sample_index,
-                            min_interval_len,
-                            seq_intervals: Vec::new(),
-                            pending: None,
-                            window_size: if user_window_size.is_some() {
-                                Some(window_size)
-                            } else {
-                                None
-                            },
-                            // `defer_buf_flush` only governs whether the
-                            // chunk's *trailing* (post-final-emit) bytes are
-                            // flushed by `emitter.flush()` itself or held for
-                            // `take_buf` + `send_chunk_bundle` below. Mid-
-                            // chunk 4 MB auto-flushes happen unconditionally
-                            // and rely on the chunk-freeze barrier in
-                            // CheckpointController for resume atomicity.
-                            defer_buf_flush: work_log_active,
-                        };
+                        let mut tile_tsv: Vec<u8> = Vec::new();
+                        let mut tile_discovered: Vec<(u32, i64, i64)> = Vec::new();
+                        let unprocessed = tracker.get_unprocessed(seq_id, tile_start, tile_end);
+                        for (region_start, region_end) in unprocessed {
+                            let mut emitter = StreamingDepthEmitter {
+                                buf: Vec::new(),
+                                writer: &writer,
+                                seq_name,
+                                anchor_sample_id: sample_id,
+                                num_samples,
+                                seq_index: impg.seq_index(),
+                                row_counter: &row_counter,
+                                intervals_counter: &intervals_counter,
+                                should_output,
+                                stats_mode,
+                                local_stats: if stats_accumulator.is_some() {
+                                    Some(DepthStats::new())
+                                } else {
+                                    None
+                                },
+                                local_combined: if stats_combined_acc.is_some() {
+                                    Some(DepthStatsWithSamples::new())
+                                } else {
+                                    None
+                                },
+                                sample_index: &sample_index,
+                                min_interval_len,
+                                seq_intervals: Vec::new(),
+                                pending: None,
+                                window_size: if user_window_size.is_some() {
+                                    Some(window_size)
+                                } else {
+                                    None
+                                },
+                                // `defer_buf_flush` only governs whether the
+                                // tile's trailing bytes are flushed by
+                                // `emitter.flush()` itself or held for
+                                // `take_buf` + the tile work-log record. Mid-
+                                // tile 4 MB auto-flushes happen
+                                // unconditionally and are protected by the
+                                // chunk-freeze barrier.
+                                defer_buf_flush: work_log_active,
+                            };
 
-                        let discovered = process_anchor_region_raw_streaming(
-                            &raw_alns,
-                            &compact_lengths,
-                            num_samples,
-                            seq_id,
-                            sample_id,
-                            chunk_start,
-                            chunk_end,
-                            &global_used,
-                            &mut |interval| emitter.emit(interval),
-                        );
-                        emitter.flush()?;
+                            let discovered = process_anchor_region_raw_streaming(
+                                &raw_alns,
+                                &compact_lengths,
+                                num_samples,
+                                seq_id,
+                                sample_id,
+                                region_start,
+                                region_end,
+                                &global_used,
+                                &mut |interval| emitter.emit(interval),
+                            );
+                            emitter.flush()?;
+                            if work_log_active {
+                                tile_tsv.extend(emitter.take_buf());
+                            }
+                            tracker.mark_processed_batch(&discovered);
+                            tile_discovered.extend(discovered);
+                            emitter.merge_stats_into(&stats_accumulator, &stats_combined_acc);
+                        }
+
                         if work_log_active {
-                            let chunk_id = encode_chunk_id_phase2(seq_id, chunk_start);
-                            let tsv_buf = emitter.take_buf();
-                            let work_buf = encode_work_record(chunk_id, &discovered);
+                            let tile_id = encode_chunk_id_phase2_tile(seq_id, tile_start);
+                            let work_buf = encode_work_record(tile_id, &tile_discovered);
                             if let Some(ref w) = writer {
-                                w.send_chunk_bundle(tsv_buf, work_buf)?;
+                                w.send_chunk_bundle(tile_tsv, work_buf)?;
                             }
                         }
-                        tracker.mark_processed_batch(&discovered);
-                        emitter.merge_stats_into(&stats_accumulator, &stats_combined_acc);
                         drop(chunk_guard);
                         if work_log_active {
                             checkpoint_ctrl.note_chunk_done()?;
                         }
 
-                        let count = phase2_chunk_count.fetch_add(1, Ordering::Relaxed) + 1;
+                        let count = phase2_tile_count.fetch_add(1, Ordering::Relaxed) + 1;
                         pb_depth.set_position(count as u64);
                         Ok(())
                     },
@@ -6473,6 +6750,7 @@ pub fn compute_depth_global(
 fn compute_region_sweep_compact(
     anchor_seq: &str,
     alignments: &[CompactAlignmentInfo],
+    cigars: &[CigarEntry],
     num_samples: usize,
     sample_index: &SampleIndex,
     seq_index: &crate::seqidx::SequenceIndex,
@@ -6505,6 +6783,7 @@ fn compute_region_sweep_compact(
     let mut active_bitmap = SampleBitmap::new(num_samples);
     let mut active_alns: Vec<Vec<usize>> = vec![Vec::new(); num_samples];
     let mut prev_pos: Option<i64> = None;
+    let mut cursors: Vec<Option<CigarCursor>> = vec![None; alignments.len()];
 
     for event in events {
         if let Some(prev) = prev_pos {
@@ -6521,15 +6800,13 @@ fn compute_region_sweep_compact(
                     let sample_name = sample_index.get_name(sample_id).unwrap_or("?");
                     for &idx in alns {
                         let aln = &alignments[idx];
-                        let (q_start, q_end) = map_target_to_query_linear(
-                            &[],
-                            aln.target_start,
-                            aln.target_end,
-                            aln.query_start,
-                            aln.query_end,
+                        let (q_start, q_end) = project_window_for_sweep(
+                            aln,
+                            cigars,
+                            &mut cursors,
+                            idx,
                             prev,
                             event.position,
-                            aln.is_reverse,
                         );
                         let seq_name = seq_index.get_name(aln.query_id).unwrap_or("?");
                         result.add_sample_position(sample_name, seq_name, q_start, q_end);
@@ -6668,6 +6945,9 @@ pub fn query_region_depth(
 
     // Collect all alignments for this region (compact: u16 sample, u32 seq).
     let mut alignments: Vec<CompactAlignmentInfo> = Vec::new();
+    // Per-region CIGAR side-table for hop-0 hits in --use-BFS path. Empty
+    // for non-CIGAR paths; the sweep falls back to linear when empty.
+    let mut cigars: Vec<CigarEntry> = Vec::new();
 
     let is_transitive = config.transitive || config.transitive_dfs;
 
@@ -6684,7 +6964,9 @@ pub fn query_region_depth(
                 config.min_transitive_len,
                 config.min_distance_between_ranges,
                 None,
-                false,
+                // store_cigar=true → carry hop-0 CIGARs for CIGAR-precise
+                // sweep projection (Plan §5 / Method A).
+                true,
                 None,
                 sequence_index,
                 false,
@@ -6700,7 +6982,7 @@ pub fn query_region_depth(
                 config.min_transitive_len,
                 config.min_distance_between_ranges,
                 None,
-                false,
+                true,
                 None,
                 sequence_index,
                 false,
@@ -6761,17 +7043,16 @@ pub fn query_region_depth(
             let q_start = query_interval.first.min(query_interval.last) as i64;
             let q_end = query_interval.first.max(query_interval.last) as i64;
 
-            let (a_start, a_end) = if target_interval.metadata == target_id {
-                let t_start = target_interval.first.min(target_interval.last) as i64;
-                let t_end = target_interval.first.max(target_interval.last) as i64;
-                (t_start.max(region_start), t_end.min(region_end))
+            let is_hop0 = target_interval.metadata == target_id;
+            let hit_t_start = target_interval.first.min(target_interval.last) as i64;
+            let hit_t_end = target_interval.first.max(target_interval.last) as i64;
+            let (a_start, a_end) = if is_hop0 {
+                (hit_t_start.max(region_start), hit_t_end.min(region_end))
             } else {
-                let t_start = target_interval.first.min(target_interval.last) as i64;
-                let t_end = target_interval.first.max(target_interval.last) as i64;
                 let p = project_hop0_coords(
                     seq_anchor_coverage.get(&target_interval.metadata),
-                    t_start,
-                    t_end,
+                    hit_t_start,
+                    hit_t_end,
                     region_start,
                     region_end,
                 );
@@ -6780,8 +7061,8 @@ pub fn query_region_depth(
                     query_sample_id,
                     query_id,
                     target_interval.metadata,
-                    t_start,
-                    t_end,
+                    hit_t_start,
+                    hit_t_end,
                     p.0,
                     p.1
                 );
@@ -6792,7 +7073,26 @@ pub fn query_region_depth(
                 continue;
             }
 
-            alignments.push(CompactAlignmentInfo::new(
+            // Method A: hop-0 hits register a CigarEntry for CIGAR-precise sweep.
+            let cigar_idx = if is_hop0 && !overlap.1.is_empty() {
+                let idx = cigars.len() as u32;
+                cigars.push(CigarEntry {
+                    ops: overlap.1.clone(),
+                    target_start: hit_t_start,
+                    target_end: hit_t_end,
+                    query_start: q_start,
+                    query_end: q_end,
+                    strand: if is_reverse {
+                        Strand::Reverse
+                    } else {
+                        Strand::Forward
+                    },
+                });
+                idx
+            } else {
+                CompactAlignmentInfo::NO_CIGAR
+            };
+            alignments.push(CompactAlignmentInfo::new_with_cigar(
                 query_sample_id,
                 query_id,
                 q_start,
@@ -6800,6 +7100,7 @@ pub fn query_region_depth(
                 a_start,
                 a_end,
                 is_reverse,
+                cigar_idx,
             ));
         }
     } else if is_transitive {
@@ -6907,7 +7208,8 @@ pub fn query_region_depth(
             target_id,
             target_start,
             target_end,
-            false,
+            // store_cigar=true → carry CIGAR for CIGAR-precise sweep.
+            true,
             None,
             sequence_index,
             false,
@@ -6930,7 +7232,28 @@ pub fn query_region_depth(
             let t_start = target_interval.first.min(target_interval.last) as i64;
             let t_end = target_interval.first.max(target_interval.last) as i64;
 
-            alignments.push(CompactAlignmentInfo::new(
+            // Method A: every result from impg.query() is hop-0, so each
+            // carries a direct anchor→query CIGAR — register it for the
+            // CIGAR-precise sweep.
+            let cigar_idx = if !overlap.1.is_empty() {
+                let idx = cigars.len() as u32;
+                cigars.push(CigarEntry {
+                    ops: overlap.1.clone(),
+                    target_start: t_start,
+                    target_end: t_end,
+                    query_start,
+                    query_end,
+                    strand: if is_reverse {
+                        Strand::Reverse
+                    } else {
+                        Strand::Forward
+                    },
+                });
+                idx
+            } else {
+                CompactAlignmentInfo::NO_CIGAR
+            };
+            alignments.push(CompactAlignmentInfo::new_with_cigar(
                 query_sample_id,
                 query_id,
                 query_start,
@@ -6938,6 +7261,7 @@ pub fn query_region_depth(
                 t_start,
                 t_end,
                 is_reverse,
+                cigar_idx,
             ));
         }
     } else {
@@ -7108,6 +7432,7 @@ pub fn query_region_depth(
     let results = compute_region_sweep_compact(
         target_seq,
         &alignments,
+        &cigars,
         num_samples,
         sample_idx,
         impg.seq_index(),
@@ -7963,5 +8288,184 @@ mod tests {
                 assert_intervals_equivalent(&baseline, &streamed);
             }
         }
+    }
+
+    // ===== CigarCursor tests =====
+    // Plan §8 — verify CIGAR-precise window projection for hop-0 hits.
+
+    fn ops_from(spec: &[(char, i32)]) -> Vec<CigarOp> {
+        spec.iter()
+            .map(|&(op, len)| CigarOp::new(len, op))
+            .collect()
+    }
+
+    /// Fresh cursor over a single match — projection should equal the
+    /// requested target sub-range (1-to-1 mapping).
+    #[test]
+    fn test_cigar_cursor_pure_match_forward() {
+        let entry = CigarEntry {
+            ops: ops_from(&[('=', 100)]),
+            target_start: 0,
+            target_end: 100,
+            query_start: 0,
+            query_end: 100,
+            strand: Strand::Forward,
+        };
+        let mut cur = CigarCursor::new(&entry);
+        assert_eq!(cur.project(&entry, 0, 50), Some((0, 50)));
+        // Cursor must move forward — second call from advanced position.
+        assert_eq!(cur.project(&entry, 50, 100), Some((50, 100)));
+    }
+
+    /// Insertion expands the query span at its anchor position.
+    #[test]
+    fn test_cigar_cursor_insertion_forward() {
+        // target [0,20), query [0,25):  10= 5I 10=
+        // target 0..10 ↔ query 0..10, I at anchor=10 → query [10,15),
+        // target 10..20 ↔ query 15..25.
+        let entry = CigarEntry {
+            ops: ops_from(&[('=', 10), ('I', 5), ('=', 10)]),
+            target_start: 0,
+            target_end: 20,
+            query_start: 0,
+            query_end: 25,
+            strand: Strand::Forward,
+        };
+        let mut cur = CigarCursor::new(&entry);
+        // Window [5,15) straddles the I (at anchor 10).
+        // Contributes: first =: q[5,10), I: q[10,15), second =: q[15,20).
+        assert_eq!(cur.project(&entry, 5, 15), Some((5, 20)));
+    }
+
+    /// Deletion contributes no query bases.
+    #[test]
+    fn test_cigar_cursor_deletion_forward() {
+        // target [0,25), query [0,20):  10= 5D 10=
+        // target 0..10 ↔ q 0..10, target 10..15 = D, target 15..25 ↔ q 10..20.
+        let entry = CigarEntry {
+            ops: ops_from(&[('=', 10), ('D', 5), ('=', 10)]),
+            target_start: 0,
+            target_end: 25,
+            query_start: 0,
+            query_end: 20,
+            strand: Strand::Forward,
+        };
+        let mut cur = CigarCursor::new(&entry);
+        // Window [8,17) covers end of first =, all D, start of second =.
+        assert_eq!(cur.project(&entry, 8, 17), Some((8, 12)));
+    }
+
+    /// Window falling entirely inside a D op → None (sweep falls back to linear).
+    #[test]
+    fn test_cigar_cursor_window_inside_deletion() {
+        let entry = CigarEntry {
+            ops: ops_from(&[('=', 10), ('D', 5), ('=', 10)]),
+            target_start: 0,
+            target_end: 25,
+            query_start: 0,
+            query_end: 20,
+            strand: Strand::Forward,
+        };
+        let mut cur = CigarCursor::new(&entry);
+        // Window [12,14) is fully inside D[10,15).
+        assert_eq!(cur.project(&entry, 12, 14), None);
+    }
+
+    /// Reverse strand: query walks down from query_end as target advances.
+    #[test]
+    fn test_cigar_cursor_reverse_strand() {
+        // target [0,20), query [0,25), reverse:  10= 5I 10=
+        // For reverse, query_pos starts at query_end=25 and decreases:
+        //   target [0,10)  ↔ q [15,25)  (q walks 25→15)
+        //   I at target 10 → q [10,15)  (q walks 15→10)
+        //   target [10,20) ↔ q [0,10)   (q walks 10→0)
+        let entry = CigarEntry {
+            ops: ops_from(&[('=', 10), ('I', 5), ('=', 10)]),
+            target_start: 0,
+            target_end: 20,
+            query_start: 0,
+            query_end: 25,
+            strand: Strand::Reverse,
+        };
+        let mut cur = CigarCursor::new(&entry);
+        // Window [5,15):
+        //   target [5,10) → q [15,20)
+        //   I at t=10 → q [10,15)
+        //   target [10,15) → q [5,10)
+        // Union: [5, 20).
+        assert_eq!(cur.project(&entry, 5, 15), Some((5, 20)));
+    }
+
+    /// Monotonic sweep: cursor advances across windows without rescanning
+    /// already-consumed ops. Tests that state is preserved.
+    #[test]
+    fn test_cigar_cursor_monotonic_sweep() {
+        let entry = CigarEntry {
+            ops: ops_from(&[('=', 10), ('I', 5), ('=', 10), ('D', 5), ('=', 10)]),
+            target_start: 0,
+            target_end: 35,
+            query_start: 0,
+            query_end: 35,
+            strand: Strand::Forward,
+        };
+        let mut cur = CigarCursor::new(&entry);
+        // Four contiguous windows; each should return the correct projection.
+        // Independent fresh cursor for ground-truth comparison.
+        for &(t0, t1) in &[(0, 8), (8, 18), (18, 27), (27, 35)] {
+            let mut fresh = CigarCursor::new(&entry);
+            let expected = fresh.project(&entry, t0, t1);
+            let got = cur.project(&entry, t0, t1);
+            assert_eq!(got, expected, "window [{},{}) drift", t0, t1);
+        }
+    }
+
+    /// Pure-D alignment: any window returns None (no query coverage).
+    #[test]
+    fn test_cigar_cursor_all_deletion_returns_none() {
+        let entry = CigarEntry {
+            ops: ops_from(&[('D', 20)]),
+            target_start: 0,
+            target_end: 20,
+            query_start: 5,
+            query_end: 5,
+            strand: Strand::Forward,
+        };
+        let mut cur = CigarCursor::new(&entry);
+        assert_eq!(cur.project(&entry, 0, 20), None);
+    }
+
+    /// project_window_for_sweep: when cigar_idx == NO_CIGAR, falls back to
+    /// linear interpolation regardless of cigars contents.
+    #[test]
+    fn test_project_window_falls_back_when_no_cigar() {
+        let aln = CompactAlignmentInfo::new(0, 0, 0, 100, 0, 100, false);
+        let cigars: Vec<CigarEntry> = Vec::new();
+        let mut cursors: Vec<Option<CigarCursor>> = vec![None];
+        // Linear: [25, 75) over (target [0,100), query [0,100)) → (25, 75).
+        let got = project_window_for_sweep(&aln, &cigars, &mut cursors, 0, 25, 75);
+        assert_eq!(got, (25, 75));
+    }
+
+    /// project_window_for_sweep: with cigar_idx set, projects via CigarCursor.
+    /// Verifies that the helper wires cursor state correctly.
+    #[test]
+    fn test_project_window_uses_cursor_when_cigar_set() {
+        let entry = CigarEntry {
+            ops: ops_from(&[('=', 10), ('I', 5), ('=', 10)]),
+            target_start: 0,
+            target_end: 20,
+            query_start: 0,
+            query_end: 25,
+            strand: Strand::Forward,
+        };
+        let cigars = vec![entry];
+        let aln = CompactAlignmentInfo::new_with_cigar(0, 0, 0, 25, 0, 20, false, 0);
+        let mut cursors: Vec<Option<CigarCursor>> = vec![None];
+        // First window [0, 10): pure first '=' op → q [0, 10).
+        let got = project_window_for_sweep(&aln, &cigars, &mut cursors, 0, 0, 10);
+        assert_eq!(got, (0, 10));
+        // Second window [10, 20): I + second '=' → q [10, 25).
+        let got = project_window_for_sweep(&aln, &cigars, &mut cursors, 0, 10, 20);
+        assert_eq!(got, (10, 25));
     }
 }

@@ -180,7 +180,12 @@ pub trait ImpgIndex: Send + Sync {
     /// Query only alignment intervals that overlap a specific range [start, end) on a target sequence.
     /// Returns raw coordinates without CIGAR projection, using coitrees range query for O(n+k) performance.
     /// Much more efficient than query_raw_intervals() when only a subset of intervals is needed (e.g., BFS).
-    fn query_raw_overlapping(&self, target_id: u32, start: i64, end: i64) -> Vec<RawAlignmentInterval>;
+    fn query_raw_overlapping(
+        &self,
+        target_id: u32,
+        start: i64,
+        end: i64,
+    ) -> Vec<RawAlignmentInterval>;
 
     /// Transient variant of `query_raw_intervals` that MUST NOT populate any
     /// long-lived sub-index or tree cache. `MultiImpg` overrides this to load
@@ -255,11 +260,7 @@ pub trait ImpgIndex: Send + Sync {
     /// is fine for single-file `Impg` but explodes memory for `MultiImpg` with hundreds of
     /// thousands of per-file sub-indices, which is why `MultiImpg` overrides it with a
     /// file-parallel strategy that bounds retained sub-indices to `num_threads`.
-    fn compute_sample_degrees(
-        &self,
-        seq_included: &[bool],
-        seq_to_sample: &[u16],
-    ) -> Vec<u16> {
+    fn compute_sample_degrees(&self, seq_included: &[bool], seq_to_sample: &[u16]) -> Vec<u16> {
         (0..seq_included.len() as u32)
             .into_par_iter()
             .map(|seq_id| {
@@ -587,8 +588,12 @@ impl ImpgIndex for ImpgWrapper {
         query_to_targets: &FxHashMap<u32, Vec<u32>>,
     ) -> Vec<(i64, i64, i64, i64, u32)> {
         match self {
-            ImpgWrapper::Single(impg) => impg.query_reverse_for_depth_with_map(query_id, query_to_targets),
-            ImpgWrapper::Multi(multi) => multi.query_reverse_for_depth_with_map(query_id, query_to_targets),
+            ImpgWrapper::Single(impg) => {
+                impg.query_reverse_for_depth_with_map(query_id, query_to_targets)
+            }
+            ImpgWrapper::Multi(multi) => {
+                multi.query_reverse_for_depth_with_map(query_id, query_to_targets)
+            }
         }
     }
 
@@ -640,7 +645,12 @@ impl ImpgIndex for ImpgWrapper {
         }
     }
 
-    fn query_raw_overlapping(&self, target_id: u32, start: i64, end: i64) -> Vec<RawAlignmentInterval> {
+    fn query_raw_overlapping(
+        &self,
+        target_id: u32,
+        start: i64,
+        end: i64,
+    ) -> Vec<RawAlignmentInterval> {
         match self {
             ImpgWrapper::Single(impg) => impg.query_raw_overlapping(target_id, start, end),
             ImpgWrapper::Multi(multi) => multi.query_raw_overlapping(target_id, start, end),
@@ -663,8 +673,12 @@ impl ImpgIndex for ImpgWrapper {
         end: i64,
     ) -> Vec<RawAlignmentInterval> {
         match self {
-            ImpgWrapper::Single(impg) => impg.query_raw_overlapping_transient(target_id, start, end),
-            ImpgWrapper::Multi(multi) => multi.query_raw_overlapping_transient(target_id, start, end),
+            ImpgWrapper::Single(impg) => {
+                impg.query_raw_overlapping_transient(target_id, start, end)
+            }
+            ImpgWrapper::Multi(multi) => {
+                multi.query_raw_overlapping_transient(target_id, start, end)
+            }
         }
     }
 
@@ -678,11 +692,7 @@ impl ImpgIndex for ImpgWrapper {
         }
     }
 
-    fn compute_sample_degrees(
-        &self,
-        seq_included: &[bool],
-        seq_to_sample: &[u16],
-    ) -> Vec<u16> {
+    fn compute_sample_degrees(&self, seq_included: &[bool], seq_to_sample: &[u16]) -> Vec<u16> {
         match self {
             // Single Impg: default trait impl (parallel-by-target) is already optimal.
             ImpgWrapper::Single(impg) => impg.compute_sample_degrees(seq_included, seq_to_sample),
