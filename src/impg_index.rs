@@ -267,6 +267,47 @@ pub trait ImpgIndex: Send + Sync {
             .collect()
     }
 
+    /// CIGAR-carrying analogue of `batch_query_raw_overlapping`: for each
+    /// `(unified_target_id, start, end)` query, return the projected single-hop
+    /// overlapping alignments (same content as `query`, i.e. `(query_interval,
+    /// cigar, target_interval)` per overlap) WITHOUT any self-interval. When
+    /// `store_cigar` is true the per-overlap CIGAR is reconstructed and carried.
+    ///
+    /// The `MultiImpg` override groups queries by alignment file and loads each
+    /// sub-index transiently exactly once per call, so peak resident sub-indices
+    /// stay bounded regardless of how many regions are batched — this is what
+    /// lets the level-synchronised CIGAR transitive BFS bound memory instead of
+    /// growing the shared sub-index cache by `T × working-set` under concurrent
+    /// chunks.
+    ///
+    /// Default: per-query `query` (single-file `Impg` keeps everything resident,
+    /// so there is no file-sharing to exploit). Errors map to an empty result
+    /// for that query, matching how the raw batch path warns-and-skips.
+    fn batch_query_overlapping_with_cigar(
+        &self,
+        queries: &[(u32, i64, i64)],
+        store_cigar: bool,
+        min_gap_compressed_identity: Option<f64>,
+        sequence_index: Option<&UnifiedSequenceIndex>,
+        approximate_mode: bool,
+    ) -> Vec<Vec<AdjustedInterval>> {
+        queries
+            .iter()
+            .map(|&(target_id, start, end)| {
+                self.query(
+                    target_id,
+                    start,
+                    end,
+                    store_cigar,
+                    min_gap_compressed_identity,
+                    sequence_index,
+                    approximate_mode,
+                )
+                .unwrap_or_default()
+            })
+            .collect()
+    }
+
     /// Pre-scan: for each unified target in `seq_included`, count unique OTHER samples
     /// directly aligned to it. Used by the depth command to auto-detect hub sequences.
     ///
@@ -723,6 +764,34 @@ impl ImpgIndex for ImpgWrapper {
         match self {
             ImpgWrapper::Single(impg) => impg.batch_query_raw_overlapping(queries),
             ImpgWrapper::Multi(multi) => multi.batch_query_raw_overlapping(queries),
+        }
+    }
+
+    fn batch_query_overlapping_with_cigar(
+        &self,
+        queries: &[(u32, i64, i64)],
+        store_cigar: bool,
+        min_gap_compressed_identity: Option<f64>,
+        sequence_index: Option<&UnifiedSequenceIndex>,
+        approximate_mode: bool,
+    ) -> Vec<Vec<AdjustedInterval>> {
+        match self {
+            // Single Impg has everything resident: the trait default (per-query
+            // `query`) is already optimal, no file-sharing to exploit.
+            ImpgWrapper::Single(impg) => impg.batch_query_overlapping_with_cigar(
+                queries,
+                store_cigar,
+                min_gap_compressed_identity,
+                sequence_index,
+                approximate_mode,
+            ),
+            ImpgWrapper::Multi(multi) => multi.batch_query_overlapping_with_cigar(
+                queries,
+                store_cigar,
+                min_gap_compressed_identity,
+                sequence_index,
+                approximate_mode,
+            ),
         }
     }
 

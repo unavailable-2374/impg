@@ -857,6 +857,50 @@ pub(crate) struct CigarEntry {
     pub strand: Strand,
 }
 
+/// Coordinate-compress a CIGAR for sweep-line projection. The depth sweep only
+/// needs to map target positions to query positions, and both consumers —
+/// `CigarCursor::project` and `project_target_range_through_alignment` — branch
+/// solely on `(target_delta, query_delta)`, treating `=`/`X`/`M` identically.
+/// So we coalesce every maximal run of same-class ops (diagonal `=`/`X`/`M` →
+/// `M`, plus runs of `I` and runs of `D`) into a single op, splitting at
+/// `CIGAR_OP_MAX_LEN`. This is lossless for coordinate projection and shrinks
+/// the long-lived `CigarEntry` side-table on mismatch-dense / fragmented (deep
+/// transitive) CIGARs, where op counts dominate memory.
+///
+/// NOTE: only valid for the depth sweep's internal use — it discards the `=`/`X`
+/// distinction, so it must never touch CIGARs that the query command emits to
+/// the user.
+pub(crate) fn coordinate_compress_cigar(ops: &[CigarOp]) -> Vec<CigarOp> {
+    // Map each op to its projection class: diagonal ops collapse to 'M',
+    // insertions/deletions keep their op so the run re-emits the right axis.
+    #[inline]
+    fn class_char(op: &CigarOp) -> char {
+        match op.op() {
+            '=' | 'X' | 'M' => 'M',
+            other => other, // 'I' or 'D'
+        }
+    }
+
+    if ops.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<CigarOp> = Vec::new();
+    let mut run_char = class_char(&ops[0]);
+    let mut run_len: i64 = ops[0].len() as i64;
+    for op in &ops[1..] {
+        let c = class_char(op);
+        if c == run_char {
+            run_len += op.len() as i64;
+        } else {
+            out.extend(CigarOp::new_run(run_len, run_char));
+            run_char = c;
+            run_len = op.len() as i64;
+        }
+    }
+    out.extend(CigarOp::new_run(run_len, run_char));
+    out
+}
+
 /// Forward-only cursor for projecting target sub-ranges through a CIGAR.
 /// Designed for sweep-line use: consecutive `project()` calls must have
 /// non-decreasing `t_start` so the cursor amortizes O(1) per window instead
@@ -3774,8 +3818,10 @@ fn process_anchor_region_transitive_cigar(
         seq_anchor_coverage.len()
     );
 
-    // Pass 2: Process all results for depth
-    for overlap in &overlaps {
+    // Pass 2: Process all results for depth. Consume `overlaps` by value so each
+    // hit's uncompressed CIGAR is freed once it is coordinate-compressed into the
+    // side-table, rather than held alongside the compressed `cigars` table.
+    for overlap in overlaps {
         let query_interval = &overlap.0;
         let target_interval = &overlap.2;
 
@@ -3854,7 +3900,7 @@ fn process_anchor_region_transitive_cigar(
             let cigar_idx = if is_hop0 && !overlap.1.is_empty() {
                 let idx = cigars.len() as u32;
                 cigars.push(CigarEntry {
-                    ops: overlap.1.clone(),
+                    ops: coordinate_compress_cigar(&overlap.1),
                     target_start: hit_t_start,
                     target_end: hit_t_end,
                     query_start,
@@ -7022,8 +7068,11 @@ pub fn query_region_depth(
             seq_anchor_coverage.len()
         );
 
-        // Pass 2: Process all results for depth
-        for overlap in &overlaps {
+        // Pass 2: Process all results for depth. Consume `overlaps` by value so
+        // each hit's (uncompressed) A→C CIGAR is freed as soon as it has been
+        // coordinate-compressed into the side-table, instead of keeping the full
+        // uncompressed `overlaps` alive alongside the compressed `cigars` table.
+        for overlap in overlaps {
             let query_interval = &overlap.0;
             let target_interval = &overlap.2;
 
@@ -7080,7 +7129,7 @@ pub fn query_region_depth(
             let cigar_idx = if is_hop0 && !overlap.1.is_empty() {
                 let idx = cigars.len() as u32;
                 cigars.push(CigarEntry {
-                    ops: overlap.1.clone(),
+                    ops: coordinate_compress_cigar(&overlap.1),
                     target_start: hit_t_start,
                     target_end: hit_t_end,
                     query_start: q_start,
@@ -7218,7 +7267,9 @@ pub fn query_region_depth(
             false,
         )?;
 
-        for overlap in &overlaps {
+        // Consume `overlaps` by value: free each uncompressed CIGAR right after
+        // it is coordinate-compressed into the side-table (see Pass 2 above).
+        for overlap in overlaps {
             let query_interval = &overlap.0;
             let target_interval = &overlap.2;
 
@@ -7241,7 +7292,7 @@ pub fn query_region_depth(
             let cigar_idx = if !overlap.1.is_empty() {
                 let idx = cigars.len() as u32;
                 cigars.push(CigarEntry {
-                    ops: overlap.1.clone(),
+                    ops: coordinate_compress_cigar(&overlap.1),
                     target_start: t_start,
                     target_end: t_end,
                     query_start,
@@ -8470,5 +8521,136 @@ mod tests {
         // Second window [10, 20): I + second '=' → q [10, 25).
         let got = project_window_for_sweep(&aln, &cigars, &mut cursors, 0, 10, 20);
         assert_eq!(got, (10, 25));
+    }
+
+    // ===== coordinate_compress_cigar tests =====
+
+    /// Helper: assert two CIGARs project identically across a panel of windows.
+    fn assert_same_projection(
+        raw: &[CigarOp],
+        compressed: &[CigarOp],
+        t_start: i64,
+        t_end: i64,
+        q_start: i64,
+        q_end: i64,
+        strand: Strand,
+    ) {
+        let raw_entry = CigarEntry {
+            ops: raw.to_vec(),
+            target_start: t_start,
+            target_end: t_end,
+            query_start: q_start,
+            query_end: q_end,
+            strand,
+        };
+        let cmp_entry = CigarEntry {
+            ops: compressed.to_vec(),
+            target_start: t_start,
+            target_end: t_end,
+            query_start: q_start,
+            query_end: q_end,
+            strand,
+        };
+        // Walk a panel of monotonically non-decreasing windows; fresh cursors
+        // each time so we compare the projection itself, not cursor drift.
+        let span = t_end - t_start;
+        for w in 1..=span {
+            let mut a = 0;
+            while a < span {
+                let b = (a + w).min(span);
+                let mut rc = CigarCursor::new(&raw_entry);
+                let mut cc = CigarCursor::new(&cmp_entry);
+                assert_eq!(
+                    rc.project(&raw_entry, t_start + a, t_start + b),
+                    cc.project(&cmp_entry, t_start + a, t_start + b),
+                    "projection drift at window [{},{}) win={}",
+                    t_start + a,
+                    t_start + b,
+                    w
+                );
+                a += w;
+            }
+        }
+    }
+
+    /// =/X/M runs collapse into a single M; op count shrinks, projection holds.
+    #[test]
+    fn test_compress_diagonal_runs() {
+        let raw = ops_from(&[('=', 5), ('X', 1), ('=', 3), ('X', 2), ('M', 4), ('=', 5)]);
+        let compressed = coordinate_compress_cigar(&raw);
+        // All diagonal → single M(20).
+        assert_eq!(compressed.len(), 1);
+        assert_eq!(compressed[0].op(), 'M');
+        assert_eq!(compressed[0].len(), 20);
+        assert_same_projection(&raw, &compressed, 0, 20, 0, 20, Strand::Forward);
+    }
+
+    /// I and D boundaries are preserved; surrounding =/X collapse.
+    #[test]
+    fn test_compress_preserves_indels() {
+        // 5= 1X 4=  5I  3= 2X  4D  6=  (target 0..24, query 0..25)
+        let raw = ops_from(&[
+            ('=', 5),
+            ('X', 1),
+            ('=', 4),
+            ('I', 5),
+            ('=', 3),
+            ('X', 2),
+            ('D', 4),
+            ('=', 6),
+        ]);
+        let compressed = coordinate_compress_cigar(&raw);
+        // Expect: M10 I5 M5 D4 M6
+        let shape: Vec<(char, i32)> = compressed.iter().map(|o| (o.op(), o.len())).collect();
+        assert_eq!(
+            shape,
+            vec![('M', 10), ('I', 5), ('M', 5), ('D', 4), ('M', 6)]
+        );
+        assert_same_projection(&raw, &compressed, 0, 24, 0, 25, Strand::Forward);
+        assert_same_projection(&raw, &compressed, 0, 24, 0, 25, Strand::Reverse);
+    }
+
+    /// Consecutive same-class indels coalesce too (I3 I2 → I5, D3 D2 → D5).
+    #[test]
+    fn test_compress_coalesces_same_class_indels() {
+        let raw = ops_from(&[
+            ('=', 4),
+            ('I', 3),
+            ('I', 2),
+            ('=', 4),
+            ('D', 3),
+            ('D', 2),
+            ('=', 4),
+        ]);
+        let compressed = coordinate_compress_cigar(&raw);
+        let shape: Vec<(char, i32)> = compressed.iter().map(|o| (o.op(), o.len())).collect();
+        assert_eq!(
+            shape,
+            vec![('M', 4), ('I', 5), ('M', 4), ('D', 5), ('M', 4)]
+        );
+        assert_same_projection(&raw, &compressed, 0, 12, 0, 13, Strand::Forward);
+    }
+
+    /// Empty input → empty output (no panic).
+    #[test]
+    fn test_compress_empty() {
+        assert!(coordinate_compress_cigar(&[]).is_empty());
+    }
+
+    /// Runs longer than CIGAR_OP_MAX_LEN split into multiple capped ops but
+    /// still sum to the original diagonal length.
+    #[test]
+    fn test_compress_respects_op_max_len() {
+        use crate::impg::CIGAR_OP_MAX_LEN;
+        // Two diagonal ops whose combined length exceeds the 29-bit cap.
+        let big = (CIGAR_OP_MAX_LEN - 10) as i32;
+        let raw = ops_from(&[('=', big), ('X', 100)]);
+        let compressed = coordinate_compress_cigar(&raw);
+        let total: i64 = compressed.iter().map(|o| o.len() as i64).sum();
+        assert_eq!(total, big as i64 + 100);
+        assert!(compressed.iter().all(|o| o.op() == 'M'));
+        assert!(compressed
+            .iter()
+            .all(|o| (o.len() as i64) <= CIGAR_OP_MAX_LEN));
     }
 }

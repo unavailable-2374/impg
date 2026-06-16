@@ -1635,6 +1635,99 @@ impl ImpgIndex for MultiImpg {
 
         results.into_iter().map(|m| m.into_inner()).collect()
     }
+
+    /// CIGAR-carrying batch projected query. Same file-grouped, transient,
+    /// load-once-per-file structure as `batch_query_raw_overlapping`, but runs
+    /// the full single-hop projection (`Impg::query`, with CIGAR when
+    /// `store_cigar`) on each loaded sub-index and translates results to unified
+    /// IDs. Produces, per query, the same projected overlaps `Impg::query` would
+    /// (minus the self-interval, which the BFS driver adds once), so a
+    /// level-synchronised transitive driver can bound peak resident sub-indices
+    /// to the file-parallel working set instead of the cached
+    /// `T × working-set` of the per-chunk `query_all_indices` path.
+    fn batch_query_overlapping_with_cigar(
+        &self,
+        queries: &[(u32, i64, i64)],
+        store_cigar: bool,
+        min_gap_compressed_identity: Option<f64>,
+        sequence_index: Option<&UnifiedSequenceIndex>,
+        approximate_mode: bool,
+    ) -> Vec<Vec<AdjustedInterval>> {
+        let n = queries.len();
+        if n == 0 {
+            return Vec::new();
+        }
+
+        // Group: file_idx → Vec<(query_idx, local_target_id, start, end)>
+        let mut by_file: FxHashMap<usize, Vec<(usize, u32, i64, i64)>> = FxHashMap::default();
+        for (qi, &(unified_target_id, start, end)) in queries.iter().enumerate() {
+            if let Some(locs) = self.forest_map.get(&unified_target_id) {
+                for loc in locs {
+                    by_file.entry(loc.index_idx()).or_default().push((
+                        qi,
+                        loc.local_target_id(),
+                        start,
+                        end,
+                    ));
+                }
+            }
+        }
+
+        let results: Vec<PlMutex<Vec<AdjustedInterval>>> =
+            (0..n).map(|_| PlMutex::new(Vec::new())).collect();
+
+        let mut file_order: Vec<usize> = by_file.keys().copied().collect();
+        file_order.sort_unstable();
+
+        file_order.par_iter().for_each(|&file_idx| {
+            let file_queries = &by_file[&file_idx];
+            let impg = match self.load_sub_index_transient(file_idx) {
+                Ok(i) => i,
+                Err(e) => {
+                    warn!(
+                        "batch_query_overlapping_with_cigar: failed to load {:?}: {}",
+                        self.index_paths[file_idx], e
+                    );
+                    return;
+                }
+            };
+
+            for &(qi, local_target_id, start, end) in file_queries {
+                let local_results = impg.query(
+                    local_target_id,
+                    start,
+                    end,
+                    store_cigar,
+                    min_gap_compressed_identity,
+                    sequence_index,
+                    approximate_mode,
+                );
+                // Translate to unified IDs, dropping the self-interval: the
+                // driver owns self-interval handling (matches query_all_indices
+                // / batch_depth_bfs, where the self row is added once per hop).
+                let mut local: Vec<AdjustedInterval> = Vec::with_capacity(local_results.len());
+                for r in local_results {
+                    if let Some(t) = self.translate_to_unified(r, file_idx) {
+                        if t.0.metadata == t.2.metadata
+                            && t.0.first == start
+                            && t.0.last == end
+                            && t.2.metadata == queries[qi].0
+                        {
+                            // Self-interval — skip; driver adds it.
+                            continue;
+                        }
+                        local.push(t);
+                    }
+                }
+                if !local.is_empty() {
+                    results[qi].lock().append(&mut local);
+                }
+            }
+            // impg dropped here — sub-index freed immediately.
+        });
+
+        results.into_iter().map(|m| m.into_inner()).collect()
+    }
 }
 
 impl MultiImpg {
