@@ -157,6 +157,37 @@ pub struct MultiImpg {
     /// Lazily-loaded sub-indices (only loaded when tree data is needed)
     sub_indices: RwLock<Vec<Option<Arc<Impg>>>>,
 
+    /// Number of populated (`Some`) slots in `sub_indices`.
+    ///
+    /// Mirrors `transient_cache_count` but guards the BFS/transitive cache.
+    /// Maintained under the `sub_indices` write lock so it stays consistent
+    /// with the actual slot population without an O(num_indices) scan per miss.
+    sub_index_cache_count: AtomicUsize,
+
+    /// Soft upper bound on `sub_index_cache_count`. When a fresh `get_sub_index`
+    /// miss would push residency above this, every slot is evicted before the
+    /// new one is stored.
+    ///
+    /// Why this matters: the CIGAR-precise transitive depth path
+    /// (`--cigar-precise` / `--use-BFS`) keeps tree caching ON for re-use across
+    /// BFS hops (see `depth.rs` `set_tree_cache_enabled(true)`), and
+    /// `clear_sub_index_cache()` only fires at the *end* of Phase 1. With
+    /// hundreds of thousands of per-file indices that means `sub_indices` grows
+    /// monotonically toward "every file" mid-phase — each tree-pinned `Arc<Impg>`
+    /// backs several mmap'd allocations, so residency blows past the kernel
+    /// `vm.max_map_count` limit (default 65530 on Linux) and the allocator
+    /// aborts with `memory allocation of N bytes failed` long before RSS nears
+    /// the host limit. Bounding residency trades a periodic header/tree reload
+    /// for survival on these workloads. Eviction is transparent to query
+    /// results (it only forces a reload), so output is byte-identical to the
+    /// unbounded path.
+    ///
+    /// Tunable via `IMPG_SUB_INDEX_CACHE_LIMIT` (number of slots). Default:
+    /// `min(num_indices, 8192)`. Set to `0` to disable bounding (recovers the
+    /// prior unbounded behaviour). For typical single-region queries this is
+    /// never reached, so their cached-tree re-use is unchanged.
+    sub_index_cache_limit: usize,
+
     /// Per-file lazy header cache for the **transient** query path.
     ///
     /// Each slot holds an `Arc<Impg>` parsed from one alignment file's index
@@ -234,6 +265,27 @@ fn resolve_transient_cache_limit(num_indices: usize) -> usize {
     // when several internal allocations per cached Impg back into mmap, and
     // is large enough that file-locality re-hits dominate at chunked depth
     // workloads on per-file indices in the few-thousand-files regime.
+    num_indices.min(8192)
+}
+
+/// Resolve the BFS/transitive sub-index cache size limit from the environment.
+/// Returns `0` to mean "unbounded" (legacy behaviour). Mirrors
+/// `resolve_transient_cache_limit` but for the `sub_indices` cache.
+fn resolve_sub_index_cache_limit(num_indices: usize) -> usize {
+    if let Ok(s) = std::env::var("IMPG_SUB_INDEX_CACHE_LIMIT") {
+        if let Ok(v) = s.parse::<usize>() {
+            return v;
+        } else {
+            warn!(
+                "IMPG_SUB_INDEX_CACHE_LIMIT='{}' is not a non-negative integer; using default",
+                s
+            );
+        }
+    }
+    // Same default rationale as the transient header cache: bound resident
+    // tree-pinned sub-indices to keep mmap pressure under vm.max_map_count at
+    // hundreds-of-thousands-of-files scale, while staying high enough that
+    // ordinary few-thousand-file workloads never evict.
     num_indices.min(8192)
 }
 
@@ -325,6 +377,8 @@ impl MultiImpg {
             sequence_files: sequence_files.map(|s| s.to_vec()).unwrap_or_default(),
             local_to_unified,
             sub_indices: RwLock::new(vec![None; num_indices]),
+            sub_index_cache_count: AtomicUsize::new(0),
+            sub_index_cache_limit: resolve_sub_index_cache_limit(num_indices),
             transient_header_cache: (0..num_indices).map(|_| PlMutex::new(None)).collect(),
             transient_cache_count: AtomicUsize::new(0),
             transient_cache_limit: resolve_transient_cache_limit(num_indices),
@@ -438,6 +492,8 @@ impl MultiImpg {
             sequence_files: sequence_files.map(|s| s.to_vec()).unwrap_or_default(),
             local_to_unified: cache.local_to_unified,
             sub_indices: RwLock::new(vec![None; num_indices]),
+            sub_index_cache_count: AtomicUsize::new(0),
+            sub_index_cache_limit: resolve_sub_index_cache_limit(num_indices),
             transient_header_cache: (0..num_indices).map(|_| PlMutex::new(None)).collect(),
             transient_cache_count: AtomicUsize::new(0),
             transient_cache_limit: resolve_transient_cache_limit(num_indices),
@@ -581,9 +637,35 @@ impl MultiImpg {
             .load(std::sync::atomic::Ordering::Relaxed);
         impg.set_tree_cache_enabled(cache_enabled);
 
-        // Store in sub-index cache
+        // Store in sub-index cache, bounding residency to keep mmap pressure
+        // under vm.max_map_count at hundreds-of-thousands-of-files scale.
         {
             let mut indices = self.sub_indices.write().unwrap();
+
+            // If storing a brand-new resident would exceed the soft cap, evict
+            // every slot first. Doing this under the same write lock that
+            // mutates the slots keeps `sub_index_cache_count` exact and means we
+            // never hold cap+1 entries. Eviction only drops cache references —
+            // any `Arc<Impg>` already handed to an in-flight query stays alive
+            // until that query drops it — so this is transparent to results.
+            let was_empty = indices[index_idx].is_none();
+            if was_empty
+                && self.sub_index_cache_limit > 0
+                && self.sub_index_cache_count.load(AtomicOrdering::Relaxed)
+                    >= self.sub_index_cache_limit
+            {
+                for slot in indices.iter_mut() {
+                    *slot = None;
+                }
+                self.sub_index_cache_count.store(0, AtomicOrdering::Relaxed);
+            }
+
+            // Count only genuine None -> Some transitions (a racing thread may
+            // have populated this slot before we took the lock).
+            if indices[index_idx].is_none() {
+                self.sub_index_cache_count
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
             indices[index_idx] = Some(Arc::clone(&impg));
         }
 
@@ -1144,6 +1226,7 @@ impl ImpgIndex for MultiImpg {
         for slot in indices.iter_mut() {
             *slot = None;
         }
+        self.sub_index_cache_count.store(0, AtomicOrdering::Relaxed);
     }
 
     fn clear_transient_header_cache(&self) {
