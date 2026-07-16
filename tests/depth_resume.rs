@@ -382,6 +382,53 @@ fn nontrans_cigar_phase2_suppresses_mutually_covered_candidate() {
 }
 
 #[test]
+fn phase2_locality_waves_mask_mutual_candidates_in_all_remaining_modes() {
+    let tmp = TempDir::new().unwrap();
+    let alist = build_phase2_mutual_coverage_dataset(tmp.path());
+    let bin = impg_binary();
+    let modes: [(&str, &[&str]); 3] = [
+        ("raw_nontrans", &[]),
+        ("raw_transitive", &["-x", "--min-transitive-len", "100"]),
+        (
+            "cigar_transitive",
+            &["-x", "--use-BFS", "--min-transitive-len", "100"],
+        ),
+    ];
+
+    for (label, args) in modes {
+        let prefix = tmp.path().join(label);
+        let mut cmd = Command::new(&bin);
+        cmd.arg("depth")
+            .arg("--alignment-list")
+            .arg(&alist)
+            .arg("-O")
+            .arg(&prefix)
+            .arg("--ref")
+            .arg("sampleR")
+            .arg("-t")
+            .arg("4")
+            .arg("--phase2-max-waves")
+            .arg("64");
+        cmd.args(args);
+        let out = cmd.output().expect("spawn impg");
+        assert!(
+            out.status.success(),
+            "{label} mutual Phase-2 TEST run failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let tsv = PathBuf::from(format!("{}.depth.tsv", prefix.display()));
+        let tsv_text = fs::read_to_string(&tsv).expect("read TEST depth TSV");
+        assert_eq!(
+            tsv_body_line_count(&tsv),
+            2,
+            "{label}: expected one sampleR/sampleD anchor and exactly one sampleB/sampleC anchor; stderr:\n{}\nTSV:\n{}",
+            String::from_utf8_lossy(&out.stderr),
+            tsv_text,
+        );
+    }
+}
+
+#[test]
 fn resume_transitive_cigar_phase2_file_first_matches_baseline() {
     let tmp = TempDir::new().unwrap();
     let alist = build_phase2_mutual_coverage_dataset(tmp.path());

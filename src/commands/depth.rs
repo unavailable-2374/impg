@@ -61,6 +61,9 @@ pub struct DepthConfig {
     /// When true, use CIGAR-precise BFS for transitive depth (--use-BFS).
     /// When false (default), use raw-interval BFS with linear interpolation.
     pub use_cigar_bfs: bool,
+    /// Maximum number of locality-aware Phase-2 waves. The final wave is a
+    /// fallback containing all residual sequences; 1 disables wave splitting.
+    pub phase2_max_waves: usize,
     /// Statistics need the union length of every projected query interval.
     /// Ordinary TSV output only consumes the representative sample position,
     /// so disabling this avoids a sort/merge pass per sample and depth segment.
@@ -2337,6 +2340,31 @@ impl ConcurrentProcessedTracker {
         unprocessed.intervals().collect()
     }
 
+    /// Return whether any base in `[start, end)` is still available as an
+    /// anchor, without allocating the explicit gap vector. Phase-2 wave
+    /// boundaries use this to discard sequences fully masked by earlier waves.
+    fn has_unprocessed(&self, seq_id: u32, start: i64, end: i64) -> bool {
+        if start >= end {
+            return false;
+        }
+        let lock = self.processed[seq_id as usize].lock();
+        if lock.is_empty() {
+            return true;
+        }
+        let mut covered = 0i64;
+        for (s, e) in lock.iter_overlapping(start, end) {
+            let clipped_start = s.max(start);
+            let clipped_end = e.min(end);
+            if clipped_end > clipped_start {
+                covered += clipped_end - clipped_start;
+                if covered >= end - start {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Mark a region as processed
     fn mark_processed(&self, seq_id: u32, start: i64, end: i64) {
         let mut lock = self.processed[seq_id as usize].lock();
@@ -2738,6 +2766,67 @@ fn build_sequence_order(
         .into_iter()
         .map(|(seq_id, _, _, _)| seq_id)
         .collect()
+}
+
+/// Build locality-aware Phase-2 waves while preserving the existing
+/// degree/length priority within every alignment-file connectivity component.
+///
+/// One sequence per component is admitted to each selective wave. After a
+/// wave finishes, callers re-read `ConcurrentProcessedTracker`; homologous
+/// regions discovered by the earlier anchor are therefore masked before the
+/// next sequence from the same component is queried. The final wave contains
+/// every remaining sequence when `max_waves` would otherwise be exceeded,
+/// preventing a dense component with weak alignments from degenerating into
+/// hundreds of thousands of global barriers.
+fn build_phase2_waves(
+    sequence_order: &[u32],
+    component_labels: &[u32],
+    max_waves: usize,
+) -> Vec<Vec<u32>> {
+    if sequence_order.is_empty() {
+        return Vec::new();
+    }
+    if component_labels.len() != sequence_order.len() || max_waves <= 1 {
+        return vec![sequence_order.to_vec()];
+    }
+
+    let mut component_to_group: FxHashMap<u32, usize> = FxHashMap::default();
+    let mut groups: Vec<Vec<u32>> = Vec::new();
+    for (&seq_id, &component) in sequence_order.iter().zip(component_labels) {
+        let next_group = groups.len();
+        let group_idx = *component_to_group.entry(component).or_insert(next_group);
+        if group_idx == next_group {
+            groups.push(Vec::new());
+        }
+        groups[group_idx].push(seq_id);
+    }
+
+    let selective_waves = max_waves.saturating_sub(1);
+    let max_group_len = groups.iter().map(Vec::len).max().unwrap_or(0);
+    let mut waves = Vec::new();
+    let emitted_selective = selective_waves.min(max_group_len);
+    for rank in 0..emitted_selective {
+        let wave: Vec<u32> = groups
+            .iter()
+            .filter_map(|group| group.get(rank).copied())
+            .collect();
+        if !wave.is_empty() {
+            waves.push(wave);
+        }
+    }
+
+    if max_group_len > emitted_selective {
+        let scheduled: FxHashSet<u32> = waves.iter().flatten().copied().collect();
+        let fallback: Vec<u32> = sequence_order
+            .iter()
+            .copied()
+            .filter(|seq_id| !scheduled.contains(seq_id))
+            .collect();
+        if !fallback.is_empty() {
+            waves.push(fallback);
+        }
+    }
+    waves
 }
 
 /// Result of processing a single anchor region
@@ -5824,6 +5913,7 @@ pub fn compute_depth_global(
             transitive: config.transitive,
             transitive_dfs: config.transitive_dfs,
             max_depth: config.max_depth,
+            phase2_max_waves: config.phase2_max_waves,
             min_transitive_len: config.min_transitive_len,
             min_distance_between_ranges: config.min_distance_between_ranges,
         },
@@ -6190,6 +6280,32 @@ pub fn compute_depth_global(
             (Vec::new(), sequence_order.clone())
         }
     };
+
+    // Convert the monolithic Phase 2 into a bounded sequence of Phase-1-like
+    // waves. MultiImpg uses the sequence↔alignment-file incidence graph;
+    // single-file Impg uses direct alignment adjacency. Both exclude Phase-1
+    // sequences so an already-processed hub cannot join independent leaf
+    // components through itself.
+    let phase2_component_labels = impg.depth_locality_components(&phase2_seqs);
+    let phase2_waves = build_phase2_waves(
+        &phase2_seqs,
+        &phase2_component_labels,
+        config.phase2_max_waves,
+    );
+    if phase2_waves.len() > 1 {
+        let component_count = phase2_component_labels
+            .iter()
+            .copied()
+            .collect::<FxHashSet<_>>()
+            .len();
+        info!(
+            "Phase 2 locality scheduler: {} sequences, {} file-connected components, {} waves (cap {})",
+            phase2_seqs.len(),
+            component_count,
+            phase2_waves.len(),
+            config.phase2_max_waves,
+        );
+    }
 
     let processed_count = AtomicUsize::new(0);
     let row_counter = AtomicUsize::new(
@@ -7026,12 +7142,6 @@ pub fn compute_depth_global(
     //     manages its own sub-index cache. Restructuring it would require
     //     also rewriting the BFS state plumbing — out of scope here.
     // =========================================================================
-    let phase2_label = if phase1_seqs.is_empty() {
-        ""
-    } else {
-        "Phase 2: "
-    };
-
     if !is_transitive && !config.use_cigar_bfs {
         // Raw non-transitive Phase 2 (default). CIGAR-precise hop-0 falls through
         // to the `else if config.use_cigar_bfs` branch below, which drives each
@@ -7044,51 +7154,15 @@ pub fn compute_depth_global(
         // spend wall time rebuilding/skipping work instead of advancing. A
         // fixed tile processes whatever unprocessed gaps still exist inside
         // [tile_start, tile_end), and commits one stable tile id when done.
-        let mut phase2_tiles: Vec<(u32, i64, i64)> = Vec::new();
-        let mut completed_tiles_skipped: usize = 0;
-        for &seq_id in &phase2_seqs {
-            let seq_len = compact_lengths.get_length(seq_id);
-            if seq_len <= 0 {
-                continue;
-            }
-            let mut tile_start = 0i64;
-            while tile_start < seq_len {
-                let tile_end = (tile_start + TRANSITIVE_CHUNK_SIZE).min(seq_len);
-                let tile_id = encode_chunk_id_phase2_tile(seq_id, tile_start);
-                if work_log_active && completed_chunks.contains(&tile_id) {
-                    completed_tiles_skipped += 1;
-                } else if !tracker
-                    .get_unprocessed(seq_id, tile_start, tile_end)
-                    .is_empty()
-                {
-                    phase2_tiles.push((seq_id, tile_start, tile_end));
-                }
-                tile_start = tile_end;
-            }
-        }
-
-        info!(
-            "Phase 2: {} sequences split into {} active fixed {}-MB tiles ({} already committed)",
-            phase2_seqs.len(),
-            phase2_tiles.len(),
-            TRANSITIVE_CHUNK_SIZE / 1_000_000,
-            completed_tiles_skipped,
-        );
-
-        let pb_depth = ProgressBar::new((phase2_tiles.len() + completed_tiles_skipped) as u64);
+        let pb_depth = ProgressBar::new_spinner();
         pb_depth.set_style(
-            ProgressStyle::default_bar()
-                .template(&format!(
-                    "{{spinner:.green}} [{{elapsed_precise}}] [{{wide_bar:.cyan/blue}}] {{pos}}/{{len}} tiles ({{eta}}) | {}remaining sequences",
-                    phase2_label
-                ))
-                .unwrap()
-                .progress_chars("#>-")
+            ProgressStyle::default_spinner()
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] {pos} tiles | Phase 2 locality waves",
+                )
+                .unwrap(),
         );
-        let phase2_tile_count = AtomicUsize::new(completed_tiles_skipped);
-        if completed_tiles_skipped > 0 {
-            pb_depth.set_position(completed_tiles_skipped as u64);
-        }
+        let phase2_tile_count = AtomicUsize::new(0);
 
         // Two-phase batched architecture mirroring Phase 1 transitive
         // (`batch_depth_bfs`):
@@ -7115,146 +7189,186 @@ pub fn compute_depth_global(
         const PHASE2_BATCH_SIZE: usize = 65_536;
         let phase2_batch_size = PHASE2_BATCH_SIZE;
 
-        for batch in phase2_tiles.chunks(phase2_batch_size) {
-            // Defensive re-filter: a tile may have been committed by a newer
-            // checkpoint format even if it was present in an older replay-built
-            // active list.
-            let live_batch: Vec<(u32, i64, i64)> = if work_log_active {
-                batch
-                    .iter()
-                    .copied()
-                    .filter(|&(seq_id, tile_start, _)| {
-                        !completed_chunks.contains(&encode_chunk_id_phase2_tile(seq_id, tile_start))
-                    })
-                    .collect()
-            } else {
-                batch.to_vec()
-            };
-            let skipped = batch.len() - live_batch.len();
-            if skipped > 0 {
-                let count = phase2_tile_count.fetch_add(skipped, Ordering::Relaxed) + skipped;
+        for (wave_idx, wave_sequences) in phase2_waves.iter().enumerate() {
+            // Rebuild work only after the preceding wave has committed its
+            // discovered regions. This is the mask barrier that turns Phase 2
+            // into successive Phase-1-like anchor passes.
+            let mut phase2_tiles: Vec<(u32, i64, i64)> = Vec::new();
+            let mut completed_tiles_skipped: usize = 0;
+            for &seq_id in wave_sequences {
+                let seq_len = compact_lengths.get_length(seq_id);
+                if seq_len <= 0 || !tracker.has_unprocessed(seq_id, 0, seq_len) {
+                    continue;
+                }
+                let mut tile_start = 0i64;
+                while tile_start < seq_len {
+                    let tile_end = (tile_start + TRANSITIVE_CHUNK_SIZE).min(seq_len);
+                    let tile_id = encode_chunk_id_phase2_tile(seq_id, tile_start);
+                    if work_log_active && completed_chunks.contains(&tile_id) {
+                        completed_tiles_skipped += 1;
+                    } else if tracker.has_unprocessed(seq_id, tile_start, tile_end) {
+                        phase2_tiles.push((seq_id, tile_start, tile_end));
+                    }
+                    tile_start = tile_end;
+                }
+            }
+            if completed_tiles_skipped > 0 {
+                let count = phase2_tile_count.fetch_add(completed_tiles_skipped, Ordering::Relaxed)
+                    + completed_tiles_skipped;
                 pb_depth.set_position(count as u64);
             }
-            if live_batch.is_empty() {
-                continue;
-            }
+            info!(
+                "Phase 2 wave {}/{}: {} candidate sequences -> {} active fixed {}-MB tiles ({} already committed)",
+                wave_idx + 1,
+                phase2_waves.len(),
+                wave_sequences.len(),
+                phase2_tiles.len(),
+                TRANSITIVE_CHUNK_SIZE / 1_000_000,
+                completed_tiles_skipped,
+            );
 
-            // Phase A: file-grouped batch query. `batch_query_raw_overlapping`
-            // is internally rayon-parallel across files; each file is loaded
-            // transiently, answers all of its queries, then is freed.
-            let queries: Vec<(u32, i64, i64)> = live_batch.clone();
-            let all_alns = impg.batch_query_raw_overlapping(&queries)?;
+            for batch in phase2_tiles.chunks(phase2_batch_size) {
+                // Defensive re-filter: a tile may have been committed by a newer
+                // checkpoint format even if it was present in an older replay-built
+                // active list.
+                let live_batch: Vec<(u32, i64, i64)> = if work_log_active {
+                    batch
+                        .iter()
+                        .copied()
+                        .filter(|&(seq_id, tile_start, _)| {
+                            !completed_chunks
+                                .contains(&encode_chunk_id_phase2_tile(seq_id, tile_start))
+                        })
+                        .collect()
+                } else {
+                    batch.to_vec()
+                };
+                let skipped = batch.len() - live_batch.len();
+                if skipped > 0 {
+                    let count = phase2_tile_count.fetch_add(skipped, Ordering::Relaxed) + skipped;
+                    pb_depth.set_position(count as u64);
+                }
+                if live_batch.is_empty() {
+                    continue;
+                }
 
-            // Phase B: parallel sweep + emit.
-            live_batch
-                .par_iter()
-                .zip(all_alns.into_par_iter())
-                .try_for_each(
-                    |(&(seq_id, tile_start, tile_end), mut raw_alns)| -> io::Result<()> {
-                        // Hold the chunk-in-flight read guard for the duration
-                        // during which mid-chunk TSV bytes may enter the writer
-                        // channel; released before `note_chunk_done` so a
-                        // commit-side write barrier can proceed.
-                        let chunk_guard = checkpoint_ctrl.begin_chunk();
-                        let sample_id = compact_lengths.get_sample_id(seq_id);
+                // Phase A: file-grouped batch query. `batch_query_raw_overlapping`
+                // is internally rayon-parallel across files; each file is loaded
+                // transiently, answers all of its queries, then is freed.
+                let queries: Vec<(u32, i64, i64)> = live_batch.clone();
+                let all_alns = impg.batch_query_raw_overlapping(&queries)?;
 
-                        if min_seq_length > 0 {
-                            raw_alns.retain(|aln| {
-                                seq_included
-                                    .get(aln.query_id as usize)
-                                    .copied()
-                                    .unwrap_or(false)
-                            });
-                        }
-                        raw_alns.sort_unstable_by_key(|aln| aln.target_start);
+                // Phase B: parallel sweep + emit.
+                live_batch
+                    .par_iter()
+                    .zip(all_alns.into_par_iter())
+                    .try_for_each(
+                        |(&(seq_id, tile_start, tile_end), mut raw_alns)| -> io::Result<()> {
+                            // Hold the chunk-in-flight read guard for the duration
+                            // during which mid-chunk TSV bytes may enter the writer
+                            // channel; released before `note_chunk_done` so a
+                            // commit-side write barrier can proceed.
+                            let chunk_guard = checkpoint_ctrl.begin_chunk();
+                            let sample_id = compact_lengths.get_sample_id(seq_id);
 
-                        let seq_name = impg.seq_index().get_name(seq_id).unwrap_or("?");
-                        let should_output = if ref_only {
-                            ref_sample_id == Some(sample_id)
-                        } else {
-                            true
-                        };
+                            if min_seq_length > 0 {
+                                raw_alns.retain(|aln| {
+                                    seq_included
+                                        .get(aln.query_id as usize)
+                                        .copied()
+                                        .unwrap_or(false)
+                                });
+                            }
+                            raw_alns.sort_unstable_by_key(|aln| aln.target_start);
 
-                        let mut tile_tsv: Vec<u8> = Vec::new();
-                        let mut tile_discovered: Vec<(u32, i64, i64)> = Vec::new();
-                        let unprocessed = tracker.get_unprocessed(seq_id, tile_start, tile_end);
-                        for (region_start, region_end) in unprocessed {
-                            let mut emitter = StreamingDepthEmitter {
-                                buf: Vec::new(),
-                                writer: &writer,
-                                seq_name,
-                                anchor_sample_id: sample_id,
-                                seq_index: impg.seq_index(),
-                                row_counter: &row_counter,
-                                should_output,
-                                stats_mode,
-                                local_stats: if stats_accumulator.is_some() {
-                                    Some(DepthStats::new())
-                                } else {
-                                    None
-                                },
-                                local_combined: if stats_combined_acc.is_some() {
-                                    Some(DepthStatsWithSamples::new())
-                                } else {
-                                    None
-                                },
-                                sample_index: &sample_index,
-                                min_interval_len,
-                                seq_intervals: Vec::new(),
-                                pending: None,
-                                window_size: if user_window_size.is_some() {
-                                    Some(window_size)
-                                } else {
-                                    None
-                                },
-                                // `defer_buf_flush` only governs whether the
-                                // tile's trailing bytes are flushed by
-                                // `emitter.flush()` itself or held for
-                                // `take_buf` + the tile work-log record. Mid-
-                                // tile 4 MB auto-flushes happen
-                                // unconditionally and are protected by the
-                                // chunk-freeze barrier.
-                                defer_buf_flush: work_log_active,
+                            let seq_name = impg.seq_index().get_name(seq_id).unwrap_or("?");
+                            let should_output = if ref_only {
+                                ref_sample_id == Some(sample_id)
+                            } else {
+                                true
                             };
 
-                            let discovered = process_anchor_region_raw_streaming(
-                                &raw_alns,
-                                &compact_lengths,
-                                num_samples,
-                                seq_id,
-                                sample_id,
-                                region_start,
-                                region_end,
-                                &global_used,
-                                config.compute_pangenome_bases,
-                                &mut |interval| emitter.emit(interval),
-                            );
-                            emitter.flush()?;
+                            let mut tile_tsv: Vec<u8> = Vec::new();
+                            let mut tile_discovered: Vec<(u32, i64, i64)> = Vec::new();
+                            let unprocessed = tracker.get_unprocessed(seq_id, tile_start, tile_end);
+                            for (region_start, region_end) in unprocessed {
+                                let mut emitter = StreamingDepthEmitter {
+                                    buf: Vec::new(),
+                                    writer: &writer,
+                                    seq_name,
+                                    anchor_sample_id: sample_id,
+                                    seq_index: impg.seq_index(),
+                                    row_counter: &row_counter,
+                                    should_output,
+                                    stats_mode,
+                                    local_stats: if stats_accumulator.is_some() {
+                                        Some(DepthStats::new())
+                                    } else {
+                                        None
+                                    },
+                                    local_combined: if stats_combined_acc.is_some() {
+                                        Some(DepthStatsWithSamples::new())
+                                    } else {
+                                        None
+                                    },
+                                    sample_index: &sample_index,
+                                    min_interval_len,
+                                    seq_intervals: Vec::new(),
+                                    pending: None,
+                                    window_size: if user_window_size.is_some() {
+                                        Some(window_size)
+                                    } else {
+                                        None
+                                    },
+                                    // `defer_buf_flush` only governs whether the
+                                    // tile's trailing bytes are flushed by
+                                    // `emitter.flush()` itself or held for
+                                    // `take_buf` + the tile work-log record. Mid-
+                                    // tile 4 MB auto-flushes happen
+                                    // unconditionally and are protected by the
+                                    // chunk-freeze barrier.
+                                    defer_buf_flush: work_log_active,
+                                };
+
+                                let discovered = process_anchor_region_raw_streaming(
+                                    &raw_alns,
+                                    &compact_lengths,
+                                    num_samples,
+                                    seq_id,
+                                    sample_id,
+                                    region_start,
+                                    region_end,
+                                    &global_used,
+                                    config.compute_pangenome_bases,
+                                    &mut |interval| emitter.emit(interval),
+                                );
+                                emitter.flush()?;
+                                if work_log_active {
+                                    tile_tsv.extend(emitter.take_buf());
+                                }
+                                tracker.mark_processed_batch(&discovered);
+                                tile_discovered.extend(discovered);
+                                emitter.merge_stats_into(&stats_accumulator, &stats_combined_acc);
+                            }
+
                             if work_log_active {
-                                tile_tsv.extend(emitter.take_buf());
+                                let tile_id = encode_chunk_id_phase2_tile(seq_id, tile_start);
+                                let work_buf = encode_work_record(tile_id, &tile_discovered);
+                                if let Some(ref w) = writer {
+                                    w.send_chunk_bundle(tile_tsv, work_buf)?;
+                                }
                             }
-                            tracker.mark_processed_batch(&discovered);
-                            tile_discovered.extend(discovered);
-                            emitter.merge_stats_into(&stats_accumulator, &stats_combined_acc);
-                        }
-
-                        if work_log_active {
-                            let tile_id = encode_chunk_id_phase2_tile(seq_id, tile_start);
-                            let work_buf = encode_work_record(tile_id, &tile_discovered);
-                            if let Some(ref w) = writer {
-                                w.send_chunk_bundle(tile_tsv, work_buf)?;
+                            drop(chunk_guard);
+                            if work_log_active {
+                                checkpoint_ctrl.note_chunk_done()?;
                             }
-                        }
-                        drop(chunk_guard);
-                        if work_log_active {
-                            checkpoint_ctrl.note_chunk_done()?;
-                        }
 
-                        let count = phase2_tile_count.fetch_add(1, Ordering::Relaxed) + 1;
-                        pb_depth.set_position(count as u64);
-                        Ok(())
-                    },
-                )?;
+                            let count = phase2_tile_count.fetch_add(1, Ordering::Relaxed) + 1;
+                            pb_depth.set_position(count as u64);
+                            Ok(())
+                        },
+                    )?;
+            }
         }
 
         pb_depth.finish_and_clear();
@@ -7420,27 +7534,37 @@ pub fn compute_depth_global(
         // and candidate memory disappear for regions that have already gained
         // an anchor. Peak scheduler memory is O(cigar_batch_size), not O(all
         // Phase-2 gaps).
-        let mut candidate_batch: Vec<(u32, i64, i64)> = Vec::with_capacity(cigar_batch_size);
-        for &seq_id in &phase2_seqs {
-            let seq_len = compact_lengths.get_length(seq_id);
-            if seq_len <= 0 {
-                continue;
-            }
-            for (region_start, region_end) in tracker.get_unprocessed(seq_id, 0, seq_len) {
-                let mut pos = region_start;
-                while pos < region_end {
-                    let chunk_end = (pos + HOP0_CIGAR_CHUNK_SIZE).min(region_end);
-                    candidate_batch.push((seq_id, pos, chunk_end));
-                    if candidate_batch.len() == cigar_batch_size {
-                        process_batch(&candidate_batch)?;
-                        candidate_batch.clear();
+        for (wave_idx, wave_sequences) in phase2_waves.iter().enumerate() {
+            info!(
+                "Phase 2 hop-0 CIGAR wave {}/{}: {} candidate sequences",
+                wave_idx + 1,
+                phase2_waves.len(),
+                wave_sequences.len(),
+            );
+            let mut candidate_batch: Vec<(u32, i64, i64)> = Vec::with_capacity(cigar_batch_size);
+            for &seq_id in wave_sequences {
+                let seq_len = compact_lengths.get_length(seq_id);
+                if seq_len <= 0 || !tracker.has_unprocessed(seq_id, 0, seq_len) {
+                    continue;
+                }
+                for (region_start, region_end) in tracker.get_unprocessed(seq_id, 0, seq_len) {
+                    let mut pos = region_start;
+                    while pos < region_end {
+                        let chunk_end = (pos + HOP0_CIGAR_CHUNK_SIZE).min(region_end);
+                        candidate_batch.push((seq_id, pos, chunk_end));
+                        if candidate_batch.len() == cigar_batch_size {
+                            process_batch(&candidate_batch)?;
+                            candidate_batch.clear();
+                        }
+                        pos = chunk_end;
                     }
-                    pos = chunk_end;
                 }
             }
-        }
-        if !candidate_batch.is_empty() {
-            process_batch(&candidate_batch)?;
+            // Never let a batch span waves: completing this call is the mask
+            // barrier before the next component rank becomes eligible.
+            if !candidate_batch.is_empty() {
+                process_batch(&candidate_batch)?;
+            }
         }
         drop(process_batch);
         processed_count.store(phase1_seqs.len() + phase2_seqs.len(), Ordering::Relaxed);
@@ -7472,170 +7596,104 @@ pub fn compute_depth_global(
             Ok(())
         };
 
-        // Build the same stable Phase-2 chunk units as the raw transitive
-        // path.  The tracker is consulted before scheduling, while each
-        // chunk keeps its deterministic `(seq_id, start)` checkpoint ID.
-        // This lets one CIGAR BFS level share every touched sub-index across
-        // many remaining anchors rather than reloading it per sequence.
-        let mut transitive_chunks = Vec::new();
-        let mut fallback_chunks = Vec::new();
-        for &seq_id in &phase2_seqs {
-            let seq_len = compact_lengths.get_length(seq_id);
-            if seq_len <= 0 {
-                continue;
-            }
-            for (region_start, region_end) in tracker.get_unprocessed(seq_id, 0, seq_len) {
-                if region_end <= region_start {
-                    continue;
-                }
-                if region_end - region_start < config.min_transitive_len {
-                    fallback_chunks.push((seq_id, region_start, region_end));
-                    continue;
-                }
-                let mut pos = region_start;
-                while pos < region_end {
-                    let chunk_end = (pos + TRANSITIVE_CHUNK_SIZE).min(region_end);
-                    transitive_chunks.push((seq_id, pos, chunk_end));
-                    pos = chunk_end;
-                }
-            }
-        }
-
-        let total_chunks = transitive_chunks.len() + fallback_chunks.len();
-        info!(
-            "Phase 2 transitive CIGAR: {} file-first chunks + {} raw fallback chunks",
-            transitive_chunks.len(),
-            fallback_chunks.len()
-        );
-        let pb_depth = ProgressBar::new(total_chunks as u64);
+        let pb_depth = ProgressBar::new_spinner();
         pb_depth.set_style(
-            ProgressStyle::default_bar()
-                .template(&format!(
-                    "{{spinner:.green}} [{{elapsed_precise}}] [{{wide_bar:.cyan/blue}}] {{pos}}/{{len}} chunks ({{eta}}) | {}remaining sequences",
-                    phase2_label
-                ))
-                .unwrap()
-                .progress_chars("#>-")
+            ProgressStyle::default_spinner()
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] {pos} chunks | Phase 2 CIGAR locality waves",
+                )
+                .unwrap(),
         );
         let phase2_chunk_count = AtomicUsize::new(0);
-
-        // Short gaps cannot seed the transitive frontier; retain the existing
-        // one-hop raw fallback, but issue it through the same file-first raw
-        // batch API used by the raw Phase-2 implementation.
-        const FALLBACK_BATCH_SIZE: usize = 65_536;
-        for batch in fallback_chunks.chunks(FALLBACK_BATCH_SIZE) {
-            let live: Vec<(u32, i64, i64)> = if work_log_active {
-                batch
-                    .iter()
-                    .copied()
-                    .filter(|&(seq_id, start, _)| {
-                        !completed_chunks.contains(&encode_chunk_id_phase2(seq_id, start))
-                    })
-                    .collect()
-            } else {
-                batch.to_vec()
-            };
-            let skipped = batch.len() - live.len();
-            if skipped > 0 {
-                let count = phase2_chunk_count.fetch_add(skipped, Ordering::Relaxed) + skipped;
-                pb_depth.set_position(count as u64);
-            }
-            if live.is_empty() {
-                continue;
-            }
-            let raw = impg.batch_query_raw_overlapping(&live)?;
-            live.par_iter().zip(raw.into_par_iter()).try_for_each(
-                |(&(seq_id, start, end), mut raw_alns)| -> io::Result<()> {
-                    if min_seq_length > 0 {
-                        raw_alns.retain(|aln| {
-                            seq_included
-                                .get(aln.query_id as usize)
-                                .copied()
-                                .unwrap_or(false)
-                        });
-                    }
-                    raw_alns.sort_unstable_by_key(|aln| aln.target_start);
-                    let result = process_anchor_region_raw(
-                        &raw_alns,
-                        &compact_lengths,
-                        num_samples,
-                        seq_id,
-                        compact_lengths.get_sample_id(seq_id),
-                        start,
-                        end,
-                        &global_used,
-                        config.compute_pangenome_bases,
-                    );
-                    tracker.mark_processed_batch(&result.discovered_regions);
-                    emit_chunk(encode_chunk_id_phase2(seq_id, start), result)?;
-                    let count = phase2_chunk_count.fetch_add(1, Ordering::Relaxed) + 1;
-                    pb_depth.set_position(count as u64);
-                    Ok(())
-                },
-            )?;
-        }
 
         let explicit_batch_size = std::env::var("IMPG_CIGAR_TRANSITIVE_BATCH")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|&value| value > 0);
-        let mut batch_size = explicit_batch_size.unwrap_or(256);
         let batch_memory_budget = cigar_transitive_batch_memory_budget();
-        let mut batch_start = 0usize;
-        while batch_start < transitive_chunks.len() {
-            let batch_end = batch_start
-                .saturating_add(batch_size)
-                .min(transitive_chunks.len());
-            let batch = &transitive_chunks[batch_start..batch_end];
-            let live: Vec<(u32, i64, i64)> = if work_log_active {
-                batch
-                    .iter()
-                    .copied()
-                    .filter(|&(seq_id, start, _)| {
-                        !completed_chunks.contains(&encode_chunk_id_phase2(seq_id, start))
-                    })
-                    .collect()
-            } else {
-                batch.to_vec()
-            };
-            let skipped = batch.len() - live.len();
-            if skipped > 0 {
-                let count = phase2_chunk_count.fetch_add(skipped, Ordering::Relaxed) + skipped;
-                pb_depth.set_position(count as u64);
-            }
-            if live.is_empty() {
-                batch_start = batch_end;
-                continue;
-            }
 
-            let overlaps = batch_cigar_depth_bfs(
-                impg,
-                &live,
-                config.max_depth,
-                config.min_transitive_len,
-                config.min_distance_between_ranges,
-            )?;
-            let raw = impg.batch_query_raw_overlapping(&live)?;
-            let observed_bytes = estimate_cigar_batch_result_bytes(&overlaps, &raw);
+        for (wave_idx, wave_sequences) in phase2_waves.iter().enumerate() {
+            // Build stable chunk units from the tracker only after the previous
+            // wave has committed. Each chunk retains its deterministic
+            // `(seq_id, start)` checkpoint identity.
+            let mut transitive_chunks = Vec::new();
+            let mut fallback_chunks = Vec::new();
+            for &seq_id in wave_sequences {
+                let seq_len = compact_lengths.get_length(seq_id);
+                if seq_len <= 0 || !tracker.has_unprocessed(seq_id, 0, seq_len) {
+                    continue;
+                }
+                for (region_start, region_end) in tracker.get_unprocessed(seq_id, 0, seq_len) {
+                    if region_end <= region_start {
+                        continue;
+                    }
+                    if region_end - region_start < config.min_transitive_len {
+                        fallback_chunks.push((seq_id, region_start, region_end));
+                        continue;
+                    }
+                    let mut pos = region_start;
+                    while pos < region_end {
+                        let chunk_end = (pos + TRANSITIVE_CHUNK_SIZE).min(region_end);
+                        transitive_chunks.push((seq_id, pos, chunk_end));
+                        pos = chunk_end;
+                    }
+                }
+            }
+            info!(
+                "Phase 2 transitive CIGAR wave {}/{}: {} file-first chunks + {} raw fallback chunks",
+                wave_idx + 1,
+                phase2_waves.len(),
+                transitive_chunks.len(),
+                fallback_chunks.len()
+            );
 
-            live.par_iter()
-                .zip(overlaps.into_par_iter().zip(raw.into_par_iter()))
-                .try_for_each(
-                    |(&(seq_id, start, end), (overlaps, raw))| -> io::Result<()> {
-                        let result = process_anchor_region_transitive_cigar(
-                            impg,
-                            config,
+            // Short gaps cannot seed the transitive frontier; retain the existing
+            // one-hop raw fallback, but issue it through the same file-first raw
+            // batch API used by the raw Phase-2 implementation.
+            const FALLBACK_BATCH_SIZE: usize = 65_536;
+            for batch in fallback_chunks.chunks(FALLBACK_BATCH_SIZE) {
+                let live: Vec<(u32, i64, i64)> = if work_log_active {
+                    batch
+                        .iter()
+                        .copied()
+                        .filter(|&(seq_id, start, _)| {
+                            !completed_chunks.contains(&encode_chunk_id_phase2(seq_id, start))
+                        })
+                        .collect()
+                } else {
+                    batch.to_vec()
+                };
+                let skipped = batch.len() - live.len();
+                if skipped > 0 {
+                    let count = phase2_chunk_count.fetch_add(skipped, Ordering::Relaxed) + skipped;
+                    pb_depth.set_position(count as u64);
+                }
+                if live.is_empty() {
+                    continue;
+                }
+                let raw = impg.batch_query_raw_overlapping(&live)?;
+                live.par_iter().zip(raw.into_par_iter()).try_for_each(
+                    |(&(seq_id, start, end), mut raw_alns)| -> io::Result<()> {
+                        if min_seq_length > 0 {
+                            raw_alns.retain(|aln| {
+                                seq_included
+                                    .get(aln.query_id as usize)
+                                    .copied()
+                                    .unwrap_or(false)
+                            });
+                        }
+                        raw_alns.sort_unstable_by_key(|aln| aln.target_start);
+                        let result = process_anchor_region_raw(
+                            &raw_alns,
                             &compact_lengths,
                             num_samples,
                             seq_id,
                             compact_lengths.get_sample_id(seq_id),
                             start,
                             end,
-                            &seq_included,
-                            min_seq_length,
                             &global_used,
-                            Some((overlaps, raw)),
-                        )?;
+                            config.compute_pangenome_bases,
+                        );
                         tracker.mark_processed_batch(&result.discovered_regions);
                         emit_chunk(encode_chunk_id_phase2(seq_id, start), result)?;
                         let count = phase2_chunk_count.fetch_add(1, Ordering::Relaxed) + 1;
@@ -7643,11 +7701,77 @@ pub fn compute_depth_global(
                         Ok(())
                     },
                 )?;
-            if explicit_batch_size.is_none() {
-                batch_size =
-                    next_adaptive_batch_size(batch_size, observed_bytes, batch_memory_budget);
             }
-            batch_start = batch_end;
+
+            let mut batch_size = explicit_batch_size.unwrap_or(256);
+            let mut batch_start = 0usize;
+            while batch_start < transitive_chunks.len() {
+                let batch_end = batch_start
+                    .saturating_add(batch_size)
+                    .min(transitive_chunks.len());
+                let batch = &transitive_chunks[batch_start..batch_end];
+                let live: Vec<(u32, i64, i64)> = if work_log_active {
+                    batch
+                        .iter()
+                        .copied()
+                        .filter(|&(seq_id, start, _)| {
+                            !completed_chunks.contains(&encode_chunk_id_phase2(seq_id, start))
+                        })
+                        .collect()
+                } else {
+                    batch.to_vec()
+                };
+                let skipped = batch.len() - live.len();
+                if skipped > 0 {
+                    let count = phase2_chunk_count.fetch_add(skipped, Ordering::Relaxed) + skipped;
+                    pb_depth.set_position(count as u64);
+                }
+                if live.is_empty() {
+                    batch_start = batch_end;
+                    continue;
+                }
+
+                let overlaps = batch_cigar_depth_bfs(
+                    impg,
+                    &live,
+                    config.max_depth,
+                    config.min_transitive_len,
+                    config.min_distance_between_ranges,
+                )?;
+                let raw = impg.batch_query_raw_overlapping(&live)?;
+                let observed_bytes = estimate_cigar_batch_result_bytes(&overlaps, &raw);
+
+                live.par_iter()
+                    .zip(overlaps.into_par_iter().zip(raw.into_par_iter()))
+                    .try_for_each(
+                        |(&(seq_id, start, end), (overlaps, raw))| -> io::Result<()> {
+                            let result = process_anchor_region_transitive_cigar(
+                                impg,
+                                config,
+                                &compact_lengths,
+                                num_samples,
+                                seq_id,
+                                compact_lengths.get_sample_id(seq_id),
+                                start,
+                                end,
+                                &seq_included,
+                                min_seq_length,
+                                &global_used,
+                                Some((overlaps, raw)),
+                            )?;
+                            tracker.mark_processed_batch(&result.discovered_regions);
+                            emit_chunk(encode_chunk_id_phase2(seq_id, start), result)?;
+                            let count = phase2_chunk_count.fetch_add(1, Ordering::Relaxed) + 1;
+                            pb_depth.set_position(count as u64);
+                            Ok(())
+                        },
+                    )?;
+                if explicit_batch_size.is_none() {
+                    batch_size =
+                        next_adaptive_batch_size(batch_size, observed_bytes, batch_memory_budget);
+                }
+                batch_start = batch_end;
+            }
         }
 
         processed_count.store(phase1_seqs.len() + phase2_seqs.len(), Ordering::Relaxed);
@@ -7693,222 +7817,223 @@ pub fn compute_depth_global(
         let phase2_nontrans_batch_size = PHASE2_NONTRANS_BATCH_SIZE;
         let phase2_trans_batch_size = PHASE2_TRANS_BATCH_SIZE;
 
-        let mut transitive_chunks: Vec<(u32, i64, i64)> = Vec::new();
-        let mut nontrans_chunks: Vec<(u32, i64, i64)> = Vec::new();
-
-        for &seq_id in &phase2_seqs {
-            let seq_len = compact_lengths.get_length(seq_id);
-            if seq_len <= 0 {
-                continue;
-            }
-            for (region_start, region_end) in tracker.get_unprocessed(seq_id, 0, seq_len) {
-                let gap_len = region_end - region_start;
-                if gap_len <= 0 {
-                    continue;
-                }
-                if gap_len < config.min_transitive_len {
-                    nontrans_chunks.push((seq_id, region_start, region_end));
-                } else {
-                    let mut pos = region_start;
-                    while pos < region_end {
-                        let chunk_end = (pos + TRANSITIVE_CHUNK_SIZE).min(region_end);
-                        transitive_chunks.push((seq_id, pos, chunk_end));
-                        pos = chunk_end;
-                    }
-                }
-            }
-        }
-
-        let total_chunks = transitive_chunks.len() + nontrans_chunks.len();
-        info!(
-            "Phase 2: {} sequences split into {} transitive chunks ({}MB each) + {} sub-{}bp fallback chunks, batch BFS",
-            phase2_seqs.len(),
-            transitive_chunks.len(),
-            TRANSITIVE_CHUNK_SIZE / 1_000_000,
-            nontrans_chunks.len(),
-            config.min_transitive_len,
-        );
-
-        let pb_depth = ProgressBar::new(total_chunks as u64);
+        let pb_depth = ProgressBar::new_spinner();
         pb_depth.set_style(
-            ProgressStyle::default_bar()
-                .template(&format!(
-                    "{{spinner:.green}} [{{elapsed_precise}}] [{{wide_bar:.cyan/blue}}] {{pos}}/{{len}} chunks ({{eta}}) | {}remaining sequences",
-                    phase2_label
-                ))
-                .unwrap()
-                .progress_chars("#>-")
+            ProgressStyle::default_spinner()
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] {pos} chunks | Phase 2 raw locality waves",
+                )
+                .unwrap(),
         );
         let phase2_chunk_count = AtomicUsize::new(0);
 
-        // Pass A: non-transitive fallback chunks (sub-min_transitive_len gaps).
-        // Same batched query pattern as the non-transitive Phase 2 branch.
-        for batch in nontrans_chunks.chunks(phase2_nontrans_batch_size) {
-            let live_batch: Vec<(u32, i64, i64)> = if work_log_active {
-                batch
-                    .iter()
-                    .copied()
-                    .filter(|&(seq_id, region_start, _)| {
-                        !completed_chunks.contains(&encode_chunk_id_phase2(seq_id, region_start))
-                    })
-                    .collect()
-            } else {
-                batch.to_vec()
-            };
-            let skipped = batch.len() - live_batch.len();
-            if skipped > 0 {
-                let count = phase2_chunk_count.fetch_add(skipped, Ordering::Relaxed) + skipped;
-                pb_depth.set_position(count as u64);
-            }
-            if live_batch.is_empty() {
-                continue;
-            }
+        for (wave_idx, wave_sequences) in phase2_waves.iter().enumerate() {
+            let mut transitive_chunks: Vec<(u32, i64, i64)> = Vec::new();
+            let mut nontrans_chunks: Vec<(u32, i64, i64)> = Vec::new();
 
-            let queries: Vec<(u32, i64, i64)> =
-                live_batch.iter().map(|&(s, cs, ce)| (s, cs, ce)).collect();
-            let all_alns = impg.batch_query_raw_overlapping(&queries)?;
-
-            live_batch
-                .par_iter()
-                .zip(all_alns.into_par_iter())
-                .try_for_each(
-                    |(&(seq_id, region_start, region_end), mut raw_alns)| -> io::Result<()> {
-                        let chunk_id = encode_chunk_id_phase2(seq_id, region_start);
-                        let sample_id = compact_lengths.get_sample_id(seq_id);
-
-                        if min_seq_length > 0 {
-                            raw_alns.retain(|aln| {
-                                seq_included
-                                    .get(aln.query_id as usize)
-                                    .copied()
-                                    .unwrap_or(false)
-                            });
+            for &seq_id in wave_sequences {
+                let seq_len = compact_lengths.get_length(seq_id);
+                if seq_len <= 0 || !tracker.has_unprocessed(seq_id, 0, seq_len) {
+                    continue;
+                }
+                for (region_start, region_end) in tracker.get_unprocessed(seq_id, 0, seq_len) {
+                    let gap_len = region_end - region_start;
+                    if gap_len <= 0 {
+                        continue;
+                    }
+                    if gap_len < config.min_transitive_len {
+                        nontrans_chunks.push((seq_id, region_start, region_end));
+                    } else {
+                        let mut pos = region_start;
+                        while pos < region_end {
+                            let chunk_end = (pos + TRANSITIVE_CHUNK_SIZE).min(region_end);
+                            transitive_chunks.push((seq_id, pos, chunk_end));
+                            pos = chunk_end;
                         }
-                        raw_alns.sort_unstable_by_key(|aln| aln.target_start);
-
-                        let result = process_anchor_region_raw(
-                            &raw_alns,
-                            &compact_lengths,
-                            num_samples,
-                            seq_id,
-                            sample_id,
-                            region_start,
-                            region_end,
-                            &global_used,
-                            config.compute_pangenome_bases,
-                        );
-                        tracker.mark_processed_batch(&result.discovered_regions);
-
-                        let work_buf = if work_log_active {
-                            encode_work_record(chunk_id, &result.discovered_regions)
-                        } else {
-                            Vec::new()
-                        };
-                        let mut buf: Vec<u8> = Vec::new();
-                        write_results(vec![result], &mut buf)?;
-                        if let Some(ref w) = writer {
-                            if work_log_active {
-                                w.send_chunk_bundle(std::mem::take(&mut buf), work_buf)?;
-                            } else if !buf.is_empty() {
-                                w.send(std::mem::take(&mut buf))?;
-                            }
-                        }
-                        if work_log_active {
-                            checkpoint_ctrl.note_chunk_done()?;
-                        }
-
-                        let count = phase2_chunk_count.fetch_add(1, Ordering::Relaxed) + 1;
-                        pb_depth.set_position(count as u64);
-                        Ok(())
-                    },
-                )?;
-        }
-
-        // Pass B: transitive chunks via batch BFS.
-        // Each batch:
-        //   Phase A) `batch_depth_bfs` drives all chunks' frontiers together;
-        //            files load sequentially (one at a time) and serve every
-        //            query in the batch that references them. Single-threaded
-        //            file I/O bounds peak retained sub-index memory at one.
-        //   Phase B) Parallel sweep + emit via
-        //            `process_anchor_region_transitive_raw_with_hits` —
-        //            CPU-only, no further file I/O.
-        for batch in transitive_chunks.chunks(phase2_trans_batch_size) {
-            let live_batch: Vec<(u32, i64, i64)> = if work_log_active {
-                batch
-                    .iter()
-                    .copied()
-                    .filter(|&(seq_id, chunk_start, _)| {
-                        !completed_chunks.contains(&encode_chunk_id_phase2(seq_id, chunk_start))
-                    })
-                    .collect()
-            } else {
-                batch.to_vec()
-            };
-            let skipped = batch.len() - live_batch.len();
-            if skipped > 0 {
-                let count = phase2_chunk_count.fetch_add(skipped, Ordering::Relaxed) + skipped;
-                pb_depth.set_position(count as u64);
+                    }
+                }
             }
-            if live_batch.is_empty() {
-                continue;
-            }
-
-            let chunk_coords: Vec<(u32, i64, i64)> =
-                live_batch.iter().map(|&(s, cs, ce)| (s, cs, ce)).collect();
-            let all_hits = batch_depth_bfs(
-                impg,
-                &chunk_coords,
-                config.max_depth,
+            info!(
+                "Phase 2 raw wave {}/{}: {} candidate sequences -> {} transitive chunks ({}MB each) + {} sub-{}bp fallback chunks",
+                wave_idx + 1,
+                phase2_waves.len(),
+                wave_sequences.len(),
+                transitive_chunks.len(),
+                TRANSITIVE_CHUNK_SIZE / 1_000_000,
+                nontrans_chunks.len(),
                 config.min_transitive_len,
-                config.min_distance_between_ranges,
-            )?;
+            );
 
-            live_batch
-                .par_iter()
-                .zip(all_hits.into_par_iter())
-                .try_for_each(
-                    |(&(seq_id, chunk_start, chunk_end), hits)| -> io::Result<()> {
-                        let chunk_id = encode_chunk_id_phase2(seq_id, chunk_start);
-                        let sample_id = compact_lengths.get_sample_id(seq_id);
-                        let result = process_anchor_region_transitive_raw_with_hits(
-                            hits,
-                            &compact_lengths,
-                            num_samples,
-                            seq_id,
-                            sample_id,
-                            chunk_start,
-                            chunk_end,
-                            &seq_included,
-                            min_seq_length,
-                            &global_used,
-                            config.compute_pangenome_bases,
-                        );
-                        tracker.mark_processed_batch(&result.discovered_regions);
+            // Pass A: non-transitive fallback chunks (sub-min_transitive_len gaps).
+            // Same batched query pattern as the non-transitive Phase 2 branch.
+            for batch in nontrans_chunks.chunks(phase2_nontrans_batch_size) {
+                let live_batch: Vec<(u32, i64, i64)> = if work_log_active {
+                    batch
+                        .iter()
+                        .copied()
+                        .filter(|&(seq_id, region_start, _)| {
+                            !completed_chunks
+                                .contains(&encode_chunk_id_phase2(seq_id, region_start))
+                        })
+                        .collect()
+                } else {
+                    batch.to_vec()
+                };
+                let skipped = batch.len() - live_batch.len();
+                if skipped > 0 {
+                    let count = phase2_chunk_count.fetch_add(skipped, Ordering::Relaxed) + skipped;
+                    pb_depth.set_position(count as u64);
+                }
+                if live_batch.is_empty() {
+                    continue;
+                }
 
-                        let work_buf = if work_log_active {
-                            encode_work_record(chunk_id, &result.discovered_regions)
-                        } else {
-                            Vec::new()
-                        };
-                        let mut buf: Vec<u8> = Vec::new();
-                        write_results(vec![result], &mut buf)?;
-                        if let Some(ref w) = writer {
-                            if work_log_active {
-                                w.send_chunk_bundle(std::mem::take(&mut buf), work_buf)?;
-                            } else if !buf.is_empty() {
-                                w.send(std::mem::take(&mut buf))?;
+                let queries: Vec<(u32, i64, i64)> =
+                    live_batch.iter().map(|&(s, cs, ce)| (s, cs, ce)).collect();
+                let all_alns = impg.batch_query_raw_overlapping(&queries)?;
+
+                live_batch
+                    .par_iter()
+                    .zip(all_alns.into_par_iter())
+                    .try_for_each(
+                        |(&(seq_id, region_start, region_end), mut raw_alns)| -> io::Result<()> {
+                            let chunk_id = encode_chunk_id_phase2(seq_id, region_start);
+                            let sample_id = compact_lengths.get_sample_id(seq_id);
+
+                            if min_seq_length > 0 {
+                                raw_alns.retain(|aln| {
+                                    seq_included
+                                        .get(aln.query_id as usize)
+                                        .copied()
+                                        .unwrap_or(false)
+                                });
                             }
-                        }
-                        if work_log_active {
-                            checkpoint_ctrl.note_chunk_done()?;
-                        }
+                            raw_alns.sort_unstable_by_key(|aln| aln.target_start);
 
-                        let count = phase2_chunk_count.fetch_add(1, Ordering::Relaxed) + 1;
-                        pb_depth.set_position(count as u64);
-                        Ok(())
-                    },
+                            let result = process_anchor_region_raw(
+                                &raw_alns,
+                                &compact_lengths,
+                                num_samples,
+                                seq_id,
+                                sample_id,
+                                region_start,
+                                region_end,
+                                &global_used,
+                                config.compute_pangenome_bases,
+                            );
+                            tracker.mark_processed_batch(&result.discovered_regions);
+
+                            let work_buf = if work_log_active {
+                                encode_work_record(chunk_id, &result.discovered_regions)
+                            } else {
+                                Vec::new()
+                            };
+                            let mut buf: Vec<u8> = Vec::new();
+                            write_results(vec![result], &mut buf)?;
+                            if let Some(ref w) = writer {
+                                if work_log_active {
+                                    w.send_chunk_bundle(std::mem::take(&mut buf), work_buf)?;
+                                } else if !buf.is_empty() {
+                                    w.send(std::mem::take(&mut buf))?;
+                                }
+                            }
+                            if work_log_active {
+                                checkpoint_ctrl.note_chunk_done()?;
+                            }
+
+                            let count = phase2_chunk_count.fetch_add(1, Ordering::Relaxed) + 1;
+                            pb_depth.set_position(count as u64);
+                            Ok(())
+                        },
+                    )?;
+            }
+
+            // Pass B: transitive chunks via batch BFS.
+            // Each batch:
+            //   Phase A) `batch_depth_bfs` drives all chunks' frontiers together;
+            //            files load sequentially (one at a time) and serve every
+            //            query in the batch that references them. Single-threaded
+            //            file I/O bounds peak retained sub-index memory at one.
+            //   Phase B) Parallel sweep + emit via
+            //            `process_anchor_region_transitive_raw_with_hits` —
+            //            CPU-only, no further file I/O.
+            for batch in transitive_chunks.chunks(phase2_trans_batch_size) {
+                let live_batch: Vec<(u32, i64, i64)> = if work_log_active {
+                    batch
+                        .iter()
+                        .copied()
+                        .filter(|&(seq_id, chunk_start, _)| {
+                            !completed_chunks.contains(&encode_chunk_id_phase2(seq_id, chunk_start))
+                        })
+                        .collect()
+                } else {
+                    batch.to_vec()
+                };
+                let skipped = batch.len() - live_batch.len();
+                if skipped > 0 {
+                    let count = phase2_chunk_count.fetch_add(skipped, Ordering::Relaxed) + skipped;
+                    pb_depth.set_position(count as u64);
+                }
+                if live_batch.is_empty() {
+                    continue;
+                }
+
+                let chunk_coords: Vec<(u32, i64, i64)> =
+                    live_batch.iter().map(|&(s, cs, ce)| (s, cs, ce)).collect();
+                let all_hits = batch_depth_bfs(
+                    impg,
+                    &chunk_coords,
+                    config.max_depth,
+                    config.min_transitive_len,
+                    config.min_distance_between_ranges,
                 )?;
+
+                live_batch
+                    .par_iter()
+                    .zip(all_hits.into_par_iter())
+                    .try_for_each(
+                        |(&(seq_id, chunk_start, chunk_end), hits)| -> io::Result<()> {
+                            let chunk_id = encode_chunk_id_phase2(seq_id, chunk_start);
+                            let sample_id = compact_lengths.get_sample_id(seq_id);
+                            let result = process_anchor_region_transitive_raw_with_hits(
+                                hits,
+                                &compact_lengths,
+                                num_samples,
+                                seq_id,
+                                sample_id,
+                                chunk_start,
+                                chunk_end,
+                                &seq_included,
+                                min_seq_length,
+                                &global_used,
+                                config.compute_pangenome_bases,
+                            );
+                            tracker.mark_processed_batch(&result.discovered_regions);
+
+                            let work_buf = if work_log_active {
+                                encode_work_record(chunk_id, &result.discovered_regions)
+                            } else {
+                                Vec::new()
+                            };
+                            let mut buf: Vec<u8> = Vec::new();
+                            write_results(vec![result], &mut buf)?;
+                            if let Some(ref w) = writer {
+                                if work_log_active {
+                                    w.send_chunk_bundle(std::mem::take(&mut buf), work_buf)?;
+                                } else if !buf.is_empty() {
+                                    w.send(std::mem::take(&mut buf))?;
+                                }
+                            }
+                            if work_log_active {
+                                checkpoint_ctrl.note_chunk_done()?;
+                            }
+
+                            let count = phase2_chunk_count.fetch_add(1, Ordering::Relaxed) + 1;
+                            pb_depth.set_position(count as u64);
+                            Ok(())
+                        },
+                    )?;
+            }
         }
 
         pb_depth.finish_and_clear();
@@ -9184,6 +9309,35 @@ mod tests {
 
         let fully_open = tracker.get_unprocessed(0, 8_000_000, 10_000_000);
         assert_eq!(fully_open, vec![(8_000_000, 10_000_000)]);
+    }
+
+    #[test]
+    fn phase2_wave_planner_takes_one_sequence_per_component_per_round() {
+        // Static order is already degree-descending: component 10 owns
+        // 100→101→102, component 20 owns 200→201, and 300 is independent.
+        let order = vec![100, 200, 300, 101, 201, 102];
+        let labels = vec![10, 20, 30, 10, 20, 10];
+        let waves = build_phase2_waves(&order, &labels, 64);
+        assert_eq!(waves, vec![vec![100, 200, 300], vec![101, 201], vec![102]]);
+    }
+
+    #[test]
+    fn phase2_wave_planner_caps_barriers_with_ordered_fallback() {
+        let order = vec![10, 20, 11, 21, 12, 22, 13];
+        let labels = vec![1, 2, 1, 2, 1, 2, 1];
+        let waves = build_phase2_waves(&order, &labels, 3);
+        assert_eq!(waves, vec![vec![10, 20], vec![11, 21], vec![12, 22, 13]]);
+    }
+
+    #[test]
+    fn phase2_wave_mask_probe_tracks_partial_and_full_coverage() {
+        let tracker = ConcurrentProcessedTracker::new(1);
+        assert!(tracker.has_unprocessed(0, 0, 100));
+        tracker.mark_processed(0, 0, 40);
+        assert!(tracker.has_unprocessed(0, 0, 100));
+        tracker.mark_processed(0, 40, 100);
+        assert!(!tracker.has_unprocessed(0, 0, 100));
+        assert!(!tracker.has_unprocessed(0, 20, 80));
     }
 
     #[test]

@@ -620,6 +620,80 @@ fn resolve_sub_index_cache_byte_budget() -> (u64, bool) {
 }
 
 impl MultiImpg {
+    /// Return one deterministic alignment-file connectivity label per input
+    /// sequence. Only `seq_ids` participate: a Phase-1 hub that is already
+    /// fully processed must not collapse otherwise independent Phase-2 leaf
+    /// components merely because every leaf has a pairwise file with that hub.
+    ///
+    /// Union-find scans the existing compact `forest_map` locations in place;
+    /// it allocates O(sequences + files), not another copy of the potentially
+    /// hundreds-of-millions of sequence/file incidences.
+    pub(crate) fn depth_locality_components(&self, seq_ids: &[u32]) -> Vec<u32> {
+        if seq_ids.is_empty() {
+            return Vec::new();
+        }
+
+        fn find(parent: &mut [usize], mut node: usize) -> usize {
+            while parent[node] != node {
+                parent[node] = parent[parent[node]];
+                node = parent[node];
+            }
+            node
+        }
+
+        fn union(parent: &mut [usize], rank: &mut [u8], left: usize, right: usize) {
+            let mut left_root = find(parent, left);
+            let mut right_root = find(parent, right);
+            if left_root == right_root {
+                return;
+            }
+            if rank[left_root] < rank[right_root] {
+                std::mem::swap(&mut left_root, &mut right_root);
+            }
+            parent[right_root] = left_root;
+            if rank[left_root] == rank[right_root] {
+                rank[left_root] = rank[left_root].saturating_add(1);
+            }
+        }
+
+        let mut parent: Vec<usize> = (0..seq_ids.len()).collect();
+        let mut rank = vec![0u8; seq_ids.len()];
+        let mut first_seq_by_file = vec![usize::MAX; self.index_paths.len()];
+
+        for (seq_pos, seq_id) in seq_ids.iter().copied().enumerate() {
+            if let Some(locations) = self.forest_map.get(&seq_id) {
+                for location in locations {
+                    let file_idx = location.index_idx();
+                    let first = first_seq_by_file[file_idx];
+                    if first == usize::MAX {
+                        first_seq_by_file[file_idx] = seq_pos;
+                    } else {
+                        union(&mut parent, &mut rank, seq_pos, first);
+                    }
+                }
+            }
+        }
+
+        // Canonicalise labels to the smallest sequence ID in each component so
+        // the result is independent of union-by-rank choices.
+        let mut min_seq_by_root: FxHashMap<usize, u32> = FxHashMap::default();
+        for (idx, seq_id) in seq_ids.iter().copied().enumerate() {
+            let root = find(&mut parent, idx);
+            min_seq_by_root
+                .entry(root)
+                .and_modify(|current| *current = (*current).min(seq_id))
+                .or_insert(seq_id);
+        }
+        seq_ids
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| {
+                let root = find(&mut parent, idx);
+                min_seq_by_root[&root]
+            })
+            .collect()
+    }
+
     /// Load headers from multiple per-file indices and build unified mappings.
     ///
     /// This loads ONLY the headers (seq_index + forest_map) from each file,

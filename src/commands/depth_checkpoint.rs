@@ -314,6 +314,7 @@ pub struct HashInputs<'a> {
     pub transitive: bool,
     pub transitive_dfs: bool,
     pub max_depth: u16,
+    pub phase2_max_waves: usize,
     pub min_transitive_len: i64,
     pub min_distance_between_ranges: i64,
 }
@@ -371,6 +372,7 @@ pub fn compute_invalidation_hash(alignment_files: &[String], inputs: &HashInputs
     inputs.transitive.hash(&mut hasher);
     inputs.transitive_dfs.hash(&mut hasher);
     inputs.max_depth.hash(&mut hasher);
+    inputs.phase2_max_waves.hash(&mut hasher);
     inputs.min_transitive_len.hash(&mut hasher);
     inputs.min_distance_between_ranges.hash(&mut hasher);
 
@@ -968,6 +970,7 @@ mod tests {
             transitive: true,
             transitive_dfs: false,
             max_depth: 0,
+            phase2_max_waves: 64,
             min_transitive_len: 0,
             min_distance_between_ranges: 0,
         };
@@ -976,5 +979,10 @@ mod tests {
         let h1 = compute_invalidation_hash(&[], &inputs1);
         let h2 = compute_invalidation_hash(&[], &inputs2);
         assert_ne!(h1, h2, "ref_only flip must change hash");
+
+        let mut inputs3 = inputs1.clone();
+        inputs3.phase2_max_waves = 1;
+        let h3 = compute_invalidation_hash(&[], &inputs3);
+        assert_ne!(h1, h3, "Phase-2 wave cap must change hash");
     }
 }

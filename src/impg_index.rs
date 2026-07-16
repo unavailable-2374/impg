@@ -130,6 +130,19 @@ pub trait ImpgIndex: Send + Sync {
         &[]
     }
 
+    /// Assign Phase-2 anchor sequences to alignment-file connectivity
+    /// components. Sequences in the same component occur together through at
+    /// least one chain of per-file indices and should therefore be scheduled in
+    /// successive waves: an earlier anchor gets a chance to mask homologous
+    /// regions before the next anchor in that component is queried.
+    ///
+    /// The default gives every sequence its own component. Alignment-backed
+    /// `Impg` and `MultiImpg` override it; the default remains appropriate for
+    /// non-alignment backends that cannot expose homology adjacency.
+    fn depth_locality_components(&self, seq_ids: &[u32]) -> Vec<u32> {
+        seq_ids.to_vec()
+    }
+
     /// Query alignments where the specified sequence is the QUERY (reverse direction).
     /// Returns: Vec of (our_q_start, our_q_end, other_t_start, other_t_end, other_seq_id)
     /// - our_q_start/our_q_end: coordinates on our sequence (appears as query in the alignment)
@@ -759,6 +772,13 @@ impl ImpgIndex for ImpgWrapper {
         match self {
             ImpgWrapper::Single(impg) => impg.alignment_files(),
             ImpgWrapper::Multi(multi) => multi.alignment_files(),
+        }
+    }
+
+    fn depth_locality_components(&self, seq_ids: &[u32]) -> Vec<u32> {
+        match self {
+            ImpgWrapper::Single(impg) => impg.depth_locality_components(seq_ids),
+            ImpgWrapper::Multi(multi) => multi.depth_locality_components(seq_ids),
         }
     }
 

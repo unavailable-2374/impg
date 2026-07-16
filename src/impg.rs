@@ -2759,6 +2759,79 @@ impl Impg {
         query_to_targets
     }
 
+    /// Connectivity labels for locality-aware Phase-2 depth waves in a
+    /// combined single-file index. Unlike `MultiImpg`, there is no meaningful
+    /// per-file incidence graph here, so use the direct alignment adjacency
+    /// already represented by the interval forest. Only `seq_ids` participate;
+    /// Phase-1 sequences are deliberately excluded from residual components.
+    pub(crate) fn depth_locality_components(&self, seq_ids: &[u32]) -> Vec<u32> {
+        if seq_ids.is_empty() {
+            return Vec::new();
+        }
+
+        fn find(parent: &mut [usize], mut node: usize) -> usize {
+            while parent[node] != node {
+                parent[node] = parent[parent[node]];
+                node = parent[node];
+            }
+            node
+        }
+
+        fn union(parent: &mut [usize], rank: &mut [u8], left: usize, right: usize) {
+            let mut left_root = find(parent, left);
+            let mut right_root = find(parent, right);
+            if left_root == right_root {
+                return;
+            }
+            if rank[left_root] < rank[right_root] {
+                std::mem::swap(&mut left_root, &mut right_root);
+            }
+            parent[right_root] = left_root;
+            if rank[left_root] == rank[right_root] {
+                rank[left_root] = rank[left_root].saturating_add(1);
+            }
+        }
+
+        let positions: FxHashMap<u32, usize> = seq_ids
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(position, seq_id)| (seq_id, position))
+            .collect();
+        let mut parent: Vec<usize> = (0..seq_ids.len()).collect();
+        let mut rank = vec![0u8; seq_ids.len()];
+        // Scan only selected residual targets and leave their trees resident.
+        // `build_query_to_targets_map()` deliberately clears the tree cache;
+        // that is invalid for a freshly constructed in-memory combined index,
+        // which has no backing index file from which to reload before Phase 1.
+        for (&target_id, &target_pos) in &positions {
+            if let Some(tree) = self.get_or_load_tree(target_id) {
+                for interval in tree.iter() {
+                    if let Some(&query_pos) = positions.get(&interval.metadata.query_id) {
+                        union(&mut parent, &mut rank, query_pos, target_pos);
+                    }
+                }
+            }
+        }
+
+        let mut min_seq_by_root: FxHashMap<usize, u32> = FxHashMap::default();
+        for (idx, seq_id) in seq_ids.iter().copied().enumerate() {
+            let root = find(&mut parent, idx);
+            min_seq_by_root
+                .entry(root)
+                .and_modify(|current| *current = (*current).min(seq_id))
+                .or_insert(seq_id);
+        }
+        seq_ids
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| {
+                let root = find(&mut parent, idx);
+                min_seq_by_root[&root]
+            })
+            .collect()
+    }
+
     /// Query reverse alignments using a pre-built query_to_targets map.
     /// Only loads the necessary trees instead of all trees.
     pub fn query_reverse_for_depth_with_map(
@@ -3898,6 +3971,10 @@ impl ImpgIndex for Impg {
 
     fn alignment_files(&self) -> &[String] {
         &self.alignment_files
+    }
+
+    fn depth_locality_components(&self, seq_ids: &[u32]) -> Vec<u32> {
+        Impg::depth_locality_components(self, seq_ids)
     }
 
     fn query_reverse_for_depth(&self, query_id: u32) -> Vec<(i64, i64, i64, i64, u32)> {

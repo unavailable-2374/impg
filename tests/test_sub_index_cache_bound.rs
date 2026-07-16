@@ -18,7 +18,7 @@
 
 use impg::alignment_record::AlignmentRecord;
 use impg::impg::{AdjustedInterval, Impg};
-use impg::impg_index::{ImpgIndex, RawAlignmentInterval};
+use impg::impg_index::{ImpgIndex, ImpgWrapper, RawAlignmentInterval};
 use impg::multi_impg::MultiImpg;
 use impg::seqidx::SequenceIndex;
 use std::fs::File;
@@ -150,6 +150,29 @@ fn build_single(alignment_files: &[String]) -> Impg {
     }
     Impg::from_multi_alignment_records(&records_by_file, seq_index, None, true)
         .expect("build combined single index")
+}
+
+#[test]
+fn depth_locality_components_use_only_phase2_sequences() {
+    let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().expect("tempdir");
+    let (index_paths, alignment_files) = build_multi(&tmp);
+    let multi =
+        MultiImpg::load_from_files(&index_paths, &alignment_files, None).expect("load multi");
+    let ids = ["seqA", "seqB", "seqC", "seqD"]
+        .map(|name| multi.seq_index().get_id(name).expect("TEST sequence id"));
+    let wrapper = ImpgWrapper::from_multi(multi);
+
+    // A-B-C-D-A is one file-connected component when every Phase-2 sequence
+    // participates.
+    let all_labels = wrapper.depth_locality_components(&ids);
+    assert!(all_labels.iter().all(|label| *label == all_labels[0]));
+
+    // If B and D were Phase-1 anchors, A and C share no per-file index. They
+    // must remain separate Phase-2 components rather than being joined through
+    // an already-processed sequence that is absent from the input subset.
+    let residual_labels = wrapper.depth_locality_components(&[ids[0], ids[2]]);
+    assert_ne!(residual_labels[0], residual_labels[1]);
 }
 
 /// Collect every single-hop `query` + transitive BFS result over all targets.
