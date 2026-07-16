@@ -117,6 +117,41 @@ fn build_test_dataset(dir: &Path) -> (Vec<String>, PathBuf) {
     (paths, alist)
 }
 
+/// TEST dataset with two disconnected components. `sampleR` is the requested
+/// Phase-1 reference and covers only `sampleD`; `sampleB` and `sampleC` cover
+/// one another and therefore both enter the initial Phase-2 candidate list.
+fn build_phase2_mutual_coverage_dataset(dir: &Path) -> PathBuf {
+    let len: i64 = 30_000;
+    let pafs: [(&str, String); 2] = [
+        (
+            "r_d.paf",
+            format!(
+                "sampleD#0#chr1\t{len}\t0\t{len}\t+\tsampleR#0#chr1\t{len}\t0\t{len}\t{len}\t{len}\t60\tcg:Z:{len}="
+            ),
+        ),
+        (
+            "b_c.paf",
+            format!(
+                "sampleC#0#chr1\t{len}\t0\t{len}\t+\tsampleB#0#chr1\t{len}\t0\t{len}\t{len}\t{len}\t60\tcg:Z:{len}="
+            ),
+        ),
+    ];
+    let mut paths = Vec::new();
+    for (name, line) in pafs {
+        let paf = dir.join(name);
+        write_paf(&paf, &[line]);
+        let idx_path = dir.join(format!("{}.impg", name));
+        build_per_file_index(paf.to_str().unwrap(), idx_path.to_str().unwrap());
+        paths.push(paf);
+    }
+    let alist = dir.join("mutual_alist.txt");
+    let mut f = File::create(&alist).unwrap();
+    for path in paths {
+        writeln!(f, "{}", path.display()).unwrap();
+    }
+    alist
+}
+
 /// Run `impg depth` and return the exit status. stderr is captured and only
 /// printed on assertion failure (helps debug CI breakage).
 fn run_depth(
@@ -142,6 +177,42 @@ fn run_depth(
         cmd.arg(a);
     }
     // Make sure no inherited env var disturbs the run.
+    cmd.env_remove("IMPG_TEST_EXIT_AFTER_COMMIT");
+    cmd.env_remove("IMPG_CHECKPOINT_INTERVAL_OVERRIDE");
+    for (k, v) in env_overrides {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("spawn impg");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    (out.status, stderr)
+}
+
+/// As `run_depth`, but lets a TEST select the Phase-1 reference sample.
+/// This is needed to leave a disconnected component for the transitive
+/// CIGAR Phase-2 path.
+fn run_depth_transitive_cigar_ref(
+    alist: &Path,
+    prefix: &Path,
+    ref_sample: &str,
+    extra_args: &[&str],
+    env_overrides: &[(&str, &str)],
+) -> (std::process::ExitStatus, String) {
+    let bin = impg_binary();
+    let mut cmd = Command::new(&bin);
+    cmd.arg("depth")
+        .arg("--alignment-list")
+        .arg(alist)
+        .arg("-O")
+        .arg(prefix)
+        .arg("-x")
+        .arg("--use-BFS")
+        .arg("--ref")
+        .arg(ref_sample)
+        .arg("--min-transitive-len")
+        .arg("100");
+    for a in extra_args {
+        cmd.arg(a);
+    }
     cmd.env_remove("IMPG_TEST_EXIT_AFTER_COMMIT");
     cmd.env_remove("IMPG_CHECKPOINT_INTERVAL_OVERRIDE");
     for (k, v) in env_overrides {
@@ -217,6 +288,37 @@ fn run_depth_nontrans(
     (out.status, stderr)
 }
 
+/// Non-transitive CIGAR-precise mode. With the A-B-C chain and A as the ref,
+/// C remains for Phase 2, exercising the file-first hop-0 batch path.
+fn run_depth_nontrans_cigar(
+    alist: &Path,
+    prefix: &Path,
+    extra_args: &[&str],
+    env_overrides: &[(&str, &str)],
+) -> (std::process::ExitStatus, String) {
+    let bin = impg_binary();
+    let mut cmd = Command::new(&bin);
+    cmd.arg("depth")
+        .arg("--alignment-list")
+        .arg(alist)
+        .arg("-O")
+        .arg(prefix)
+        .arg("--use-BFS")
+        .arg("--ref")
+        .arg("sampleA");
+    for a in extra_args {
+        cmd.arg(a);
+    }
+    cmd.env_remove("IMPG_TEST_EXIT_AFTER_COMMIT");
+    cmd.env_remove("IMPG_CHECKPOINT_INTERVAL_OVERRIDE");
+    for (k, v) in env_overrides {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("spawn impg");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    (out.status, stderr)
+}
+
 /// Read a `<prefix>.depth.tsv`, drop the header, drop the per-row `#id`
 /// column (non-deterministic across runs), and return sorted lines.
 fn read_normalized_tsv(path: &Path) -> Vec<String> {
@@ -244,6 +346,131 @@ fn tsv_body_line_count(path: &Path) -> usize {
         .lines()
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .count()
+}
+
+#[test]
+fn nontrans_cigar_phase2_suppresses_mutually_covered_candidate() {
+    let tmp = TempDir::new().unwrap();
+    let alist = build_phase2_mutual_coverage_dataset(tmp.path());
+    let prefix = tmp.path().join("mutual_phase2");
+    let bin = impg_binary();
+    let out = Command::new(bin)
+        .arg("depth")
+        .arg("--alignment-list")
+        .arg(&alist)
+        .arg("-O")
+        .arg(&prefix)
+        .arg("--use-BFS")
+        .arg("--ref")
+        .arg("sampleR")
+        .arg("-t")
+        .arg("4")
+        .output()
+        .expect("spawn impg");
+    assert!(
+        out.status.success(),
+        "mutual Phase-2 TEST run failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let tsv = PathBuf::from(format!("{}.depth.tsv", prefix.display()));
+    assert_eq!(
+        tsv_body_line_count(&tsv),
+        2,
+        "expected one sampleR/sampleD anchor and exactly one sampleB/sampleC anchor"
+    );
+}
+
+#[test]
+fn resume_transitive_cigar_phase2_file_first_matches_baseline() {
+    let tmp = TempDir::new().unwrap();
+    let alist = build_phase2_mutual_coverage_dataset(tmp.path());
+
+    let baseline = tmp.path().join("transitive_cigar_phase2_baseline");
+    let (st, err) = run_depth_transitive_cigar_ref(&alist, &baseline, "sampleR", &[], &[]);
+    assert!(st.success(), "baseline depth failed:\n{err}");
+    assert!(
+        err.contains("Phase 2 transitive CIGAR"),
+        "TEST dataset did not reach the transitive CIGAR Phase-2 path:\n{err}"
+    );
+    let baseline_tsv = read_normalized_tsv(Path::new(&format!("{}.depth.tsv", baseline.display())));
+    assert!(!baseline_tsv.is_empty(), "baseline produced empty TSV");
+
+    let resumed = tmp.path().join("transitive_cigar_phase2_resumed");
+    let (st, err) = run_depth_transitive_cigar_ref(
+        &alist,
+        &resumed,
+        "sampleR",
+        &["--resume"],
+        &[("IMPG_CIGAR_TRANSITIVE_BATCH", "1")],
+    );
+    assert!(st.success(), "--resume depth failed:\n{err}");
+    let resumed_tsv = read_normalized_tsv(Path::new(&format!("{}.depth.tsv", resumed.display())));
+    assert_eq!(
+        baseline_tsv, resumed_tsv,
+        "transitive CIGAR Phase-2 TSV differs between baseline and --resume"
+    );
+}
+
+#[test]
+fn resume_after_transitive_cigar_phase2_crash_matches_baseline() {
+    let tmp = TempDir::new().unwrap();
+    let alist = build_phase2_mutual_coverage_dataset(tmp.path());
+
+    let baseline = tmp.path().join("transitive_cigar_phase2_crash_baseline");
+    let (st, err) = run_depth_transitive_cigar_ref(&alist, &baseline, "sampleR", &[], &[]);
+    assert!(st.success(), "baseline depth failed:\n{err}");
+    let baseline_tsv = read_normalized_tsv(Path::new(&format!("{}.depth.tsv", baseline.display())));
+
+    // The TEST fixture has one Phase-1 reference chunk.  Commit after two
+    // chunks therefore aborts only after the first Phase-2 CIGAR work record
+    // is durable, exercising the stable Phase-2 chunk ID replay path.
+    let resumed = tmp.path().join("transitive_cigar_phase2_crash_resumed");
+    let (st, err) = run_depth_transitive_cigar_ref(
+        &alist,
+        &resumed,
+        "sampleR",
+        &["--resume"],
+        &[
+            ("IMPG_CIGAR_TRANSITIVE_BATCH", "1"),
+            ("IMPG_CHECKPOINT_INTERVAL_OVERRIDE", "2"),
+            ("IMPG_TEST_EXIT_AFTER_COMMIT", "1"),
+        ],
+    );
+    assert_eq!(
+        st.code(),
+        Some(99),
+        "expected Phase-2 forced exit 99; stderr=\n{err}"
+    );
+    let ckpt_path = PathBuf::from(format!("{}.depth.ckpt", resumed.display()));
+    let work_path = PathBuf::from(format!("{}.depth.work.bin", resumed.display()));
+    assert!(
+        ckpt_path.exists(),
+        "ckpt missing after Phase-2 simulated crash"
+    );
+    assert!(
+        work_path.exists(),
+        "work.bin missing after Phase-2 simulated crash"
+    );
+
+    let (st, err) = run_depth_transitive_cigar_ref(
+        &alist,
+        &resumed,
+        "sampleR",
+        &["--resume"],
+        &[("IMPG_CIGAR_TRANSITIVE_BATCH", "1")],
+    );
+    assert!(st.success(), "second --resume depth failed:\n{err}");
+    let resumed_tsv = read_normalized_tsv(Path::new(&format!("{}.depth.tsv", resumed.display())));
+    assert_eq!(
+        baseline_tsv, resumed_tsv,
+        "post-resume transitive CIGAR Phase-2 TSV differs from baseline"
+    );
+    assert!(!ckpt_path.exists(), "ckpt should be cleaned up on success");
+    assert!(
+        !work_path.exists(),
+        "work.bin should be cleaned up on successful resume"
+    );
 }
 
 #[test]
@@ -528,4 +755,30 @@ fn resume_nontrans_after_simulated_crash_matches_baseline() {
         !work_path.exists(),
         "work.bin should be cleaned up on success (non-transitive)"
     );
+}
+
+#[test]
+fn resume_nontrans_cigar_file_first_matches_baseline() {
+    let tmp = TempDir::new().unwrap();
+    let (_paths, alist) = build_test_dataset(tmp.path());
+
+    let baseline = tmp.path().join("baseline_nontrans_cigar");
+    let (st, err) = run_depth_nontrans_cigar(&alist, &baseline, &[], &[]);
+    assert!(st.success(), "nontrans CIGAR baseline failed:\n{err}");
+    assert!(
+        err.contains("Phase 2 hop-0 CIGAR"),
+        "file-first Phase 2 was not exercised:\n{err}"
+    );
+    let base_tsv = read_normalized_tsv(Path::new(&format!("{}.depth.tsv", baseline.display())));
+
+    let resumed = tmp.path().join("resumed_nontrans_cigar");
+    let (st, err) = run_depth_nontrans_cigar(
+        &alist,
+        &resumed,
+        &["--resume"],
+        &[("IMPG_CIGAR_QUERY_BATCH", "2")],
+    );
+    assert!(st.success(), "nontrans CIGAR resume run failed:\n{err}");
+    let resumed_tsv = read_normalized_tsv(Path::new(&format!("{}.depth.tsv", resumed.display())));
+    assert_eq!(base_tsv, resumed_tsv);
 }

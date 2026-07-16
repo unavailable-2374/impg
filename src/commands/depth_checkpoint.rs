@@ -36,7 +36,10 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -55,7 +58,12 @@ use serde::{Deserialize, Serialize};
 /// chain (notes/PLAN_hop_ge1_cigar_precise_IMPL.md, Part A). v2 rows have
 /// linear-interpolated hop≥1 coordinates; mixing them with v3 rows on resume
 /// would produce inconsistent coordinates, so v2 checkpoints are rejected.
-pub const CKPT_SCHEMA_VERSION: u32 = 3;
+///
+/// v4 (2026-07-15): direction is part of the CIGAR cache identity. V2
+/// bidirectional index entries can share a backing-file offset while requiring
+/// opposite I/D orientation; v3 could therefore emit directionally incorrect
+/// positions after cache reuse. Refuse to append corrected rows to those TSVs.
+pub const CKPT_SCHEMA_VERSION: u32 = 4;
 
 /// Bumped on any breaking layout change to the work-log binary format.
 pub const WORKLOG_VERSION: u16 = 1;
@@ -69,6 +77,66 @@ pub const TSV_SUFFIX: &str = ".depth.tsv";
 pub const WORKLOG_SUFFIX: &str = ".depth.work.bin";
 pub const CKPT_SUFFIX: &str = ".depth.ckpt";
 pub const CKPT_TMP_SUFFIX: &str = ".depth.ckpt.tmp";
+pub const LOCK_SUFFIX: &str = ".depth.lock";
+
+static CKPT_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Process-lifetime exclusive lock for one output prefix.
+///
+/// The lock file is intentionally retained after exit: the kernel advisory
+/// lock, not file existence, is the ownership signal. Retaining the small file
+/// also leaves useful provenance for diagnosing an interrupted SLURM job.
+pub struct DepthRunLock {
+    file: File,
+}
+
+impl DepthRunLock {
+    pub fn acquire(prefix: &str) -> io::Result<Self> {
+        let path = format!("{}{}", prefix, LOCK_SUFFIX);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|e| io::Error::new(e.kind(), format!("open depth lock '{}': {e}", path)))?;
+
+        #[cfg(unix)]
+        {
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                let e = io::Error::last_os_error();
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "output prefix '{}' is already locked by another depth process (lock '{}'): {}",
+                        prefix, path, e
+                    ),
+                ));
+            }
+        }
+
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        writeln!(file, "pid={}", std::process::id())?;
+        if let Ok(job_id) = std::env::var("SLURM_JOB_ID") {
+            writeln!(file, "slurm_job_id={job_id}")?;
+        }
+        if let Ok(host) = std::env::var("HOSTNAME") {
+            writeln!(file, "host={host}")?;
+        }
+        file.flush()?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for DepthRunLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
 
 /// Persistent state captured at every commit barrier.
 ///
@@ -118,21 +186,63 @@ impl DepthCheckpoint {
     /// [`fsync_dir`] after `save_atomic`.
     pub fn save_atomic(&self, prefix: &str) -> io::Result<()> {
         let final_path = format!("{}{}", prefix, CKPT_SUFFIX);
-        let tmp_path = format!("{}{}", prefix, CKPT_TMP_SUFFIX);
 
         let bytes = bincode::serde::encode_to_vec(self, bincode::config::standard())
             .map_err(|e| io::Error::other(format!("ckpt encode: {}", e)))?;
 
-        {
-            let mut f = OpenOptions::new()
-                .create(true)
+        // A unique create-new temporary prevents one process from renaming or
+        // truncating another process's in-flight checkpoint even if a caller
+        // bypasses the prefix lock. The run lock remains the primary guard.
+        let (tmp_path, mut f) = loop {
+            let serial = CKPT_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let tmp_path = format!(
+                "{}{}.{}.{}",
+                prefix,
+                CKPT_TMP_SUFFIX,
+                std::process::id(),
+                serial
+            );
+            match OpenOptions::new()
+                .create_new(true)
                 .write(true)
-                .truncate(true)
-                .open(&tmp_path)?;
-            f.write_all(&bytes)?;
-            f.sync_data()?;
+                .open(&tmp_path)
+            {
+                Ok(f) => break (tmp_path, f),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!("create checkpoint temporary '{}': {e}", tmp_path),
+                    ))
+                }
+            }
+        };
+        let write_result = (|| -> io::Result<()> {
+            f.write_all(&bytes).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("write checkpoint temporary '{}': {e}", tmp_path),
+                )
+            })?;
+            f.sync_data().map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("sync checkpoint temporary '{}': {e}", tmp_path),
+                )
+            })?;
+            drop(f);
+            fs::rename(&tmp_path, &final_path).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("rename checkpoint '{}' -> '{}': {e}", tmp_path, final_path),
+                )
+            })?;
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&tmp_path);
         }
-        fs::rename(&tmp_path, &final_path)?;
+        write_result?;
         Ok(())
     }
 
@@ -294,12 +404,32 @@ pub const WORKLOG_HEADER_LEN: u64 = 16;
 /// the writer thread. The hot path: called once per chunk by every worker,
 /// so it deliberately does no extra allocations beyond the result Vec.
 pub fn encode_work_record(chunk_id: u64, regions: &[(u32, i64, i64)]) -> Vec<u8> {
+    // A chunk commonly discovers the same query span through multiple direct
+    // alignments. Persisting every duplicate made VGP work logs tens of GB and
+    // forced billions of BTree insertions during resume. Canonicalise to the
+    // per-sequence interval union before encoding; replay only needs the union.
+    let mut merged: Vec<(u32, i64, i64)> = regions.to_vec();
+    if merged.len() > 1 {
+        merged.sort_unstable();
+        let mut write = 0usize;
+        for read in 1..merged.len() {
+            let (seq_id, start, end) = merged[read];
+            if seq_id == merged[write].0 && start <= merged[write].2 {
+                merged[write].2 = merged[write].2.max(end);
+            } else {
+                write += 1;
+                merged[write] = (seq_id, start, end);
+            }
+        }
+        merged.truncate(write + 1);
+    }
+
     // Record header: 4 + 8 + 4 = 16 bytes; payload: 20 bytes per region.
-    let mut out = Vec::with_capacity(16 + 20 * regions.len());
+    let mut out = Vec::with_capacity(16 + 20 * merged.len());
     out.extend_from_slice(&WORKLOG_RECORD_MARKER.to_le_bytes());
     out.extend_from_slice(&chunk_id.to_le_bytes());
-    out.extend_from_slice(&(regions.len() as u32).to_le_bytes());
-    for &(seq_id, start, end) in regions {
+    out.extend_from_slice(&(merged.len() as u32).to_le_bytes());
+    for (seq_id, start, end) in merged {
         out.extend_from_slice(&seq_id.to_le_bytes());
         out.extend_from_slice(&start.to_le_bytes());
         out.extend_from_slice(&end.to_le_bytes());
@@ -328,10 +458,29 @@ pub struct WorkRecord {
 /// - file missing while ckpt says we should have one ⇒ `InvalidData`
 /// - magic / version mismatch ⇒ `InvalidData`
 /// - truncated record ⇒ `UnexpectedEof`
+/// - corrupt record content (see below) ⇒ `InvalidData`
 ///
 /// The expected_end_offset is the `work_byte_offset` from the ckpt; bytes
 /// past it (already truncated by the resume entry path) must not exist.
-pub fn replay_work_log<F>(path: &Path, expected_end_offset: u64, mut cb: F) -> io::Result<u64>
+///
+/// `num_sequences` is the size of the current sequence index; every decoded
+/// `seq_id` is validated against it. This is the last line of defence against
+/// a *physically corrupt* work-log — one whose length still matches the ckpt
+/// (so the length check and per-record marker both pass) but whose interior
+/// bytes are a zero-hole or garbage from lost buffered writes (a job killed
+/// mid-write / a shared-FS extent loss). Without this check a garbage
+/// `seq_id` flows straight into `ConcurrentProcessedTracker::processed[seq_id]`
+/// and panics with an opaque `index out of bounds`; here we instead reject the
+/// file with an actionable error that names the corrupt byte offset. Records
+/// are additionally required to fit within `expected_end_offset` (so a garbage
+/// `num_regions` can't trigger a multi-GB `Vec` allocation) and to carry
+/// non-negative, non-inverted coordinates.
+pub fn replay_work_log<F>(
+    path: &Path,
+    expected_end_offset: u64,
+    num_sequences: u32,
+    mut cb: F,
+) -> io::Result<u64>
 where
     F: FnMut(WorkRecord) -> io::Result<()>,
 {
@@ -401,6 +550,22 @@ where
         let chunk_id = u64::from_le_bytes(head[4..12].try_into().unwrap());
         let num_regions = u32::from_le_bytes(head[12..16].try_into().unwrap()) as usize;
 
+        // The record must fit entirely within the committed region. A garbage
+        // `num_regions` (framing drift / corruption) would otherwise drive a
+        // multi-GB `Vec::with_capacity` and/or read past the ckpt offset.
+        let record_len = 16u64 + 20u64 * num_regions as u64;
+        if consumed + record_len > expected_end_offset {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "work-log {:?} corrupt: record at offset {} claims {} regions \
+                     ({} bytes), overrunning the committed length {}. The checkpoint \
+                     cannot be resumed — delete the .ckpt + .work.bin files to start fresh.",
+                    path, consumed, num_regions, record_len, expected_end_offset
+                ),
+            ));
+        }
+
         let mut regions: Vec<(u32, i64, i64)> = Vec::with_capacity(num_regions);
         let mut buf = [0u8; 20];
         for _ in 0..num_regions {
@@ -408,6 +573,24 @@ where
             let seq_id = u32::from_le_bytes(buf[0..4].try_into().unwrap());
             let start = i64::from_le_bytes(buf[4..12].try_into().unwrap());
             let end = i64::from_le_bytes(buf[12..20].try_into().unwrap());
+            // Reject out-of-range seq_ids and nonsensical coordinates. These
+            // never occur in a healthy work-log; when they do it means the file
+            // is physically corrupt (e.g. a zero-hole from lost writes) even
+            // though its length and record markers still line up. Fail loudly
+            // here rather than panicking downstream on `processed[seq_id]`.
+            if seq_id >= num_sequences || start < 0 || end < start {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "work-log {:?} corrupt: record at offset {} (chunk_id {}) has an \
+                         invalid region seq_id={} start={} end={} (num_sequences={}). The \
+                         work-log content is inconsistent with the current sequence index \
+                         — most likely truncated/zero-filled writes from an interrupted run. \
+                         Delete the .ckpt + .work.bin files to start fresh.",
+                        path, consumed, chunk_id, seq_id, start, end, num_sequences
+                    ),
+                ));
+            }
             regions.push((seq_id, start, end));
         }
         consumed += 16 + (20 * num_regions as u64);
@@ -472,6 +655,11 @@ pub fn encode_chunk_id_phase2(seq_id: u32, chunk_start: i64) -> u64 {
     let seq = ((seq_id as u64) & ((1u64 << 26) - 1)) << 36;
     let start = (chunk_start as u64) & ((1u64 << 36) - 1);
     PHASE2_TAG | seq | start
+}
+
+#[inline]
+pub fn is_phase2_gap_chunk_id(chunk_id: u64) -> bool {
+    chunk_id & (3u64 << 62) == PHASE2_TAG
 }
 
 pub fn encode_chunk_id_phase2_tile(seq_id: u32, tile_start: i64) -> u64 {
@@ -558,6 +746,46 @@ mod tests {
     }
 
     #[test]
+    fn output_prefix_lock_is_exclusive() {
+        let dir = tempdir().unwrap();
+        let prefix = dir.path().join("locked").to_string_lossy().into_owned();
+        let first = DepthRunLock::acquire(&prefix).unwrap();
+        let err = match DepthRunLock::acquire(&prefix) {
+            Ok(_) => panic!("second lock unexpectedly succeeded"),
+            Err(e) => e,
+        };
+        assert!(format!("{err}").contains("already locked"));
+        drop(first);
+        DepthRunLock::acquire(&prefix).unwrap();
+    }
+
+    #[test]
+    fn work_record_merges_duplicate_and_overlapping_regions() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("merged.bin");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&encode_worklog_header());
+        bytes.extend(encode_work_record(
+            7,
+            &[
+                (2, 50, 100),
+                (1, 20, 30),
+                (2, 0, 60),
+                (1, 10, 25),
+                (2, 0, 60),
+            ],
+        ));
+        std::fs::write(&path, &bytes).unwrap();
+        let mut got = Vec::new();
+        replay_work_log(&path, bytes.len() as u64, 4, |rec| {
+            got.push(rec);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(got[0].regions, vec![(1, 10, 30), (2, 0, 100)]);
+    }
+
+    #[test]
     fn worklog_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("w.bin");
@@ -570,7 +798,7 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
 
         let mut got: Vec<WorkRecord> = Vec::new();
-        let consumed = replay_work_log(&path, bytes.len() as u64, |rec| {
+        let consumed = replay_work_log(&path, bytes.len() as u64, 8, |rec| {
             got.push(rec);
             Ok(())
         })
@@ -601,7 +829,7 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
 
         let mut chunk_ids = Vec::new();
-        let consumed = replay_work_log(&path, stop_at, |rec| {
+        let consumed = replay_work_log(&path, stop_at, 8, |rec| {
             chunk_ids.push(rec.chunk_id);
             Ok(())
         })
@@ -617,8 +845,63 @@ mod tests {
         let mut bytes = vec![0u8; 16];
         bytes[0..4].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
         std::fs::write(&path, &bytes).unwrap();
-        let err = replay_work_log(&path, bytes.len() as u64, |_| Ok(())).unwrap_err();
+        let err = replay_work_log(&path, bytes.len() as u64, 8, |_| Ok(())).unwrap_err();
         assert!(format!("{err}").contains("bad magic"));
+    }
+
+    #[test]
+    fn worklog_out_of_range_seq_id_rejected() {
+        // Regression: a physically corrupt work-log whose length + record
+        // markers still parse must be rejected with a clean error rather than
+        // panicking downstream on `processed[seq_id]` (index out of bounds).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("w.bin");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&encode_worklog_header());
+        bytes.extend(encode_work_record(1, &[(0, 0, 100)]));
+        // seq_id 2458833 mirrors the real corruption; num_sequences below is 8.
+        bytes.extend(encode_work_record(2, &[(2_458_833, 0, 100)]));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = replay_work_log(&path, bytes.len() as u64, 8, |_| Ok(())).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let msg = format!("{err}");
+        assert!(msg.contains("corrupt"), "unexpected message: {msg}");
+        assert!(msg.contains("seq_id=2458833"), "unexpected message: {msg}");
+    }
+
+    #[test]
+    fn worklog_inverted_coords_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("w.bin");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&encode_worklog_header());
+        // end < start: garbage coordinates from a corrupt interior.
+        bytes.extend(encode_work_record(1, &[(0, 500, 100)]));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = replay_work_log(&path, bytes.len() as u64, 8, |_| Ok(())).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(format!("{err}").contains("corrupt"));
+    }
+
+    #[test]
+    fn worklog_overlong_num_regions_rejected() {
+        // A garbage `num_regions` must be caught by the fit-within-offset guard
+        // before it drives a giant allocation, not read past the committed end.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("w.bin");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&encode_worklog_header());
+        // Hand-write a record header claiming a huge region count with no payload.
+        bytes.extend_from_slice(&WORKLOG_RECORD_MARKER.to_le_bytes());
+        bytes.extend_from_slice(&7u64.to_le_bytes()); // chunk_id
+        bytes.extend_from_slice(&1_000_000_000u32.to_le_bytes()); // num_regions
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = replay_work_log(&path, bytes.len() as u64, 8, |_| Ok(())).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(format!("{err}").contains("overrunning"));
     }
 
     #[test]

@@ -45,6 +45,21 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 //   - `metadata_thp:auto`   — back jemalloc metadata with transparent huge
 //                             pages when available, reducing both metadata
 //                             VMAs and TLB pressure.
+//   - `retain:false`        — jemalloc's Linux default is `retain:true`, which
+//                             keeps freed extents mapped as PROT_NONE VMAs in a
+//                             retained pool instead of munmap-ing them. Those
+//                             retained ranges don't count as committed memory
+//                             (so RSS stays low) but each is a live VMA. Under
+//                             `impg depth`'s sub-index load/evict churn across
+//                             10⁵ files + 100+ threads, the retained pool
+//                             fragments past `vm.max_map_count` (65530), mmap
+//                             then fails ENOMEM, and a tiny alloc (e.g.
+//                             "memory allocation of 65536 bytes failed") aborts
+//                             the process while RSS is only ~20% of RAM.
+//                             `retain:false` munmaps freed extents so VMA count
+//                             tracks the live working set, at the cost of more
+//                             mmap/munmap syscalls (acceptable: allocator is not
+//                             the hotspot here).
 //   - `abort_conf:false`    — never abort if a future jemalloc rejects an
 //                             unknown option here; warn and continue.
 //
@@ -59,7 +74,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // `&'static c_char` in const context).
 #[cfg(feature = "jemalloc")]
 const JEMALLOC_MALLOC_CONF: &[u8] =
-    b"narenas:8,dirty_decay_ms:1000,muzzy_decay_ms:0,metadata_thp:auto,abort_conf:false\0";
+    b"narenas:8,retain:false,dirty_decay_ms:1000,muzzy_decay_ms:0,metadata_thp:auto,abort_conf:false\0";
 
 #[cfg(feature = "jemalloc")]
 #[allow(non_upper_case_globals)]
@@ -101,12 +116,13 @@ compile_error!(
      `--features jemalloc` (default) or `--no-default-features --features system-alloc`"
 );
 
-use clap::{ArgGroup, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use coitrees::{Interval, IntervalTree};
 use crossbeam_channel as channel;
 use impg::alignment_record::{AlignmentFormat, AlignmentRecord, Strand};
 use impg::commands::{
-    align, depth, genotype, graph, infer, lace, partition, refine, render, similarity,
+    align, depth, depth_checkpoint, genotype, graph, infer, lace, partition, refine, render,
+    similarity,
 };
 use impg::impg::{AdjustedInterval, CigarOp, Impg};
 use impg::impg_index::{ImpgIndex, ImpgWrapper};
@@ -6048,10 +6064,6 @@ GFA engine shorthand:
     ///
     /// Add-on:
     ///   --stats       Produce summary statistics and per-depth BED files
-    // `--cigar-precise` only makes sense in transitive mode, which is enabled by
-    // either `-x` (BFS) or `--transitive-dfs` (DFS); the group lets `requires`
-    // accept either one.
-    #[command(group(ArgGroup::new("transitive_mode").args(["transitive", "transitive_dfs"])))]
     Depth {
         #[clap(flatten)]
         alignment: AlignmentOpts,
@@ -6112,19 +6124,18 @@ GFA engine shorthand:
         #[clap(long, action)]
         merge_adjacent: bool,
 
-        /// Compute CIGAR-precise transitive depth: the `positions` column is
-        /// projected base-by-base through synthesized per-hop CIGARs (exact at
-        /// indels). Slower and higher memory. The default transitive path uses
-        /// raw-interval BFS with linear interpolation — faster, lower memory, and
-        /// sufficient when you only need region-level depth counts. Requires a
-        /// transitive mode (`-x` or `--transitive-dfs`). (Alias: `--use-BFS`.)
+        /// Compute CIGAR-precise depth: interval boundaries are projected
+        /// base-by-base through alignment CIGARs (exact at indels) instead of by
+        /// linear interpolation. Slower and higher memory than the default
+        /// (raw-interval + linear) path.
+        ///
+        /// Without a transitive flag this computes hop-0 (direct alignments)
+        /// only — ideal for all-vs-all inputs where every sample pair already has
+        /// a direct alignment, so no transitive exploration is needed. Combined
+        /// with `-x` / `--transitive-dfs` it makes the whole transitive chain
+        /// CIGAR-precise. (Alias: `--use-BFS`.)
         #[arg(help_heading = "Performance")]
-        #[clap(
-            long = "cigar-precise",
-            visible_alias = "use-BFS",
-            action,
-            requires = "transitive_mode"
-        )]
+        #[clap(long = "cigar-precise", visible_alias = "use-BFS", action)]
         cigar_precise: bool,
 
         /// Separator for PanSN format (default: #)
@@ -10557,6 +10568,15 @@ fn run() -> io::Result<()> {
         } => {
             initialize_threads_and_log(&common);
 
+            // Acquire before alignment discovery/index initialization so a
+            // duplicate SLURM job fails immediately rather than spending
+            // minutes loading 10^5+ per-file indices before discovering that
+            // the output/checkpoint prefix already has a writer.
+            let _depth_run_lock = output_prefix
+                .as_deref()
+                .map(depth_checkpoint::DepthRunLock::acquire)
+                .transpose()?;
+
             let alignment_files = resolve_alignment_files(&alignment)?;
 
             let impg = initialize_index(
@@ -10581,6 +10601,7 @@ fn run() -> io::Result<()> {
                 min_distance_between_ranges: transitive_opts.min_distance_between_ranges as i64,
                 merge_adjacent,
                 use_cigar_bfs: cigar_precise,
+                compute_pangenome_bases: stats,
             };
 
             // Region query mode: depth for specific genomic regions
@@ -10609,16 +10630,17 @@ fn run() -> io::Result<()> {
                 let mut all_results: Vec<depth::RegionDepthResult> = Vec::new();
                 let mut all_samples: rustc_hash::FxHashSet<String> =
                     rustc_hash::FxHashSet::default();
+                let region_context =
+                    depth::RegionDepthContext::new(&impg, &separator, sample_filter.as_ref());
 
                 for (seq_name, start, end) in &regions {
-                    let results = depth::query_region_depth(
+                    let results = depth::query_region_depth_with_context(
                         &impg,
                         &config,
                         seq_name,
                         *start,
                         *end,
-                        &separator,
-                        sample_filter.as_ref(),
+                        &region_context,
                         None,
                     )?;
 
@@ -10797,7 +10819,11 @@ fn build_engine_opts(
         sparsify,
         mash_params,
         aligner: aln.sw.aligner.clone(),
-        map_pct_identity: aln.sw.map_pct_identity.clone().or_else(|| Some("90".to_string())),
+        map_pct_identity: aln
+            .sw
+            .map_pct_identity
+            .clone()
+            .or_else(|| Some("90".to_string())),
         num_mappings: aln.sw.num_mappings.clone(),
         scaffold_jump: aln.sw.scaffold_jump,
         scaffold_mass: aln.sw.scaffold_mass,

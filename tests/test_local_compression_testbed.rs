@@ -623,14 +623,17 @@ fn local_compression_chunk_window_sweepga_seqwish_is_resolver_distinct() {
         assert_eq!(row["flubble_count"].as_u64(), Some(2));
     }
 
-    let smooth_gfa = fs::read_to_string(root.join(smooth["normalized_gfa_path"].as_str().unwrap())).unwrap();
-    let sweepga_gfa = fs::read_to_string(root.join(sweepga["normalized_gfa_path"].as_str().unwrap())).unwrap();
+    let smooth_gfa =
+        fs::read_to_string(root.join(smooth["normalized_gfa_path"].as_str().unwrap())).unwrap();
+    let sweepga_gfa =
+        fs::read_to_string(root.join(sweepga["normalized_gfa_path"].as_str().unwrap())).unwrap();
     assert_ne!(
         smooth_gfa, sweepga_gfa,
         "SweepGA/seqwish chunk row should exercise a resolver-distinct graph construction"
     );
     assert!(
-        sweepga["total_segment_bp"].as_u64().unwrap() < smooth["total_segment_bp"].as_u64().unwrap(),
+        sweepga["total_segment_bp"].as_u64().unwrap()
+            < smooth["total_segment_bp"].as_u64().unwrap(),
         "resolver-distinct row should reuse sequence across windows: smooth={} sweepga={}",
         smooth["total_segment_bp"],
         sweepga["total_segment_bp"]

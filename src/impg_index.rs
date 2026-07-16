@@ -5,7 +5,7 @@
 //! the same interface to query commands, making the multi-index logic invisible
 //! to callers.
 
-use crate::impg::{AdjustedInterval, CigarOp, Impg, QueryMetadata, SortedRanges};
+use crate::impg::{AdjustedInterval, CigarCacheKey, CigarOp, Impg, QueryMetadata, SortedRanges};
 use crate::multi_impg::MultiImpg;
 use crate::seqidx::SequenceIndex;
 use crate::sequence_index::UnifiedSequenceIndex;
@@ -56,7 +56,7 @@ pub trait ImpgIndex: Send + Sync {
         store_cigar: bool,
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
-        cigar_cache: &FxHashMap<(u32, u64), Vec<CigarOp>>,
+        cigar_cache: &FxHashMap<CigarCacheKey, Vec<CigarOp>>,
     ) -> io::Result<Vec<AdjustedInterval>>;
 
     /// Populate CIGAR cache for a region.
@@ -67,7 +67,7 @@ pub trait ImpgIndex: Send + Sync {
         range_end: i64,
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
-        cache: &mut FxHashMap<(u32, u64), Vec<CigarOp>>,
+        cache: &mut FxHashMap<CigarCacheKey, Vec<CigarOp>>,
     );
 
     /// Transitive query using depth-first search.
@@ -164,6 +164,46 @@ pub trait ImpgIndex: Send + Sync {
     /// Useful for depth computation with many alignment files to bound peak memory.
     fn clear_sub_index_cache(&self) {}
 
+    /// Adaptively *lower* the `MultiImpg` sub-index (BFS/transitive) cache cap.
+    ///
+    /// Peak residency in that cache is `cap × per-sub-index-bytes` (the oldest
+    /// resident is evicted incrementally, FIFO, once the count hits the cap), so
+    /// the cap is the dominant memory lever for the CIGAR-precise depth path,
+    /// which keeps tree caching
+    /// ON. A caller that knows its concurrency can shrink the cap before the
+    /// parallel region to keep peak memory bounded at hundreds-of-thousands of
+    /// per-file indices. Only ever moves the cap down; an explicit
+    /// `IMPG_SUB_INDEX_CACHE_LIMIT` override and `limit == 0` are ignored.
+    /// For single `Impg` (no sub-index cache) this is a no-op.
+    fn set_sub_index_cache_limit(&self, _limit: usize) {}
+
+    /// Adaptively *lower* the `MultiImpg` sub-index cache **byte** budget.
+    ///
+    /// A slot-*count* cap cannot bound RAM when per-file index sizes span
+    /// orders of magnitude (KB to ~1 GB on all-vs-all workloads): the
+    /// CIGAR-precise depth path anchors on the highest-degree hub sequences,
+    /// whose neighbour indices are exactly the large tail, so a few thousand
+    /// cached slots can reach >100 GB. This budget bounds estimated resident
+    /// bytes directly. Only ever moves the budget down; an explicit
+    /// `IMPG_SUB_INDEX_CACHE_BYTES` override and `budget == 0` are ignored.
+    /// For single `Impg` (no sub-index cache) this is a no-op.
+    fn set_sub_index_cache_byte_budget(&self, _budget_bytes: u64) {}
+
+    /// Relax the `MultiImpg` sub-index slot-*count* cap so the **byte** budget
+    /// becomes the sole residency governor.
+    ///
+    /// The count cap defaults to a conservative `min(num_indices, 8192)` as a
+    /// `vm.max_map_count` backstop. But sub-indices are heap-loaded (not mmap'd),
+    /// and jemalloc packs their allocations into a handful of arenas — measured
+    /// at ~900 VMAs for 8192 cached files, i.e. ~0.1 VMAs/file, leaving ~65×
+    /// headroom under a typical 65530 `max_map_count`. When a byte budget is in
+    /// force (CIGAR-precise depth), that budget already bounds RAM safely, so the
+    /// 8192-slot cap only throttles the warm working set (~580 files/query ×
+    /// thread count ≫ 8192) into needless disk re-decompression. This raises the
+    /// cap to `num_indices` so the byte budget governs. Honours an explicit
+    /// `IMPG_SUB_INDEX_CACHE_LIMIT`. For single `Impg` this is a no-op.
+    fn relax_sub_index_cache_count_cap(&self) {}
+
     /// Clear the transient per-file header cache used by `MultiImpg`'s
     /// chunked Phase 1/2 hot paths (`load_sub_index_transient`). For single
     /// `Impg` this is a no-op; the default implementation matches that.
@@ -258,13 +298,13 @@ pub trait ImpgIndex: Send + Sync {
     fn batch_query_raw_overlapping(
         &self,
         queries: &[(u32, i64, i64)],
-    ) -> Vec<Vec<RawAlignmentInterval>> {
-        queries
+    ) -> io::Result<Vec<Vec<RawAlignmentInterval>>> {
+        Ok(queries
             .iter()
             .map(|&(target_id, start, end)| {
                 self.query_raw_overlapping_transient(target_id, start, end)
             })
-            .collect()
+            .collect())
     }
 
     /// CIGAR-carrying analogue of `batch_query_raw_overlapping`: for each
@@ -281,8 +321,8 @@ pub trait ImpgIndex: Send + Sync {
     /// chunks.
     ///
     /// Default: per-query `query` (single-file `Impg` keeps everything resident,
-    /// so there is no file-sharing to exploit). Errors map to an empty result
-    /// for that query, matching how the raw batch path warns-and-skips.
+    /// so there is no file-sharing to exploit). Errors are propagated so a
+    /// missing/corrupt sub-index cannot silently produce incomplete depth.
     fn batch_query_overlapping_with_cigar(
         &self,
         queries: &[(u32, i64, i64)],
@@ -290,7 +330,7 @@ pub trait ImpgIndex: Send + Sync {
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
         approximate_mode: bool,
-    ) -> Vec<Vec<AdjustedInterval>> {
+    ) -> io::Result<Vec<Vec<AdjustedInterval>>> {
         queries
             .iter()
             .map(|&(target_id, start, end)| {
@@ -303,7 +343,82 @@ pub trait ImpgIndex: Send + Sync {
                     sequence_index,
                     approximate_mode,
                 )
-                .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// Single-hop CIGAR-projected overlaps for one region, with each overlap's
+    /// CIGAR passed through `compress` the instant it is reconstructed — so the
+    /// uncompressed per-base CIGAR is freed before the next alignment (and, for
+    /// `MultiImpg`, before the next alignment *file*) is processed.
+    ///
+    /// This is the memory-bounding analogue of `query(.., store_cigar=true)` for
+    /// the depth hop-0 CIGAR sweep. The plain `MultiImpg::query` reconstructs and
+    /// holds EVERY overlapping file's full CIGAR resident at once
+    /// (`degree × region_len × ops_per_base × 4 B`), which OOMs an all-vs-all run
+    /// at 10^5 per-file indices: a 5 MB hub chunk over ~580 species is ~3.4 GB of
+    /// uncompressed CIGAR, times the rayon thread count of concurrent chunks.
+    /// Compressing each file's overlaps before they leave the worker keeps only
+    /// one alignment *file*'s uncompressed CIGAR live per worker (~one file's
+    /// overlaps, not all `degree` files'); the accumulated result holds only the
+    /// (tiny) compressed CIGARs.
+    ///
+    /// The returned overlaps are identical — same order, same compressed CIGAR —
+    /// to `query(.., true, ..).map(|o| { o.1 = compress(&o.1); o })`, so a caller
+    /// that already coordinate-compresses each overlap gets byte-identical output.
+    ///
+    /// Default: a normal `query` followed by compression (single-file `Impg` keeps
+    /// everything resident anyway, so there is no per-file streaming to exploit).
+    fn query_overlapping_cigar_compressed(
+        &self,
+        target_id: u32,
+        range_start: i64,
+        range_end: i64,
+        compress: &(dyn Fn(&[CigarOp]) -> Vec<CigarOp> + Sync),
+    ) -> Vec<AdjustedInterval> {
+        let mut overlaps = self
+            .query(target_id, range_start, range_end, true, None, None, false)
+            .unwrap_or_default();
+        for o in &mut overlaps {
+            o.1 = compress(&o.1);
+        }
+        overlaps
+    }
+
+    /// Return compressed CIGAR projections and raw alignment extents together.
+    /// Multi-file implementations override this so both views are collected
+    /// while the same sub-index and interval tree are resident.
+    fn query_overlapping_cigar_compressed_with_raw(
+        &self,
+        target_id: u32,
+        range_start: i64,
+        range_end: i64,
+        compress: &(dyn Fn(&[CigarOp]) -> Vec<CigarOp> + Sync),
+    ) -> (Vec<AdjustedInterval>, Vec<RawAlignmentInterval>) {
+        (
+            self.query_overlapping_cigar_compressed(target_id, range_start, range_end, compress),
+            self.query_raw_overlapping(target_id, range_start, range_end),
+        )
+    }
+
+    /// Batch form of `query_overlapping_cigar_compressed_with_raw`.
+    /// Implementations with many per-file indices should group all queries by
+    /// file so one index/tree load serves the whole batch. Unlike legacy batch
+    /// helpers this API is strict: an input/index/CIGAR failure aborts the batch
+    /// instead of silently returning an incomplete result.
+    fn batch_query_overlapping_cigar_compressed_with_raw(
+        &self,
+        queries: &[(u32, i64, i64)],
+        compress: &(dyn Fn(&[CigarOp]) -> Vec<CigarOp> + Sync),
+    ) -> io::Result<Vec<(Vec<AdjustedInterval>, Vec<RawAlignmentInterval>)>> {
+        queries
+            .iter()
+            .map(|&(target_id, start, end)| {
+                let mut overlaps = self.query(target_id, start, end, true, None, None, false)?;
+                for overlap in &mut overlaps {
+                    overlap.1 = compress(&overlap.1);
+                }
+                Ok((overlaps, self.query_raw_overlapping(target_id, start, end)))
             })
             .collect()
     }
@@ -322,8 +437,12 @@ pub trait ImpgIndex: Send + Sync {
     /// is fine for single-file `Impg` but explodes memory for `MultiImpg` with hundreds of
     /// thousands of per-file sub-indices, which is why `MultiImpg` overrides it with a
     /// file-parallel strategy that bounds retained sub-indices to `num_threads`.
-    fn compute_sample_degrees(&self, seq_included: &[bool], seq_to_sample: &[u16]) -> Vec<u16> {
-        (0..seq_included.len() as u32)
+    fn compute_sample_degrees(
+        &self,
+        seq_included: &[bool],
+        seq_to_sample: &[u16],
+    ) -> io::Result<Vec<u16>> {
+        Ok((0..seq_included.len() as u32)
             .into_par_iter()
             .map(|seq_id| {
                 if !seq_included.get(seq_id as usize).copied().unwrap_or(false) {
@@ -353,7 +472,7 @@ pub trait ImpgIndex: Send + Sync {
                 }
                 samples.len().min(u16::MAX as usize) as u16
             })
-            .collect()
+            .collect())
     }
 
     /// Access the underlying `SyngIndex` if this implementation is
@@ -445,7 +564,7 @@ impl ImpgIndex for ImpgWrapper {
         store_cigar: bool,
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
-        cigar_cache: &FxHashMap<(u32, u64), Vec<CigarOp>>,
+        cigar_cache: &FxHashMap<CigarCacheKey, Vec<CigarOp>>,
     ) -> io::Result<Vec<AdjustedInterval>> {
         match self {
             ImpgWrapper::Single(impg) => Ok(impg.query_with_cache(
@@ -477,7 +596,7 @@ impl ImpgIndex for ImpgWrapper {
         range_end: i64,
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
-        cache: &mut FxHashMap<(u32, u64), Vec<CigarOp>>,
+        cache: &mut FxHashMap<CigarCacheKey, Vec<CigarOp>>,
     ) {
         match self {
             ImpgWrapper::Single(impg) => impg.populate_cigar_cache(
@@ -686,6 +805,25 @@ impl ImpgIndex for ImpgWrapper {
         }
     }
 
+    fn set_sub_index_cache_limit(&self, limit: usize) {
+        // Without this override a call on a `&dyn ImpgIndex` typed as
+        // `ImpgWrapper` would hit the trait default no-op and silently leave the
+        // `MultiImpg` cap at its 8192 default, defeating the adaptive lowering.
+        match self {
+            ImpgWrapper::Single(_) => {}
+            ImpgWrapper::Multi(multi) => multi.set_sub_index_cache_limit(limit),
+        }
+    }
+
+    fn set_sub_index_cache_byte_budget(&self, budget_bytes: u64) {
+        // See set_sub_index_cache_limit: the trait default no-op would otherwise
+        // leave the MultiImpg byte budget unset for a `&dyn ImpgIndex`.
+        match self {
+            ImpgWrapper::Single(_) => {}
+            ImpgWrapper::Multi(multi) => multi.set_sub_index_cache_byte_budget(budget_bytes),
+        }
+    }
+
     fn clear_transient_header_cache(&self) {
         // Without this override, calls on a `&dyn ImpgIndex` / `&impl ImpgIndex`
         // typed as `ImpgWrapper` would silently use the trait default no-op,
@@ -732,6 +870,64 @@ impl ImpgIndex for ImpgWrapper {
         }
     }
 
+    fn query_overlapping_cigar_compressed(
+        &self,
+        target_id: u32,
+        range_start: i64,
+        range_end: i64,
+        compress: &(dyn Fn(&[CigarOp]) -> Vec<CigarOp> + Sync),
+    ) -> Vec<AdjustedInterval> {
+        match self {
+            ImpgWrapper::Single(impg) => {
+                impg.query_overlapping_cigar_compressed(target_id, range_start, range_end, compress)
+            }
+            ImpgWrapper::Multi(multi) => multi.query_overlapping_cigar_compressed(
+                target_id,
+                range_start,
+                range_end,
+                compress,
+            ),
+        }
+    }
+
+    fn query_overlapping_cigar_compressed_with_raw(
+        &self,
+        target_id: u32,
+        range_start: i64,
+        range_end: i64,
+        compress: &(dyn Fn(&[CigarOp]) -> Vec<CigarOp> + Sync),
+    ) -> (Vec<AdjustedInterval>, Vec<RawAlignmentInterval>) {
+        match self {
+            ImpgWrapper::Single(impg) => impg.query_overlapping_cigar_compressed_with_raw(
+                target_id,
+                range_start,
+                range_end,
+                compress,
+            ),
+            ImpgWrapper::Multi(multi) => multi.query_overlapping_cigar_compressed_with_raw(
+                target_id,
+                range_start,
+                range_end,
+                compress,
+            ),
+        }
+    }
+
+    fn batch_query_overlapping_cigar_compressed_with_raw(
+        &self,
+        queries: &[(u32, i64, i64)],
+        compress: &(dyn Fn(&[CigarOp]) -> Vec<CigarOp> + Sync),
+    ) -> io::Result<Vec<(Vec<AdjustedInterval>, Vec<RawAlignmentInterval>)>> {
+        match self {
+            ImpgWrapper::Single(impg) => {
+                impg.batch_query_overlapping_cigar_compressed_with_raw(queries, compress)
+            }
+            ImpgWrapper::Multi(multi) => {
+                multi.batch_query_overlapping_cigar_compressed_with_raw(queries, compress)
+            }
+        }
+    }
+
     fn query_raw_intervals_transient(&self, target_id: u32) -> Vec<RawAlignmentInterval> {
         match self {
             // Single Impg: no per-file sub-index cache, trait default (== cached path) is fine.
@@ -760,7 +956,7 @@ impl ImpgIndex for ImpgWrapper {
     fn batch_query_raw_overlapping(
         &self,
         queries: &[(u32, i64, i64)],
-    ) -> Vec<Vec<RawAlignmentInterval>> {
+    ) -> io::Result<Vec<Vec<RawAlignmentInterval>>> {
         match self {
             ImpgWrapper::Single(impg) => impg.batch_query_raw_overlapping(queries),
             ImpgWrapper::Multi(multi) => multi.batch_query_raw_overlapping(queries),
@@ -774,7 +970,7 @@ impl ImpgIndex for ImpgWrapper {
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
         approximate_mode: bool,
-    ) -> Vec<Vec<AdjustedInterval>> {
+    ) -> io::Result<Vec<Vec<AdjustedInterval>>> {
         match self {
             // Single Impg has everything resident: the trait default (per-query
             // `query`) is already optimal, no file-sharing to exploit.
@@ -795,7 +991,11 @@ impl ImpgIndex for ImpgWrapper {
         }
     }
 
-    fn compute_sample_degrees(&self, seq_included: &[bool], seq_to_sample: &[u16]) -> Vec<u16> {
+    fn compute_sample_degrees(
+        &self,
+        seq_included: &[bool],
+        seq_to_sample: &[u16],
+    ) -> io::Result<Vec<u16>> {
         match self {
             // Single Impg: default trait impl (parallel-by-target) is already optimal.
             ImpgWrapper::Single(impg) => impg.compute_sample_degrees(seq_included, seq_to_sample),

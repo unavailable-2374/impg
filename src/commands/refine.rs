@@ -200,7 +200,8 @@ fn refine_single_range(
     };
 
     // Pre-populate CIGAR cache for max interval (if not using transitive queries)
-    let mut cigar_cache: FxHashMap<(u32, u64), Vec<crate::impg::CigarOp>> = FxHashMap::default();
+    let mut cigar_cache: FxHashMap<crate::impg::CigarCacheKey, Vec<crate::impg::CigarOp>> =
+        FxHashMap::default();
     if !config.use_transitive_bfs && !config.use_transitive_dfs {
         let max_start = orig_start.saturating_sub(max_extension_bp).max(0);
         let max_end = orig_end.saturating_add(max_extension_bp).min(seq_len);
@@ -421,7 +422,7 @@ fn evaluate_candidate(
     config: &RefineConfig<'_>,
     sequence_index: Option<&UnifiedSequenceIndex>,
     max_entities: Option<usize>,
-    cigar_cache: &FxHashMap<(u32, u64), Vec<crate::impg::CigarOp>>,
+    cigar_cache: &FxHashMap<crate::impg::CigarCacheKey, Vec<crate::impg::CigarOp>>,
 ) -> io::Result<Option<CandidateResult>> {
     let tentative_start = orig_start.saturating_sub(left_flank);
     let tentative_end = orig_end.saturating_add(right_flank);
@@ -485,7 +486,7 @@ fn query_overlaps(
     config: &RefineConfig<'_>,
     sequence_index: Option<&UnifiedSequenceIndex>,
     buffer: &mut Vec<AdjustedInterval>,
-    cigar_cache: &FxHashMap<(u32, u64), Vec<crate::impg::CigarOp>>,
+    cigar_cache: &FxHashMap<crate::impg::CigarCacheKey, Vec<crate::impg::CigarOp>>,
 ) -> io::Result<()> {
     buffer.clear();
 
