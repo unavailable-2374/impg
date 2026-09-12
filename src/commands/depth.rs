@@ -2771,13 +2771,12 @@ fn build_sequence_order(
 /// Build locality-aware Phase-2 waves while preserving the existing
 /// degree/length priority within every alignment-file connectivity component.
 ///
-/// One sequence per component is admitted to each selective wave. After a
-/// wave finishes, callers re-read `ConcurrentProcessedTracker`; homologous
-/// regions discovered by the earlier anchor are therefore masked before the
-/// next sequence from the same component is queried. The final wave contains
-/// every remaining sequence when `max_waves` would otherwise be exceeded,
-/// preventing a dense component with weak alignments from degenerating into
-/// hundreds of thousands of global barriers.
+/// Each component is split into at most `max_waves` ordered, nearly balanced
+/// slices. Small components still admit one sequence per wave; dense components
+/// admit enough consecutive sequences per wave to avoid a huge final fallback
+/// and hundreds of effectively serial barriers. After a wave finishes, callers
+/// re-read `ConcurrentProcessedTracker`, so regions discovered by earlier
+/// anchors are masked before the next slice from the same component is queried.
 fn build_phase2_waves(
     sequence_order: &[u32],
     component_labels: &[u32],
@@ -2801,29 +2800,24 @@ fn build_phase2_waves(
         groups[group_idx].push(seq_id);
     }
 
-    let selective_waves = max_waves.saturating_sub(1);
     let max_group_len = groups.iter().map(Vec::len).max().unwrap_or(0);
-    let mut waves = Vec::new();
-    let emitted_selective = selective_waves.min(max_group_len);
-    for rank in 0..emitted_selective {
-        let wave: Vec<u32> = groups
-            .iter()
-            .filter_map(|group| group.get(rank).copied())
-            .collect();
+    let wave_count = max_waves.min(max_group_len);
+    let mut waves = Vec::with_capacity(wave_count);
+    for wave_idx in 0..wave_count {
+        let mut wave = Vec::new();
+        for group in &groups {
+            let group_wave_count = max_waves.min(group.len());
+            if wave_idx >= group_wave_count {
+                continue;
+            }
+            let base = group.len() / group_wave_count;
+            let remainder = group.len() % group_wave_count;
+            let start = wave_idx * base + wave_idx.min(remainder);
+            let end = start + base + usize::from(wave_idx < remainder);
+            wave.extend_from_slice(&group[start..end]);
+        }
         if !wave.is_empty() {
             waves.push(wave);
-        }
-    }
-
-    if max_group_len > emitted_selective {
-        let scheduled: FxHashSet<u32> = waves.iter().flatten().copied().collect();
-        let fallback: Vec<u32> = sequence_order
-            .iter()
-            .copied()
-            .filter(|seq_id| !scheduled.contains(seq_id))
-            .collect();
-        if !fallback.is_empty() {
-            waves.push(fallback);
         }
     }
     waves
@@ -6298,12 +6292,16 @@ pub fn compute_depth_global(
             .copied()
             .collect::<FxHashSet<_>>()
             .len();
+        let min_wave_size = phase2_waves.iter().map(Vec::len).min().unwrap_or(0);
+        let max_wave_size = phase2_waves.iter().map(Vec::len).max().unwrap_or(0);
         info!(
-            "Phase 2 locality scheduler: {} sequences, {} file-connected components, {} waves (cap {})",
+            "Phase 2 locality scheduler: {} sequences, {} file-connected components, {} balanced waves (cap {}, candidates/wave {}..={})",
             phase2_seqs.len(),
             component_count,
             phase2_waves.len(),
             config.phase2_max_waves,
+            min_wave_size,
+            max_wave_size,
         );
     }
 
@@ -9322,11 +9320,26 @@ mod tests {
     }
 
     #[test]
-    fn phase2_wave_planner_caps_barriers_with_ordered_fallback() {
+    fn phase2_wave_planner_balances_dense_components_across_cap() {
         let order = vec![10, 20, 11, 21, 12, 22, 13];
         let labels = vec![1, 2, 1, 2, 1, 2, 1];
         let waves = build_phase2_waves(&order, &labels, 3);
-        assert_eq!(waves, vec![vec![10, 20], vec![11, 21], vec![12, 22, 13]]);
+        assert_eq!(waves, vec![vec![10, 11, 20], vec![12, 21], vec![13, 22]]);
+    }
+
+    #[test]
+    fn phase2_wave_planner_avoids_single_component_fallback_cliff() {
+        let order: Vec<u32> = (0..1_003).collect();
+        let labels = vec![7; order.len()];
+        let waves = build_phase2_waves(&order, &labels, 10);
+        let sizes: Vec<usize> = waves.iter().map(Vec::len).collect();
+
+        assert_eq!(waves.len(), 10);
+        assert_eq!(
+            sizes,
+            vec![101, 101, 101, 100, 100, 100, 100, 100, 100, 100]
+        );
+        assert_eq!(waves.into_iter().flatten().collect::<Vec<_>>(), order);
     }
 
     #[test]

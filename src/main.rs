@@ -6153,10 +6153,11 @@ GFA engine shorthand:
         #[clap(long, value_parser)]
         window_size: Option<i64>,
 
-        /// Maximum locality-aware Phase-2 waves. Each wave admits at most one
-        /// anchor sequence per alignment-connected component, then masks all
-        /// discovered regions before the next wave. The last wave contains any
-        /// residual sequences after the cap. Set to 1 to disable wave splitting.
+        /// Maximum locality-aware Phase-2 waves. Each alignment-connected
+        /// component is split into ordered, balanced slices across at most this
+        /// many waves; discovered regions are masked between waves. Small
+        /// components retain one anchor sequence per wave. Set to 1 to disable
+        /// wave splitting.
         #[arg(help_heading = "Performance")]
         #[clap(long, value_parser, default_value_t = NonZeroUsize::new(64).unwrap())]
         phase2_max_waves: NonZeroUsize,

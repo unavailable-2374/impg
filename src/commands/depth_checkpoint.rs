@@ -67,6 +67,10 @@ pub const CKPT_SCHEMA_VERSION: u32 = 4;
 
 /// Bumped on any breaking layout change to the work-log binary format.
 pub const WORKLOG_VERSION: u16 = 1;
+/// Bump whenever Phase-2 scheduling can change which sequence becomes an
+/// anchor. It is included in the input hash so a resume cannot silently append
+/// rows produced by a different scheduling policy.
+pub const PHASE2_WAVE_SCHEDULER_VERSION: u16 = 2;
 /// Identifies a `.depth.work.bin` file. ASCII "IMPW".
 pub const WORKLOG_MAGIC: u32 = 0x49_4D_50_57;
 /// Per-record sentinel inside the work-log. ASCII "RECD".
@@ -332,6 +336,7 @@ pub fn compute_invalidation_hash(alignment_files: &[String], inputs: &HashInputs
     // the ckpt or work-log layout invalidates older artifacts automatically.
     CKPT_SCHEMA_VERSION.hash(&mut hasher);
     WORKLOG_VERSION.hash(&mut hasher);
+    PHASE2_WAVE_SCHEDULER_VERSION.hash(&mut hasher);
 
     // Alignment files: path + size + mtime (seconds + nanoseconds). mtime is
     // brittle under `cp` without `-p`; if a caller hits a false-positive

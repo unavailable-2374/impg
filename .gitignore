@@ -19,3 +19,7 @@ demo-results
 .claude/
 perf.data
 perf.data.old
+
+# Scratch indices written by `impg depth` next to the working directory during
+# the 581-genome runs; they are rebuildable and there are tens of thousands.
+combined_*.impg
