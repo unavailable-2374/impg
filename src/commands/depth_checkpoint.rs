@@ -304,6 +304,12 @@ pub fn fsync_dir(path: &Path) -> io::Result<()> {
 /// incompatible state.
 #[derive(Debug, Clone, Copy)]
 pub struct HashInputs<'a> {
+    /// The explicit sequence processing order, if one was requested.  It is in
+    /// here because the order decides the PARTITION: resuming a checkpoint
+    /// written under one order into a run using another would interleave two
+    /// different partitions of the same pangenome, and nothing downstream could
+    /// tell.
+    pub explicit_order: Option<&'a [String]>,
     pub ref_sample: Option<&'a str>,
     pub ref_only: bool,
     pub min_seq_length: i64,
@@ -363,6 +369,15 @@ pub fn compute_invalidation_hash(alignment_files: &[String], inputs: &HashInputs
     }
 
     // Config that influences chunk identity / discovered_regions content.
+    match inputs.explicit_order {
+        None => 0u64.hash(&mut hasher),
+        Some(names) => {
+            (names.len() as u64).hash(&mut hasher);
+            for n in names {
+                n.hash(&mut hasher);
+            }
+        }
+    }
     inputs.ref_sample.unwrap_or("").hash(&mut hasher);
     inputs.ref_only.hash(&mut hasher);
     inputs.min_seq_length.hash(&mut hasher);
@@ -961,6 +976,7 @@ mod tests {
     #[test]
     fn invalidation_hash_changes_with_config() {
         let inputs1 = HashInputs {
+            explicit_order: None,
             ref_sample: None,
             ref_only: false,
             min_seq_length: 0,
@@ -989,5 +1005,19 @@ mod tests {
         inputs3.phase2_max_waves = 1;
         let h3 = compute_invalidation_hash(&[], &inputs3);
         assert_ne!(h1, h3, "Phase-2 wave cap must change hash");
+
+        // The processing order decides the partition, so two runs that differ
+        // only in it must not share a checkpoint.  Order matters, not just
+        // membership: a permutation is a different run.
+        let o1 = vec!["a".to_string(), "b".to_string()];
+        let o2 = vec!["b".to_string(), "a".to_string()];
+        let mut inputs4 = inputs1.clone();
+        inputs4.explicit_order = Some(&o1);
+        let mut inputs5 = inputs1.clone();
+        inputs5.explicit_order = Some(&o2);
+        let h4 = compute_invalidation_hash(&[], &inputs4);
+        let h5 = compute_invalidation_hash(&[], &inputs5);
+        assert_ne!(h1, h4, "an explicit order must change the hash");
+        assert_ne!(h4, h5, "permuting the order must change the hash");
     }
 }

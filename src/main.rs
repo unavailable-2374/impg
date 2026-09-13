@@ -6076,12 +6076,16 @@ GFA engine shorthand:
         #[clap(flatten)]
         transitive_opts: TransitiveOpts,
 
-        /// File containing reference sequence names in processing order (one per line)
+        /// File of sequence names, one per line, to process in exactly that
+        /// order. Named sequences are anchored first, in the order given; any
+        /// sequence not named follows under the default rule. The order is part
+        /// of the checkpoint's invalidation hash, so changing it starts a fresh
+        /// run rather than resuming into a different partition.
         #[arg(help_heading = "Reference order")]
         #[clap(long, value_parser, conflicts_with = "ref_order")]
         ref_order_file: Option<String>,
 
-        /// Comma-separated list of reference sequence names in processing order
+        /// Comma-separated sequence names to process in exactly that order
         #[arg(help_heading = "Reference order")]
         #[clap(
             long,
@@ -6090,6 +6094,14 @@ GFA engine shorthand:
             conflicts_with = "ref_order_file"
         )]
         ref_order: Option<Vec<String>>,
+
+        /// Write the sequence processing order actually used to this file, one
+        /// name per line, and carry on. The partition a depth run produces is a
+        /// function of this order, so an experiment that varies the order has to
+        /// be able to show that it did.
+        #[arg(help_heading = "Reference order")]
+        #[clap(long, value_parser)]
+        dump_order: Option<String>,
 
         /// Path to a text file containing paths to FAI index files (one per line)
         /// When provided, uncovered regions will be filled with depth=1
@@ -10555,8 +10567,9 @@ fn run() -> io::Result<()> {
             alignment,
             transitive,
             transitive_opts,
-            ref_order_file: _, // Not used in sample-based mode
-            ref_order: _,      // Not used in sample-based mode
+            ref_order_file,
+            ref_order,
+            dump_order,
             fai_list,
             ref_sample,
             ref_only,
@@ -10730,6 +10743,22 @@ fn run() -> io::Result<()> {
                     ));
                 }
             }
+            // An explicit processing order, from either flag.  Both were
+            // parsed and thrown away before 2026-09-12, which meant a user who
+            // asked for an order got the default one and no warning.
+            let explicit_order: Option<Vec<String>> = match (&ref_order_file, &ref_order) {
+                (Some(path), _) => {
+                    let text = std::fs::read_to_string(path)?;
+                    Some(
+                        text.lines()
+                            .map(|l| l.trim().to_string())
+                            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                            .collect(),
+                    )
+                }
+                (None, Some(list)) => Some(list.clone()),
+                (None, None) => None,
+            };
             depth::compute_depth_global(
                 &impg,
                 &config,
@@ -10745,6 +10774,8 @@ fn run() -> io::Result<()> {
                 combined_output,
                 resume,
                 alignment_files.as_slice(),
+                explicit_order.as_deref(),
+                dump_order.as_deref(),
             )?;
         }
     }

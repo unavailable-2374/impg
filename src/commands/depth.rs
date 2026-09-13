@@ -2730,12 +2730,26 @@ fn compute_alignment_degrees(
 
 /// Build sequence processing order: sorted by degree descending, then length descending.
 /// If ref_sample is specified, that sample's sequences are moved to the front.
+/// Build the order in which sequences are offered as anchors.
+///
+/// THE PARTITION A DEPTH RUN PRODUCES IS A FUNCTION OF THIS ORDER.  The depth
+/// VALUE at a locus is not -- it is the number of distinct samples whose
+/// alignments cover it -- but which sequence CLAIMS a region, and therefore
+/// which record it appears in and in whose coordinates, is decided here.  That
+/// is why an explicit order is a first-class input and why it is hashed into
+/// the checkpoint: resuming a run under a different order would silently mix
+/// two partitions.
+///
+/// `explicit` names sequences to anchor first, in exactly the order given.
+/// Everything it does not name follows under the default rule (the --ref
+/// sample first, then degree descending, then length descending).
 fn build_sequence_order(
     impg: &impl ImpgIndex,
     compact_lengths: &CompactSequenceLengths,
     ref_sample_id: Option<u16>,
     seq_included: &[bool],
     degrees: &[u16],
+    explicit: Option<&[u32]>,
 ) -> Vec<u32> {
     let num_seqs = impg.seq_index().len();
     let mut seq_order: Vec<(u32, i64, bool, u16)> = (0..num_seqs as u32)
@@ -2762,10 +2776,30 @@ fn build_sequence_order(
             .then_with(|| b.1.cmp(&a.1)) // then by length descending
     });
 
-    seq_order
-        .into_iter()
-        .map(|(seq_id, _, _, _)| seq_id)
-        .collect()
+    let tail = seq_order.into_iter().map(|(seq_id, _, _, _)| seq_id);
+    match explicit {
+        None => tail.collect(),
+        Some(head) => {
+            let mut seen = vec![false; num_seqs];
+            let mut out: Vec<u32> = Vec::with_capacity(num_seqs);
+            for &seq_id in head {
+                if (seq_id as usize) < num_seqs
+                    && seq_included.get(seq_id as usize).copied().unwrap_or(false)
+                    && !seen[seq_id as usize]
+                {
+                    seen[seq_id as usize] = true;
+                    out.push(seq_id);
+                }
+            }
+            for seq_id in tail {
+                if !seen[seq_id as usize] {
+                    seen[seq_id as usize] = true;
+                    out.push(seq_id);
+                }
+            }
+            out
+        }
+    }
 }
 
 /// Build locality-aware Phase-2 waves while preserving the existing
@@ -5855,6 +5889,8 @@ pub fn compute_depth_global(
     stats_combined: bool,
     resume: bool,
     alignment_files: &[String],
+    explicit_order: Option<&[String]>,
+    dump_order: Option<&str>,
 ) -> io::Result<()> {
     // ------------------------------------------------------------------
     // Checkpoint / resume bootstrap.
@@ -5893,6 +5929,7 @@ pub fn compute_depth_global(
     let invalidation_hash = compute_invalidation_hash(
         alignment_files,
         &HashInputs {
+            explicit_order,
             ref_sample,
             ref_only,
             min_seq_length,
@@ -6068,18 +6105,66 @@ pub fn compute_depth_global(
         );
     }
 
-    // Build sequence processing order (degree descending, length descending, ref sample first)
+    // Build sequence processing order (explicit names first if given, then the
+    // ref sample, then degree descending, then length descending)
+    let explicit_ids: Option<Vec<u32>> = match explicit_order {
+        None => None,
+        Some(names) => {
+            let mut ids = Vec::with_capacity(names.len());
+            let mut missing = Vec::new();
+            for name in names {
+                match impg.seq_index().get_id(name) {
+                    Some(id) => ids.push(id),
+                    None => missing.push(name.clone()),
+                }
+            }
+            if !missing.is_empty() {
+                // Loud, not silent: an order file with a typo in it would
+                // otherwise produce the DEFAULT order under an experiment whose
+                // whole point is that the order changed.
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "{} sequence name(s) in the requested order are not in the \
+                         alignments, e.g. {:?}",
+                        missing.len(),
+                        &missing[..missing.len().min(3)]
+                    ),
+                ));
+            }
+            info!(
+                "Explicit processing order supplied: {} sequences anchored first",
+                ids.len()
+            );
+            Some(ids)
+        }
+    };
     let sequence_order = build_sequence_order(
         impg,
         &compact_lengths,
         ref_sample_id,
         &seq_included,
         &degrees,
+        explicit_ids.as_deref(),
     );
     debug!(
         "Sequence processing order: {} sequences",
         sequence_order.len()
     );
+    if let Some(path) = dump_order {
+        let mut fh = std::io::BufWriter::new(std::fs::File::create(path)?);
+        for &seq_id in &sequence_order {
+            if let Some(name) = impg.seq_index().get_name(seq_id) {
+                writeln!(fh, "{}", name)?;
+            }
+        }
+        fh.flush()?;
+        info!(
+            "Wrote the processing order actually used to {} ({} sequences)",
+            path,
+            sequence_order.len()
+        );
+    }
 
     // Prepare output: TSV writer for normal mode, stats accumulators for --stats add-on.
     //
