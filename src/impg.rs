@@ -501,6 +501,29 @@ impl Impg {
     }
 
     /// Get CIGAR operations for an alignment (handles both PAF and 1aln files)
+    /// get_cigar_ops through the process-wide cache when it is enabled and the
+    /// record comes from a PAF. Tracepoint formats depend on the target and the
+    /// sequence index as well, so they always take the direct path.
+    fn get_cigar_ops_shared(
+        &self,
+        metadata: &QueryMetadata,
+        target_id: u32,
+        sequence_index: Option<&UnifiedSequenceIndex>,
+    ) -> Arc<Vec<CigarOp>> {
+        let alignment_file = &self.alignment_files[metadata.alignment_file_index as usize];
+        if let Some(cache) = crate::cigar_cache::global() {
+            if matches!(QueryMetadata::get_file_type(alignment_file), FileType::Paf) {
+                return cache.get_or_insert_with(
+                    alignment_file,
+                    metadata.strand_and_data_offset,
+                    metadata.data_bytes as u32,
+                    || self.get_cigar_ops(metadata, target_id, sequence_index),
+                );
+            }
+        }
+        Arc::new(self.get_cigar_ops(metadata, target_id, sequence_index))
+    }
+
     fn get_cigar_ops(
         &self,
         metadata: &QueryMetadata,
@@ -1267,7 +1290,9 @@ impl Impg {
         }
 
         // Fallback: Full CIGAR reconstruction + projection (for non-.1aln files or if subsetting failed)
-        let mut cigar_ops = self.get_cigar_ops(metadata, target_id, sequence_index);
+        // Shared, not owned: with IMPG_CIGAR_CACHE_GB set, a record hit by
+        // many consecutive windows is read and parsed once (cigar_cache.rs).
+        let cigar_ops = self.get_cigar_ops_shared(metadata, target_id, sequence_index);
 
         let projection = project_target_range_through_alignment(
             (range_start, range_end),
@@ -1307,9 +1332,7 @@ impl Impg {
                 metadata: target_id,
             };
 
-            cigar_ops = adjusted_cigar;
-
-            Some((query_interval, cigar_ops, target_interval))
+            Some((query_interval, adjusted_cigar, target_interval))
         } else {
             debug!(
                 "Projection failed for alignment (target_id={target_id}, file_index={}, range={}-{})",

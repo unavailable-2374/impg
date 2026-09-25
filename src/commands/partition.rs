@@ -317,6 +317,7 @@ pub fn partition_alignments(
     // Re-querying it forever spins a single core in silence. Detect that
     // state and force-mask the region so selection moves on.
     let mut last_round_windows: Option<Vec<(u32, i32, i32)>> = None;
+    let mut last_cache_log = std::time::Instant::now();
 
     // If no windows are yet defined, select initial windows based on selection_mode
     if windows.is_empty() {
@@ -355,6 +356,12 @@ pub fn partition_alignments(
 
         for (seq_id, start, end) in windows.drain(..) {
             let chrom = impg.seq_index().get_name(seq_id).unwrap();
+            if last_cache_log.elapsed().as_secs() >= 600 {
+                if let Some(c) = crate::cigar_cache::global() {
+                    info!("  {} (partition {partition_num})", c.stats_line());
+                }
+                last_cache_log = std::time::Instant::now();
+            }
             let window_start = std::time::Instant::now();
 
             if debug {
@@ -716,6 +723,9 @@ pub fn partition_alignments(
 
     if let Some(j) = journal.as_mut() {
         j.finish()?;
+    }
+    if let Some(cache) = crate::cigar_cache::global() {
+        info!("{}", cache.stats_line());
     }
 
     // Convert temporary BED files to graph/MAF if needed

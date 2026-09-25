@@ -3,6 +3,7 @@
 #![allow(clippy::type_complexity)]
 pub mod agc_index;
 pub mod alignment_record;
+pub mod cigar_cache;
 pub mod commands;
 pub mod faidx;
 pub mod forest_map;
