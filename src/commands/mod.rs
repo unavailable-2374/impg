@@ -5,6 +5,7 @@ pub mod infer;
 pub mod lace;
 pub mod partition;
 pub mod partition_journal;
+mod partition_longest;
 pub mod refine;
 pub mod render;
 pub mod similarity;

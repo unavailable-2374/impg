@@ -10,6 +10,14 @@ pub struct SequenceIndex {
 }
 
 impl SequenceIndex {
+    /// Cache accounting estimate, including both owned copies of each name.
+    pub(crate) fn estimated_heap_bytes(&self) -> usize {
+        self.name_to_id.capacity() * (std::mem::size_of::<(String, u32)>() + 2)
+            + self.id_to_name.capacity() * (std::mem::size_of::<(u32, String)>() + 2)
+            + self.id_to_len.capacity() * (std::mem::size_of::<(u32, usize)>() + 2)
+            + self.name_to_id.keys().map(|s| s.capacity()).sum::<usize>()
+            + self.id_to_name.values().map(|s| s.capacity()).sum::<usize>()
+    }
     pub fn new() -> Self {
         SequenceIndex {
             name_to_id: FxHashMap::default(),

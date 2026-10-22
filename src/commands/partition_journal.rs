@@ -94,6 +94,10 @@ impl Journal {
             _ => return Ok(None),
         };
         let exists = std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false);
+        if !exists && std::env::var_os("IMPG_PARTITION_REPLAY_ONLY").is_some() {
+            return Err(io::Error::new(io::ErrorKind::NotFound,
+                "read-only replay requires an existing nonempty journal"));
+        }
         if !exists {
             let mut f = File::create(&path)?;
             f.write_all(FILE_MAGIC)?;
@@ -180,6 +184,15 @@ impl Journal {
                 Ok(Some(ivs))
             }
             None => {
+                if std::env::var_os("IMPG_PARTITION_REPLAY_ONLY").is_some() {
+                    if std::fs::metadata(&self.path)?.len() != self.good_offset {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData,
+                            "read-only replay stopped at a torn/corrupt record; original journal left unchanged"));
+                    }
+                    self.reader = None;
+                    info!("partition journal: READ_ONLY_REPLAY_VERIFIED {} windows; no query, truncate or append", self.replayed_windows);
+                    return Ok(None);
+                }
                 self.switch_to_append()?;
                 Ok(None)
             }
@@ -257,6 +270,15 @@ impl Journal {
                         self.path
                     ),
                 ));
+            }
+            if std::env::var_os("IMPG_PARTITION_REPLAY_ONLY").is_some() {
+                if std::fs::metadata(&self.path)?.len() != self.good_offset {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData,
+                        "read-only replay stopped at a torn/corrupt record; original journal left unchanged"));
+                }
+                self.reader = None;
+                info!("partition journal: READ_ONLY_REPLAY_VERIFIED {} windows; no query, truncate or append", self.replayed_windows);
+                return Ok(());
             }
             self.switch_to_append()?;
         }

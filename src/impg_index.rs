@@ -102,6 +102,10 @@ pub trait ImpgIndex: Send + Sync {
     /// Remove a cached tree from memory (for memory management).
     fn remove_cached_tree(&self, target_id: u32);
 
+    /// Release reloadable cache payload before memory-heavy output processing.
+    /// Default leaves in-memory-only implementations untouched.
+    fn release_cached_indexes(&self) {}
+
     /// Get number of targets with trees.
     fn num_targets(&self) -> usize {
         self.target_ids().len()
@@ -151,6 +155,12 @@ impl ImpgWrapper {
 }
 
 impl ImpgIndex for ImpgWrapper {
+    fn release_cached_indexes(&self) {
+        match self {
+            ImpgWrapper::Single(impg) => impg.release_cached_indexes(),
+            ImpgWrapper::Multi(multi) => multi.release_cached_indexes(),
+        }
+    }
     fn seq_index(&self) -> &SequenceIndex {
         match self {
             ImpgWrapper::Single(impg) => impg.seq_index(),

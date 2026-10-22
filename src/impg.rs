@@ -22,7 +22,7 @@ use std::cell::RefCell;
 use std::cmp::{max, min};
 use std::fs::File;
 use std::io::{self, BufReader, Seek, SeekFrom};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, OnceLock};
 use tracepoints::{tracepoints_to_cigar_fastga_with_aligner, tracepoints_to_cigar_with_aligner};
 
 // use libc;
@@ -362,18 +362,17 @@ impl SortedRanges {
     }
 
     pub fn merge_forward_from(&mut self, start_idx: usize) {
-        let mut write = start_idx;
-        let mut read = start_idx + 1;
-        while read < self.ranges.len() {
-            if self.ranges[write].1 >= self.ranges[read].0 {
-                self.ranges[write].1 = max(self.ranges[write].1, self.ranges[read].1);
-            } else {
-                write += 1;
-                self.ranges.swap(write, read);
-            }
-            read += 1;
+        // Existing ranges after the inserted/extended one are already sorted
+        // and disjoint. Once the first gap is reached, that suffix is unchanged;
+        // scanning and swapping its every entry costs O(all masks) per insert.
+        let mut stop = start_idx + 1;
+        while stop < self.ranges.len() && self.ranges[start_idx].1 >= self.ranges[stop].0 {
+            self.ranges[start_idx].1 = max(self.ranges[start_idx].1, self.ranges[stop].1);
+            stop += 1;
         }
-        self.ranges.truncate(write + 1);
+        if stop > start_idx + 1 {
+            self.ranges.drain(start_idx + 1..stop);
+        }
     }
 }
 
@@ -410,9 +409,26 @@ pub struct Impg {
     /// Cache for trace_spacing values per .1aln file (indexed by alignment_file_index)
     /// Uses Vec for O(1) direct indexing. None = not yet loaded or not a .1aln file.
     trace_spacing_cache: RwLock<Vec<Option<i64>>>,
+    cache_base_bytes: OnceLock<usize>,
 }
 
 impl Impg {
+    /// Approximate retained index payload, not allocator RSS. A 25% allowance
+    /// covers hash-table and vector spare capacity; construction is transient.
+    pub(crate) fn estimated_cache_bytes(&self) -> usize {
+        let trees = self.trees.read().unwrap();
+        let nodes = trees.values().map(|tree| {
+            tree.len() * std::mem::size_of::<coitrees::IntervalNode<QueryMetadata, u32>>()
+                + std::mem::size_of::<BasicCOITree<QueryMetadata, u32>>()
+        }).sum::<usize>();
+        let base = *self.cache_base_bytes.get_or_init(|| self.seq_index.estimated_heap_bytes()
+            + self.forest_map.entries.capacity() * 24
+            + self.alignment_files.iter().chain(&self.sequence_files)
+                .map(|p| p.capacity() + std::mem::size_of::<String>()).sum::<usize>()
+            + self.index_file_path.capacity());
+        let bytes = nodes + base + trees.capacity() * 24;
+        bytes.saturating_add(bytes / 4)
+    }
     /// Get cached trace_spacing for a .1aln file (lazy-loaded on first access)
     fn get_trace_spacing(&self, file_index: usize) -> Result<i64, String> {
         let file_path = &self.alignment_files[file_index];
@@ -1657,6 +1673,7 @@ impl Impg {
             index_file_path: String::new(),
             sequence_files: sequence_files.map(|s| s.to_vec()).unwrap_or_default(),
             trace_spacing_cache: RwLock::new(vec![None; num_files]),
+            cache_base_bytes: OnceLock::new(),
         })
     }
 
@@ -1855,6 +1872,7 @@ impl Impg {
             index_file_path,
             sequence_files: sequence_files.map(|s| s.to_vec()).unwrap_or_default(),
             trace_spacing_cache: RwLock::new(vec![None; num_files]),
+            cache_base_bytes: OnceLock::new(),
         })
     }
 

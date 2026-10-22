@@ -10,6 +10,7 @@ use rustc_hash::FxHashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
+use super::partition_longest::LongestMissing;
 //use std::time::Instant;
 
 /// Helper function to create output file path with optional output folder
@@ -46,56 +47,49 @@ pub fn rehome_singleton_slivers(collected_partitions: &mut Vec<(usize, Vec<Inter
     if collected_partitions.is_empty() {
         return;
     }
-    type Row = (u32, i32, i32, usize, Interval<u32>);
-    let mut rows: Vec<Row> = Vec::new();
-    for (pidx, (_, ivs)) in collected_partitions.iter().enumerate() {
-        for iv in ivs {
-            let (s, e) = if iv.first <= iv.last {
-                (iv.first, iv.last)
-            } else {
-                (iv.last, iv.first)
-            };
-            rows.push((iv.metadata, s, e, pidx, *iv));
+    let mut counts: Vec<usize> = collected_partitions.iter().map(|(_, ivs)| ivs.len()).collect();
+    let initial_singletons = counts.iter().filter(|&&c| c == 1).count();
+    if initial_singletons == 0 { return; }
+    // Only one copy of coordinates in each row, rather than normalized AND
+    // original coordinates. Transfer intervals, freeing source allocations.
+    type Row = (usize, Interval<u32>);
+    fn key(row: &Row) -> (u32, i32, i32) {
+        (row.1.metadata, row.1.first.min(row.1.last), row.1.first.max(row.1.last))
+    }
+    let mut rows: Vec<Row> = Vec::with_capacity(counts.iter().sum());
+    for (pidx, (_, ivs)) in collected_partitions.iter_mut().enumerate() {
+        for iv in std::mem::take(ivs) {
+            rows.push((pidx, iv));
         }
     }
-    rows.sort_by_key(|r| (r.0, r.1, r.2));
-
-    let mut counts = vec![0usize; collected_partitions.len()];
-    for r in &rows {
-        counts[r.3] += 1;
-    }
-    let initial_singletons = counts.iter().filter(|&&c| c == 1).count();
-    if initial_singletons == 0 {
-        return;
-    }
+    rows.sort_by_key(key);
 
     let mut pass = 0;
     loop {
         pass += 1;
-        let singletons: std::collections::HashSet<usize> = counts
+        let singletons: Vec<bool> = counts
             .iter()
-            .enumerate()
-            .filter(|(_, &c)| c == 1)
-            .map(|(i, _)| i)
+            .map(|&c| c == 1)
             .collect();
         let mut pending: Vec<(usize, usize)> = Vec::new();
         for i in 0..rows.len() {
-            let (c, s, e, pidx, _) = rows[i];
-            if !singletons.contains(&pidx) {
+            let (c, s, e) = key(&rows[i]);
+            let pidx = rows[i].0;
+            if !singletons[pidx] {
                 continue;
             }
-            let left = if i > 0 && rows[i - 1].0 == c && rows[i - 1].2 == s {
-                Some(rows[i - 1].3)
+            let left = if i > 0 && key(&rows[i - 1]).0 == c && key(&rows[i - 1]).2 == s {
+                Some(rows[i - 1].0)
             } else {
                 None
             };
-            let right = if i + 1 < rows.len() && rows[i + 1].0 == c && rows[i + 1].1 == e {
-                Some(rows[i + 1].3)
+            let right = if i + 1 < rows.len() && key(&rows[i + 1]).0 == c && key(&rows[i + 1]).1 == e {
+                Some(rows[i + 1].0)
             } else {
                 None
             };
-            let ls = left.map(|p| !singletons.contains(&p)).unwrap_or(false);
-            let rs = right.map(|p| !singletons.contains(&p)).unwrap_or(false);
+            let ls = left.map(|p| !singletons[p]).unwrap_or(false);
+            let rs = right.map(|p| !singletons[p]).unwrap_or(false);
             let target = if ls && rs {
                 let lp = left.unwrap();
                 let rp = right.unwrap();
@@ -119,10 +113,10 @@ pub fn rehome_singleton_slivers(collected_partitions: &mut Vec<(usize, Vec<Inter
             break;
         }
         for (row_idx, new_pidx) in &pending {
-            let old_pidx = rows[*row_idx].3;
+            let old_pidx = rows[*row_idx].0;
             counts[old_pidx] -= 1;
             counts[*new_pidx] += 1;
-            rows[*row_idx].3 = *new_pidx;
+            rows[*row_idx].0 = *new_pidx;
         }
     }
     let remaining = counts.iter().filter(|&&c| c == 1).count();
@@ -134,25 +128,13 @@ pub fn rehome_singleton_slivers(collected_partitions: &mut Vec<(usize, Vec<Inter
         pass
     );
 
-    let mut new_intervals: Vec<Vec<Interval<u32>>> = (0..collected_partitions.len())
-        .map(|_| Vec::new())
-        .collect();
-    for (_, _, _, pidx, iv) in rows.drain(..) {
-        new_intervals[pidx].push(iv);
+    for (i, (_, ivs)) in collected_partitions.iter_mut().enumerate() {
+        *ivs = Vec::with_capacity(counts[i]);
     }
-    let rebuilt: Vec<(usize, Vec<Interval<u32>>)> = collected_partitions
-        .iter()
-        .enumerate()
-        .filter_map(|(i, (pnum, _))| {
-            let ivs = std::mem::take(&mut new_intervals[i]);
-            if ivs.is_empty() {
-                None
-            } else {
-                Some((*pnum, ivs))
-            }
-        })
-        .collect();
-    *collected_partitions = rebuilt;
+    for (pidx, iv) in rows {
+        collected_partitions[pidx].1.push(iv);
+    }
+    collected_partitions.retain(|(_, ivs)| !ivs.is_empty());
 }
 
 pub fn partition_alignments(
@@ -263,6 +245,11 @@ pub fn partition_alignments(
         .collect();
 
     let mut partition_num = 0;
+    // Opt-out exists solely for exact same-binary differential verification.
+    let mut longest_selector = if selection_mode == "longest"
+        && std::env::var_os("IMPG_PARTITION_LEGACY_SELECT").is_none() {
+        Some(LongestMissing::new(&missing_regions))
+    } else { None };
     let mut total_partitioned_length = 0;
     let total_sequence_length: u64 = (0..impg.seq_index().len() as u32)
         .into_par_iter()
@@ -309,6 +296,11 @@ pub fn partition_alignments(
         );
         super::partition_journal::Journal::from_env(&header)?
     };
+    let replay_only = std::env::var_os("IMPG_PARTITION_REPLAY_ONLY").is_some();
+    if replay_only && journal.is_none() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            "read-only replay requires IMPG_PARTITION_JOURNAL"));
+    }
 
     // Force-progress bookkeeping: if a round emits no partitions and the
     // next selection replays the exact same windows, the selected region has
@@ -326,6 +318,7 @@ pub fn partition_alignments(
             &missing_regions,
             selection_mode,
             window_size,
+            longest_selector.as_mut(),
         )?;
     }
 
@@ -412,6 +405,11 @@ pub fn partition_alignments(
                 Some(j) => j.take_replay(seq_id, start, end)?,
                 None => None,
             };
+            if replay_only && replayed.is_none() {
+                info!("Read-only verification finished at partition{}; no BED or completion marker written", partition_num);
+                return Ok(());
+            }
+            let replaying = replayed.is_some();
             let mut overlaps = if let Some(ivs) = replayed {
                 ivs.into_iter()
                     .map(|q| {
@@ -494,6 +492,7 @@ pub fn partition_alignments(
                 &mut masked_regions,
                 &mut missing_regions,
                 min_missing_size,
+                longest_selector.as_mut(),
             );
             //let mask_time = mask_start.elapsed();
 
@@ -514,7 +513,7 @@ pub fn partition_alignments(
                 // Calculate current partition length
                 let num_regions = overlaps.len();
                 let current_partition_length: u64 = overlaps
-                    .par_iter()
+                    .iter()
                     .map(|(interval, _, _)| (interval.last - interval.first).unsigned_abs() as u64)
                     .sum();
                 total_partitioned_length += current_partition_length;
@@ -591,11 +590,18 @@ pub fn partition_alignments(
                     match output_format {
                         "bed" => {
                             // Collect BED partitions
-                            collected_partitions.push((partition_num, query_intervals.clone()));
+                            // Read-only verification checks selection and masks,
+                            // never final output. Retaining every emitted interval
+                            // there wastes memory without checking anything else.
+                            if !replay_only {
+                                collected_partitions.push((partition_num, query_intervals));
+                            }
                         }
                         "gfa" | "vcf" if engine_config.partition_size.is_some() => {
                             // Partitioned GFA mode: collect intervals for later pipeline
-                            collected_partitions.push((partition_num, query_intervals.clone()));
+                            if !replay_only {
+                                collected_partitions.push((partition_num, query_intervals));
+                            }
                         }
                         "gfa" | "vcf" | "maf" | "fasta" => {
                             return Err(io::Error::new(
@@ -612,7 +618,8 @@ pub fn partition_alignments(
                     }
                 }
 
-                info!("  Computed partition{} with {} regions: {} bp this partition ({}), {} bp total ({}) - (query {}:{}-{}, len: {})", 
+                if !replaying {
+                    info!("  Computed partition{} with {} regions: {} bp this partition ({}), {} bp total ({}) - (query {}:{}-{}, len: {})",
                     partition_num,
                     num_regions,
                     current_partition_length,   // Current partition size in bp
@@ -623,7 +630,11 @@ pub fn partition_alignments(
                     start,
                     end,
                     end - start,
-                );
+                    );
+                } else if partition_num % 1_000_000 == 0 {
+                    info!("Replay progress: partition{}; {} bp reconstructed ({})", partition_num,
+                          total_partitioned_length, total_percentage_str);
+                }
                 debug!(
                     "  Window {}:{}-{} took {:?} (query + mask + write)",
                     chrom,
@@ -654,6 +665,7 @@ pub fn partition_alignments(
             &missing_regions,
             selection_mode,
             window_size,
+            longest_selector.as_mut(),
         )?;
         //let window_time = window_start.elapsed();
         //info!("  select_and_window_sequences={:?}", window_time);
@@ -703,12 +715,16 @@ pub fn partition_alignments(
                 }
             }
             windows.clear();
+            if longest_selector.is_some() {
+                longest_selector = Some(LongestMissing::new(&missing_regions));
+            }
             select_and_window_sequences(
                 &mut windows,
                 impg,
                 &missing_regions,
                 selection_mode,
                 window_size,
+                longest_selector.as_mut(),
             )?;
         }
         last_round_windows = Some(round_windows);
@@ -717,6 +733,17 @@ pub fn partition_alignments(
     if let Some(j) = journal.as_mut() {
         j.finish()?;
     }
+    if replay_only {
+        info!("Read-only verification finished at partition{}; no BED or completion marker written", partition_num);
+        return Ok(());
+    }
+
+    // These drive selection/querying only, not rehoming or output. Release
+    // them before sorting/rebuilding the potentially very large interval set.
+    drop(longest_selector);
+    drop(masked_regions);
+    drop(missing_regions);
+    impg.release_cached_indexes();
 
     // Convert temporary BED files to graph/MAF if needed
     if !temp_bed_files.is_empty() {
@@ -857,13 +884,16 @@ fn select_and_window_sequences(
     missing_regions: &FxHashMap<u32, SortedRanges>,
     selection_mode: &str,
     window_size: usize,
+    longest_selector: Option<&mut LongestMissing>,
 ) -> io::Result<()> {
     let mut ranges_to_window = Vec::new();
 
     match selection_mode {
         "longest" => {
             // Select longest single missing region
-            let longest_region = missing_regions
+            let longest_region = if let Some(selector) = longest_selector {
+                selector.select(missing_regions)
+            } else { missing_regions
                 .par_iter()
                 .flat_map(|(seq_id, ranges)| {
                     // For each sequence, convert its ranges to (seq_id, start, end, length) tuples
@@ -881,7 +911,7 @@ fn select_and_window_sequences(
                         // If lengths are equal, compare by sequence ID for deterministic results
                         .then_with(|| id1.cmp(&id2))
                 })
-                .map(|(seq_id, start, end, _)| (seq_id, start, end));
+                .map(|(seq_id, start, end, _)| (seq_id, start, end)) };
 
             if let Some((seq_id, start, end)) = longest_region {
                 let seq_name = impg.seq_index().get_name(seq_id).unwrap();
@@ -1119,6 +1149,7 @@ fn mask_and_update_regions(
     masked_regions: &mut FxHashMap<u32, SortedRanges>,
     missing_regions: &mut FxHashMap<u32, SortedRanges>,
     min_fragment_size: i32,
+    mut longest_selector: Option<&mut LongestMissing>,
 ) -> Vec<(Interval<u32>, Vec<CigarOp>, Interval<u32>)> {
     fn process_sequence_overlaps(
         seq_id: u32,
@@ -1129,6 +1160,7 @@ fn mask_and_update_regions(
         result: &mut Vec<(Interval<u32>, Vec<CigarOp>, Interval<u32>)>,
         extensions: &mut Vec<(i32, i32)>,
         mask_buffer: &mut Vec<(i32, i32)>,
+        longest_selector: Option<&mut LongestMissing>,
     ) {
         if seq_overlaps.is_empty() {
             return;
@@ -1464,6 +1496,9 @@ fn mask_and_update_regions(
                         rebuilt.insert((current, miss_end));
                     }
                 }
+                if let Some(selector) = longest_selector {
+                    selector.replace(seq_id, &missing.ranges[first..last], &rebuilt.ranges);
+                }
                 missing.ranges.splice(first..last, rebuilt.ranges);
 
                 // Remove sequence if no more missing regions
@@ -1500,6 +1535,7 @@ fn mask_and_update_regions(
                 &mut result,
                 &mut extensions,
                 &mut mask_buffer,
+                longest_selector.as_deref_mut(),
             );
             seq_overlaps.clear();
             current_seq = interval.metadata;
@@ -1516,6 +1552,7 @@ fn mask_and_update_regions(
         &mut result,
         &mut extensions,
         &mut mask_buffer,
+        longest_selector.as_deref_mut(),
     );
 
     result

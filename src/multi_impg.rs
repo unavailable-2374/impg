@@ -19,7 +19,8 @@ use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
+use crate::index_cache::IndexCache;
 use std::time::SystemTime;
 
 /// Location of a tree within a specific sub-index.
@@ -129,10 +130,32 @@ pub struct MultiImpg {
     local_to_unified: Vec<Vec<u32>>,
 
     /// Lazily-loaded sub-indices (only loaded when tree data is needed)
-    sub_indices: RwLock<Vec<Option<Arc<Impg>>>>,
+    sub_indices: Mutex<IndexCache<Impg>>,
+}
+
+impl Drop for MultiImpg {
+    fn drop(&mut self) {
+        let cache = self.sub_indices.lock().unwrap();
+        if cache.budget.is_some() {
+            info!("Final index cache: {} retained, {} estimated MiB, {} evictions, {} hits, {} misses",
+                cache.len(), cache.bytes >> 20, cache.evictions, cache.hits, cache.misses);
+        }
+    }
 }
 
 impl MultiImpg {
+    fn new_sub_index_cache(len: usize) -> io::Result<Mutex<IndexCache<Impg>>> {
+        let budget = match std::env::var("IMPG_SUBINDEX_CACHE_MIB") {
+            Ok(value) => Some(value.parse::<usize>().ok()
+                .and_then(|mib| mib.checked_mul(1 << 20))
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput,
+                    "IMPG_SUBINDEX_CACHE_MIB must be a nonnegative integer MiB budget"))?),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidInput, e)),
+        };
+        info!("Sub-index cache: estimated payload budget {:?} MiB; active queries and other partition state are additional memory", budget.map(|b| b >> 20));
+        Ok(Mutex::new(IndexCache::new(len, budget)))
+    }
     /// Load headers from multiple per-file indices and build unified mappings.
     ///
     /// This loads ONLY the headers (seq_index + forest_map) from each file,
@@ -211,7 +234,7 @@ impl MultiImpg {
             alignment_files: alignment_files.to_vec(),
             sequence_files: sequence_files.map(|s| s.to_vec()).unwrap_or_default(),
             local_to_unified,
-            sub_indices: RwLock::new(vec![None; num_indices]),
+            sub_indices: Self::new_sub_index_cache(num_indices)?,
         })
     }
 
@@ -319,7 +342,7 @@ impl MultiImpg {
             alignment_files: alignment_files.to_vec(),
             sequence_files: sequence_files.map(|s| s.to_vec()).unwrap_or_default(),
             local_to_unified: cache.local_to_unified,
-            sub_indices: RwLock::new(vec![None; num_indices]),
+            sub_indices: Self::new_sub_index_cache(num_indices)?,
         })
     }
 
@@ -424,9 +447,9 @@ impl MultiImpg {
     fn get_sub_index(&self, index_idx: usize) -> std::io::Result<Arc<Impg>> {
         // Fast path: check if already loaded
         {
-            let indices = self.sub_indices.read().unwrap();
-            if let Some(ref impg) = indices[index_idx] {
-                return Ok(Arc::clone(impg));
+            let mut indices = self.sub_indices.lock().unwrap();
+            if let Some(impg) = indices.get(index_idx) {
+                return Ok(impg);
             }
         }
 
@@ -450,12 +473,23 @@ impl MultiImpg {
         let impg = Arc::new(impg);
 
         // Store in cache
-        {
-            let mut indices = self.sub_indices.write().unwrap();
-            indices[index_idx] = Some(Arc::clone(&impg));
-        }
+        let bytes = impg.estimated_cache_bytes();
+        Ok(self.sub_indices.lock().unwrap().insert(index_idx, impg, bytes))
+    }
 
-        Ok(impg)
+    fn release_sub_index(&self, index_idx: usize, impg: Arc<Impg>) {
+        // Default (unbounded) behavior avoids re-counting trees per query.
+        if self.sub_indices.lock().unwrap().budget.is_none() { return; }
+        let bytes = impg.estimated_cache_bytes();
+        let mut cache = self.sub_indices.lock().unwrap();
+        cache.update(index_idx, &impg, bytes);
+        drop(impg);
+        let previous = cache.evictions;
+        cache.trim();
+        if cache.evictions != previous && (previous == 0 || cache.evictions / 1024 != previous / 1024) {
+            info!("Index cache: {} retained, {} estimated MiB, {} evictions, {} hits, {} misses",
+                cache.len(), cache.bytes >> 20, cache.evictions, cache.hits, cache.misses);
+        }
     }
 
     /// Translate an AdjustedInterval from local IDs to unified IDs.
@@ -501,30 +535,28 @@ impl MultiImpg {
         min_gap_compressed_identity: Option<f64>,
         sequence_index: Option<&UnifiedSequenceIndex>,
         approximate_mode: bool,
-    ) -> Vec<AdjustedInterval> {
+    ) -> io::Result<Vec<AdjustedInterval>> {
         let locations = match self.forest_map.get(&unified_target_id) {
             Some(locs) => locs,
             None => {
-                return vec![self.make_self_interval(
+                return Ok(vec![self.make_self_interval(
                     unified_target_id,
                     range_start,
                     range_end,
                     store_cigar,
-                )]
+                )])
             }
         };
 
         // Query all relevant sub-indices in parallel
         let results: Vec<Vec<AdjustedInterval>> = locations
             .par_iter()
-            .filter_map(|loc| {
-                let impg = match self.get_sub_index(loc.index_idx) {
-                    Ok(i) => i,
-                    Err(e) => {
-                        warn!("Failed to load sub-index {}: {}", loc.index_idx, e);
-                        return None;
-                    }
-                };
+            .map(|loc| -> io::Result<Vec<AdjustedInterval>> {
+                // Cache eviction can require reloading. A reload error is a
+                // hard failure, never a silently omitted alignment source.
+                let impg = self.get_sub_index(loc.index_idx).map_err(|e| {
+                    io::Error::new(e.kind(), format!("Failed to load sub-index {}: {}", loc.index_idx, e))
+                })?;
 
                 // Query using local target ID
                 let local_results = impg.query(
@@ -536,6 +568,7 @@ impl MultiImpg {
                     sequence_index,
                     approximate_mode,
                 );
+                self.release_sub_index(loc.index_idx, impg);
 
                 // Translate results to unified IDs
                 let unified_results: Vec<AdjustedInterval> = local_results
@@ -543,9 +576,9 @@ impl MultiImpg {
                     .filter_map(|r| self.translate_to_unified(r, loc.index_idx))
                     .collect();
 
-                Some(unified_results)
+                Ok(unified_results)
             })
-            .collect();
+            .collect::<io::Result<_>>()?;
 
         // Merge all results, but only include ONE self-interval
         let mut final_results = Vec::new();
@@ -591,7 +624,7 @@ impl MultiImpg {
             final_results.insert(0, self_interval);
         }
 
-        final_results
+        Ok(final_results)
     }
 
     /// Create a self-referential interval for the query region.
@@ -623,6 +656,11 @@ impl MultiImpg {
 }
 
 impl ImpgIndex for MultiImpg {
+    fn release_cached_indexes(&self) {
+        let mut cache = self.sub_indices.lock().unwrap();
+        cache.clear_unpinned();
+        info!("Released idle sub-index cache before output: {} retained", cache.len());
+    }
     fn seq_index(&self) -> &SequenceIndex {
         &self.seq_index
     }
@@ -637,7 +675,7 @@ impl ImpgIndex for MultiImpg {
         sequence_index: Option<&UnifiedSequenceIndex>,
         approximate_mode: bool,
     ) -> io::Result<Vec<AdjustedInterval>> {
-        Ok(self.query_all_indices(
+        self.query_all_indices(
             target_id,
             range_start,
             range_end,
@@ -645,7 +683,7 @@ impl ImpgIndex for MultiImpg {
             min_gap_compressed_identity,
             sequence_index,
             approximate_mode,
-        ))
+        )
     }
 
     fn query_with_cache(
@@ -701,7 +739,7 @@ impl ImpgIndex for MultiImpg {
         subset_filter: Option<&SubsetFilter>,
     ) -> io::Result<Vec<AdjustedInterval>> {
         // Transitive query implementation using DFS with deterministic ordering
-        Ok(self.transitive_query_impl(
+        self.transitive_query_impl(
             target_id,
             range_start,
             range_end,
@@ -716,7 +754,7 @@ impl ImpgIndex for MultiImpg {
             approximate_mode,
             subset_filter,
             true, // use_dfs
-        ))
+        )
     }
 
     fn query_transitive_bfs(
@@ -736,7 +774,7 @@ impl ImpgIndex for MultiImpg {
         subset_filter: Option<&SubsetFilter>,
     ) -> io::Result<Vec<AdjustedInterval>> {
         // Transitive query implementation using BFS with deterministic ordering
-        Ok(self.transitive_query_impl(
+        self.transitive_query_impl(
             target_id,
             range_start,
             range_end,
@@ -751,7 +789,7 @@ impl ImpgIndex for MultiImpg {
             approximate_mode,
             subset_filter,
             false, // use_dfs
-        ))
+        )
     }
 
     fn get_or_load_tree(&self, target_id: u32) -> Option<Arc<BasicCOITree<QueryMetadata, u32>>> {
@@ -767,7 +805,9 @@ impl ImpgIndex for MultiImpg {
         let local_target_id = loc.local_target_id;
 
         let impg = self.get_sub_index(loc.index_idx).ok()?;
-        impg.get_or_load_tree(local_target_id)
+        let tree = impg.get_or_load_tree(local_target_id);
+        self.release_sub_index(loc.index_idx, impg);
+        tree
     }
 
     fn target_ids(&self) -> Vec<u32> {
@@ -809,7 +849,7 @@ impl MultiImpg {
         approximate_mode: bool,
         subset_filter: Option<&SubsetFilter>,
         use_dfs: bool,
-    ) -> Vec<AdjustedInterval> {
+    ) -> io::Result<Vec<AdjustedInterval>> {
         // Visited ranges start as a copy of the masks, but each sequence is
         // copied on first touch rather than all of them up front. The eager copy
         // cloned every mask of every sequence for every query: partition calls
@@ -877,7 +917,7 @@ impl MultiImpg {
                 min_gap_compressed_identity,
                 sequence_index,
                 approximate_mode,
-            );
+            )?;
 
             // Process results - matches original Impg behavior
             for result in step_results {
@@ -957,7 +997,7 @@ impl MultiImpg {
             }
         }
 
-        results
+        Ok(results)
     }
 }
 
