@@ -2908,13 +2908,12 @@ impl BfsChunkState {
         anchor_seq_id: u32,
         region_start: i64,
         region_end: i64,
-        anchor_len: i64,
         min_transitive_len: i64,
     ) -> Self {
         let mut visited_ranges: FxHashMap<u32, SortedRanges> = FxHashMap::default();
         let anchor_sorted = visited_ranges
             .entry(anchor_seq_id)
-            .or_insert_with(|| SortedRanges::new(anchor_len, 0));
+            .or_insert_with(|| SortedRanges::new());
         let filtered = anchor_sorted.insert((region_start, region_end));
 
         let mut queue = std::collections::VecDeque::new();
@@ -2940,7 +2939,6 @@ impl BfsChunkState {
         current_end: i64,
         current_depth: u16,
         raw_alns: &[RawAlignmentInterval],
-        seq_len_fn: &impl Fn(u32) -> i64,
         min_transitive_len: i64,
         min_distance_between_ranges: i64,
         can_descend: bool,
@@ -2999,11 +2997,10 @@ impl BfsChunkState {
 
             let explore_start = aln.query_start.min(aln.query_end);
             let explore_end = aln.query_start.max(aln.query_end);
-            let query_seq_len = seq_len_fn(aln.query_id);
             let ranges = self
                 .visited_ranges
                 .entry(aln.query_id)
-                .or_insert_with(|| SortedRanges::new(query_seq_len, 0));
+                .or_insert_with(|| SortedRanges::new());
 
             let mut should_add = true;
             if min_distance_between_ranges > 0 {
@@ -3088,7 +3085,6 @@ fn batch_depth_bfs(
         return Ok(Vec::new());
     }
 
-    let seq_len_fn = |id: u32| impg.seq_index().get_len_from_id(id).unwrap_or(0) as i64;
 
     let mut states: Vec<BfsChunkState> = chunks
         .iter()
@@ -3097,7 +3093,6 @@ fn batch_depth_bfs(
                 anchor_id,
                 start,
                 end,
-                seq_len_fn(anchor_id),
                 min_transitive_len,
             )
         })
@@ -3149,7 +3144,6 @@ fn batch_depth_bfs(
                 *end,
                 *depth,
                 raw_alns,
-                &seq_len_fn,
                 min_transitive_len,
                 min_distance_between_ranges,
                 max_depth == 0 || *depth < max_depth.saturating_sub(1),
@@ -3182,11 +3176,10 @@ fn batch_cigar_depth_bfs(
     let mut current_ranges: Vec<(usize, TransitiveRange)> = Vec::with_capacity(chunks.len());
 
     for (chunk_idx, &(anchor_id, start, end)) in chunks.iter().enumerate() {
-        let anchor_len = impg.seq_index().get_len_from_id(anchor_id).unwrap_or(0) as i64;
         let mut visited_ranges = FxHashMap::default();
         let accepted = visited_ranges
             .entry(anchor_id)
-            .or_insert_with(|| SortedRanges::new(anchor_len, 0))
+            .or_insert_with(|| SortedRanges::new())
             .insert((start, end));
         states.push(CigarBfsChunkState {
             visited_ranges,
@@ -3275,12 +3268,10 @@ fn batch_cigar_depth_bfs(
                 };
 
                 if can_descend {
-                    let seq_len =
-                        impg.seq_index().get_len_from_id(hit.query_id).unwrap_or(0) as i64;
                     let ranges = state
                         .visited_ranges
                         .entry(hit.query_id)
-                        .or_insert_with(|| SortedRanges::new(seq_len, 0));
+                        .or_insert_with(|| SortedRanges::new());
                     let new_min = hit.query_first.min(hit.query_last);
                     let new_max = hit.query_first.max(hit.query_last);
                     let idx = ranges
@@ -3513,10 +3504,9 @@ fn depth_transitive_bfs(
     let mut visited_ranges: FxHashMap<u32, SortedRanges> = FxHashMap::default();
 
     // Initialize visited for the starting target
-    let target_len = impg.seq_index().get_len_from_id(target_id).unwrap_or(0) as i64;
     let target_sorted = visited_ranges
         .entry(target_id)
-        .or_insert_with(|| SortedRanges::new(target_len, 0));
+        .or_insert_with(|| SortedRanges::new());
     let filtered_input_range = target_sorted.insert((range_start, range_end));
 
     // BFS queue: (seq_id, start, end, current_depth)
@@ -3600,10 +3590,9 @@ fn depth_transitive_bfs(
             let explore_start = aln.query_start.min(aln.query_end);
             let explore_end = aln.query_start.max(aln.query_end);
 
-            let query_seq_len = impg.seq_index().get_len_from_id(aln.query_id).unwrap_or(0) as i64;
             let ranges = visited_ranges
                 .entry(aln.query_id)
-                .or_insert_with(|| SortedRanges::new(query_seq_len, 0));
+                .or_insert_with(|| SortedRanges::new());
 
             // Check proximity to existing ranges
             let mut should_add = true;
@@ -10000,7 +9989,7 @@ mod tests {
 
     #[test]
     fn terminal_raw_bfs_hop_records_hit_without_building_frontier() {
-        let mut state = BfsChunkState::new(1, 0, 100, 100, 1);
+        let mut state = BfsChunkState::new(1, 0, 100, 1);
         state.queue.clear();
         let raw = [RawAlignmentInterval {
             target_start: 10,
@@ -10011,7 +10000,7 @@ mod tests {
             is_reverse: false,
         }];
 
-        state.process_hop(1, 0, 100, 1, &raw, &|_| 100, 1, 0, false);
+        state.process_hop(1, 0, 100, 1, &raw, 1, 0, false);
 
         assert_eq!(state.results.len(), 1);
         assert!(state.queue.is_empty());

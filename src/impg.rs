@@ -45,6 +45,8 @@ thread_local! {
     static GAP_AFFINE_ALIGNER: RefCell<Option<AffineWavefronts>> = const { RefCell::new(None) };
     static GAP_AFFINE2P_ALIGNER: RefCell<Option<AffineWavefronts>> = const { RefCell::new(None) };
     static ONEALN_HANDLE: RefCell<Option<(String, OneFile)>> = const { RefCell::new(None) };
+    static PAF_HANDLE: RefCell<Option<(String, std::fs::File)>> = const { RefCell::new(None) };
+    static PAF_CIGAR_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     static TPA_HANDLE: RefCell<Option<(String, tpa::TpaReader)>> = const { RefCell::new(None) };
     static TARGET_SEQ_CACHE: RefCell<Option<((u32, i64, i64, bool), Vec<u8>)>> = const { RefCell::new(None) };
     /// Reused PAF CIGAR byte buffer. The old hot path allocated and freed one
@@ -168,28 +170,26 @@ impl CigarOp {
     }
 }
 
-/// Invert CIGAR operations for bidirectional alignment interpretation.
-/// - Swap I↔D (insertions become deletions and vice versa)
-/// - Reverse the CIGAR array only if strand is Reverse
-/// - Matches (=), mismatches (X), and ambiguous (M) stay the same
-fn invert_cigar_ops(ops: &[CigarOp], strand: Strand) -> Vec<CigarOp> {
-    let inverted: Vec<CigarOp> = ops
-        .iter()
-        .map(|op| {
-            let new_op = match op.op() {
-                'I' => 'D',
-                'D' => 'I',
-                other => other, // =, X, M unchanged
-            };
-            CigarOp::new(op.len(), new_op)
-        })
-        .collect();
-
-    if strand == Strand::Reverse {
-        inverted.into_iter().rev().collect()
-    } else {
-        inverted
+/// Invert CIGAR ops for bidirectional interpretation: swap I<->D, keep =/X/M,
+/// and reverse the array on the reverse strand.
+fn invert_cigar_ops_in_place(ops: &mut [CigarOp], strand: Strand) {
+    for op in ops.iter_mut() {
+        let new_op = match op.op() {
+            'I' => 'D',
+            'D' => 'I',
+            other => other,
+        };
+        *op = CigarOp::new(op.len(), new_op);
     }
+    if strand == Strand::Reverse {
+        ops.reverse();
+    }
+}
+
+fn invert_cigar_ops(ops: &[CigarOp], strand: Strand) -> Vec<CigarOp> {
+    let mut inverted = ops.to_vec();
+    invert_cigar_ops_in_place(&mut inverted, strand);
+    inverted
 }
 
 /// Accumulates a CIGAR as same-op runs, merging adjacent equal ops and
@@ -632,17 +632,11 @@ struct SerializableInterval {
 #[derive(Default, Clone)]
 pub struct SortedRanges {
     pub ranges: Vec<(i64, i64)>,
-    sequence_length: i64,
-    min_distance: i64,
 }
 
 impl SortedRanges {
-    pub fn new(sequence_length: i64, min_distance: i64) -> Self {
-        Self {
-            ranges: Vec::new(),
-            sequence_length,
-            min_distance,
-        }
+    pub fn new() -> Self {
+        Self { ranges: Vec::new() }
     }
 
     pub fn len(&self) -> usize {
@@ -657,7 +651,27 @@ impl SortedRanges {
         self.ranges.iter()
     }
 
+    /// Insert a range, snapping its boundaries onto adjacent existing ranges
+    /// when they lie within `min_distance` (used for expansion ranges, to absorb
+    /// alignment boundary jitter while keeping novel territory).
+    ///
+    /// User-requested ranges must go through `insert`, which never snaps.
+    pub fn insert_with_boundary_snap(
+        &mut self,
+        new_range: (i64, i64),
+        min_distance: i64,
+    ) -> Vec<(i64, i64)> {
+        if min_distance <= 0 {
+            return self.insert(new_range);
+        }
+        self.insert_inner(new_range, min_distance)
+    }
+
     pub fn insert(&mut self, new_range: (i64, i64)) -> Vec<(i64, i64)> {
+        self.insert_inner(new_range, 0)
+    }
+
+    fn insert_inner(&mut self, new_range: (i64, i64), min_distance: i64) -> Vec<(i64, i64)> {
         let (mut start, mut end) = if new_range.0 <= new_range.1 {
             (new_range.0, new_range.1)
         } else {
@@ -665,24 +679,19 @@ impl SortedRanges {
         };
 
         // Find nearby ranges to potentially merge with
-        let mut i = match self.ranges.binary_search_by_key(&start, |&(s, _)| s) {
+        let i = match self.ranges.binary_search_by_key(&start, |&(s, _)| s) {
             Ok(pos) => pos,
             Err(pos) => pos,
         };
 
         // Check previous range
-        if i > 0 && (start - self.ranges[i - 1].1).abs() < self.min_distance {
+        if i > 0 && (start - self.ranges[i - 1].1).abs() < min_distance {
             start = self.ranges[i - 1].1;
-            i -= 1;
-        } else if start < self.min_distance {
-            start = 0;
         }
 
         // Check next range
-        if i < self.ranges.len() && (self.ranges[i].0 - end).abs() < self.min_distance {
+        if i < self.ranges.len() && (self.ranges[i].0 - end).abs() < min_distance {
             end = self.ranges[i].0;
-        } else if end > (self.sequence_length - self.min_distance) {
-            end = self.sequence_length;
         }
 
         // Return regions that don't overlap with existing ranges
@@ -912,7 +921,7 @@ impl Impg {
     ) -> io::Result<Vec<CigarOp>> {
         let alignment_file = &self.alignment_files[metadata.alignment_file_index as usize];
 
-        let ops = match QueryMetadata::get_file_type(alignment_file) {
+        let mut ops = match QueryMetadata::get_file_type(alignment_file) {
             FileType::Paf => {
                 // For PAF files, read CIGAR directly from file
                 if metadata.data_bytes == 0 {
@@ -928,7 +937,7 @@ impl Impg {
                 CIGAR_DATA_BUFFER.with(|buffer| -> io::Result<Vec<CigarOp>> {
                     let mut data_buffer = buffer.borrow_mut();
                     data_buffer.resize(metadata.data_bytes, 0);
-                    read_cigar_data(
+                    read_paf_cigar_data(
                         alignment_file,
                         metadata.data_offset(),
                         &mut data_buffer[..metadata.data_bytes],
@@ -968,12 +977,11 @@ impl Impg {
             }
         };
 
-        // Apply CIGAR inversion if this is a reversed entry
+        // Apply CIGAR inversion if this is a reversed entry (in place, no extra alloc)
         if metadata.is_reversed() {
-            Ok(invert_cigar_ops(&ops, metadata.strand()))
-        } else {
-            Ok(ops)
+            invert_cigar_ops_in_place(&mut ops, metadata.strand());
         }
+        Ok(ops)
     }
 
     fn get_onealn_alignment(&self, metadata: &QueryMetadata) -> Result<OneAlnAlignment, String> {
@@ -3111,6 +3119,18 @@ impl Impg {
         (results, raw_results)
     }
 
+    /// Get or lazily create a sequence's visited-range set during a transitive walk.
+    /// A new entry gets the sequence's real length when unmasked (matching the old
+    /// eager pre-population) and length 0 otherwise (matching the old `or_default()`).
+    #[inline]
+    fn visited_entry<'a>(
+        &'a self,
+        visited_ranges: &'a mut FxHashMap<u32, SortedRanges>,
+        id: u32,
+    ) -> &'a mut SortedRanges {
+        visited_ranges.entry(id).or_insert_with(SortedRanges::new)
+    }
+
     pub fn query_transitive_dfs(
         &self,
         target_id: u32,
@@ -3138,10 +3158,8 @@ impl Impg {
         };
 
         // Filter input range
-        let target_len = self.seq_index.get_len_from_id(target_id).unwrap_or(0) as i64;
-        let filtered_input_range = visited_ranges
-            .entry(target_id)
-            .or_insert_with(|| SortedRanges::new(target_len, 0))
+        let filtered_input_range = self
+            .visited_entry(&mut visited_ranges, target_id)
             .insert((range_start, range_end));
 
         // See query_transitive_bfs: carry the per-hop synthesized CIGAR only on
@@ -3352,56 +3370,17 @@ impl Impg {
                     };
                     // Only add non-overlapping portions to the stack for further exploration
                     if can_descend && hit.query_id != hit.parent_id {
-                        let ranges = visited_ranges.entry(hit.query_id).or_insert_with(|| {
-                            let len = self.seq_index.get_len_from_id(hit.query_id).unwrap_or(0);
-                            SortedRanges::new(len as i64, 0)
-                        });
-
-                        let mut should_add = true;
-
-                        // Check if the range is too close to any existing ranges
-                        if min_distance_between_ranges > 0 {
-                            let (new_min, new_max) = if hit.query_first <= hit.query_last {
-                                (hit.query_first, hit.query_last)
-                            } else {
-                                (hit.query_last, hit.query_first)
-                            };
-
-                            // Find insertion point in sorted ranges
-                            let idx = match ranges
-                                .ranges
-                                .binary_search_by_key(&new_min, |&(start, _)| start)
-                            {
-                                Ok(i) => i,
-                                Err(i) => i,
-                            };
-
-                            // Only need to check adjacent ranges due to sorting
-                            if idx > 0 {
-                                // Check previous range
-                                let (_, prev_end) = ranges.ranges[idx - 1];
-                                if (new_min - prev_end).abs() < min_distance_between_ranges {
-                                    should_add = false;
-                                }
-                            }
-                            if idx < ranges.ranges.len() {
-                                // Check next range
-                                let (next_start, _) = ranges.ranges[idx];
-                                if (next_start - new_max).abs() < min_distance_between_ranges {
-                                    should_add = false;
-                                }
-                            }
-                        }
-
-                        if should_add {
-                            let new_ranges = ranges.insert((hit.query_first, hit.query_last));
-                            extend_frontier_from_hit(
-                                &hit,
-                                new_ranges,
-                                min_transitive_len,
-                                |range| stack.push((range, current_depth + 1)),
-                            );
-                        }
+                        let ranges = self.visited_entry(&mut visited_ranges, hit.query_id);
+                        let new_ranges = ranges.insert_with_boundary_snap(
+                            (hit.query_first, hit.query_last),
+                            min_distance_between_ranges,
+                        );
+                        extend_frontier_from_hit(
+                            &hit,
+                            new_ranges,
+                            min_transitive_len,
+                            |range| stack.push((range, current_depth + 1)),
+                        );
                     }
 
                     if should_add_to_output {
@@ -3475,10 +3454,8 @@ impl Impg {
         };
 
         // Filter input range
-        let target_len = self.seq_index.get_len_from_id(target_id).unwrap_or(0) as i64;
-        let filtered_input_range = visited_ranges
-            .entry(target_id)
-            .or_insert_with(|| SortedRanges::new(target_len, 0))
+        let filtered_input_range = self
+            .visited_entry(&mut visited_ranges, target_id)
             .insert((range_start, range_end));
 
         let mut results = Vec::new();
@@ -3703,57 +3680,17 @@ impl Impg {
                     };
                     // Only consider for next depth if it's a different sequence
                     if can_descend && hit.query_id != hit.parent_id {
-                        let ranges = visited_ranges.entry(hit.query_id).or_insert_with(|| {
-                            let len = self.seq_index.get_len_from_id(hit.query_id).unwrap_or(0);
-                            SortedRanges::new(len as i64, 0)
-                        });
-
-                        let mut should_add = true;
-
-                        // Check proximity to existing ranges
-                        if min_distance_between_ranges > 0 {
-                            let (new_min, new_max) = if hit.query_first <= hit.query_last {
-                                (hit.query_first, hit.query_last)
-                            } else {
-                                (hit.query_last, hit.query_first)
-                            };
-
-                            // Find insertion point in sorted ranges
-                            let idx = match ranges
-                                .ranges
-                                .binary_search_by_key(&new_min, |&(start, _)| start)
-                            {
-                                Ok(i) => i,
-                                Err(i) => i,
-                            };
-
-                            // Only need to check adjacent ranges due to sorting
-                            if idx > 0 {
-                                // Check previous range
-                                let (_, prev_end) = ranges.ranges[idx - 1];
-                                if (new_min - prev_end).abs() < min_distance_between_ranges {
-                                    should_add = false;
-                                }
-                            }
-
-                            if should_add && idx < ranges.ranges.len() {
-                                // Check next range
-                                let (next_start, _) = ranges.ranges[idx];
-                                if (next_start - new_max).abs() < min_distance_between_ranges {
-                                    should_add = false;
-                                }
-                            }
-                        }
-
-                        if should_add {
-                            let new_ranges = ranges.insert((hit.query_first, hit.query_last));
-                            extend_frontier_from_hit(
-                                &hit,
-                                new_ranges,
-                                min_transitive_len,
-                                |range| next_depth_ranges.push(range),
-                            );
-                        }
+                        let ranges = self.visited_entry(&mut visited_ranges, hit.query_id);
+                        let new_ranges = ranges.insert_with_boundary_snap(
+                            (hit.query_first, hit.query_last),
+                            min_distance_between_ranges,
+                        );
+                        extend_frontier_from_hit(
+                            &hit,
+                            new_ranges,
+                            min_transitive_len,
+                            |range| next_depth_ranges.push(range),
+                        );
                     }
 
                     if should_add_to_output {
@@ -4291,16 +4228,51 @@ fn project_target_range_coords_through_alignment(
     }
 }
 
+/// Read a PAF CIGAR span into `buffer`. Uncompressed PAF uses a per-thread cached
+/// handle and `read_exact_at` (no open()+seek per projection); BGZF keeps the
+/// virtual-position path in `read_cigar_data`.
+fn read_paf_cigar_data(alignment_file: &str, offset: u64, buffer: &mut [u8]) -> Result<(), String> {
+    let is_compressed = alignment_file.ends_with(".gz") || alignment_file.ends_with(".bgz");
+    if is_compressed {
+        return read_cigar_data(alignment_file, offset, buffer);
+    }
+
+    use std::os::unix::fs::FileExt;
+    PAF_HANDLE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let needs_open = match slot.as_ref() {
+            Some((cached_path, _)) => cached_path != alignment_file,
+            None => true,
+        };
+        if needs_open {
+            *slot = None;
+            let file = std::fs::File::open(alignment_file)
+                .map_err(|e| format!("Failed to open file '{}': {}", alignment_file, e))?;
+            *slot = Some((alignment_file.to_string(), file));
+        }
+        let (_, file) = slot.as_ref().expect("PAF_HANDLE must contain a handle");
+        file.read_exact_at(buffer, offset).map_err(|e| {
+            format!(
+                "Failed to read {} CIGAR bytes at offset {} in '{}': {}",
+                buffer.len(),
+                offset,
+                alignment_file,
+                e
+            )
+        })
+    })
+}
+
 fn parse_cigar_to_delta(cigar: &str) -> Result<Vec<CigarOp>, OneAlnParseErr> {
+    // CIGAR is pure ASCII; iterate bytes to skip UTF-8 decoding of every char.
     let mut ops = Vec::new();
     let mut len: i32 = 0;
 
-    for c in cigar.chars() {
+    for &c in cigar.as_bytes() {
         if c.is_ascii_digit() {
-            len = len * 10 + (c as i32 - '0' as i32);
+            len = len * 10 + (c - b'0') as i32;
         } else {
-            let op = CigarOp::new(len, c);
-            ops.push(op);
+            ops.push(CigarOp::new(len, c as char));
             len = 0;
         }
     }

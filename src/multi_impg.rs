@@ -2815,10 +2815,9 @@ impl MultiImpg {
         };
 
         // Filter input range
-        let target_len = self.seq_index.get_len_from_id(target_id).unwrap_or(0) as i64;
         let filtered_input_range = visited_ranges
             .entry(target_id)
-            .or_insert_with(|| SortedRanges::new(target_len, 0))
+            .or_insert_with(SortedRanges::new)
             .insert((range_start, range_end));
 
         let carry = store_cigar && !approximate_mode;
@@ -2887,7 +2886,6 @@ impl MultiImpg {
                     };
                     if can_descend {
                         extend_multi_transitive_hit(
-                            &self.seq_index,
                             &mut visited_ranges,
                             &hit,
                             min_distance_between_ranges,
@@ -2958,7 +2956,6 @@ impl MultiImpg {
                     };
                     if can_descend {
                         extend_multi_transitive_hit(
-                            &self.seq_index,
                             &mut visited_ranges,
                             &hit,
                             min_distance_between_ranges,
@@ -3075,7 +3072,6 @@ fn transitive_hit_from_pairwise(
 }
 
 fn extend_multi_transitive_hit(
-    seq_index: &SequenceIndex,
     visited_ranges: &mut FxHashMap<u32, SortedRanges>,
     hit: &BfsHit,
     min_distance_between_ranges: i64,
@@ -3085,29 +3081,10 @@ fn extend_multi_transitive_hit(
     if hit.query_id == hit.parent_id {
         return;
     }
-    let ranges = visited_ranges.entry(hit.query_id).or_insert_with(|| {
-        SortedRanges::new(
-            seq_index.get_len_from_id(hit.query_id).unwrap_or(0) as i64,
-            0,
-        )
-    });
-    if min_distance_between_ranges > 0 {
-        let new_min = hit.query_first.min(hit.query_last);
-        let new_max = hit.query_first.max(hit.query_last);
-        let idx = ranges
-            .ranges
-            .binary_search_by_key(&new_min, |&(start, _)| start)
-            .unwrap_or_else(|i| i);
-        if idx > 0 && (new_min - ranges.ranges[idx - 1].1).abs() < min_distance_between_ranges {
-            return;
-        }
-        if idx < ranges.ranges.len()
-            && (ranges.ranges[idx].0 - new_max).abs() < min_distance_between_ranges
-        {
-            return;
-        }
-    }
-    let new_ranges = ranges.insert((hit.query_first, hit.query_last));
+    let new_ranges = visited_ranges
+        .entry(hit.query_id)
+        .or_insert_with(SortedRanges::new)
+        .insert_with_boundary_snap((hit.query_first, hit.query_last), min_distance_between_ranges);
     extend_frontier_from_hit(hit, new_ranges, min_transitive_len, push);
 }
 

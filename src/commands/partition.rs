@@ -249,10 +249,7 @@ pub fn partition_alignments(
     // Initialize masked regions
     let mut masked_regions: FxHashMap<u32, SortedRanges> = (0..impg.seq_index().len() as u32)
         .into_par_iter()
-        .map(|id| {
-            let len = impg.seq_index().get_len_from_id(id).unwrap();
-            (id, SortedRanges::new(len as i64, 0))
-        })
+        .map(|id| (id, SortedRanges::new()))
         .collect();
 
     // Initialize missing regions from sequence index
@@ -260,7 +257,7 @@ pub fn partition_alignments(
         .into_par_iter()
         .map(|id| {
             let len = impg.seq_index().get_len_from_id(id).unwrap();
-            let mut ranges = SortedRanges::new(len as i64, 0);
+            let mut ranges = SortedRanges::new();
             ranges.insert((0, len as i64));
             (id, ranges)
         })
@@ -274,6 +271,14 @@ pub fn partition_alignments(
         .sum::<usize>() as u64;
 
     info!("Partitioning");
+
+    // Force-progress bookkeeping: if a round emits no partitions and the
+    // next selection replays the exact same windows, the selected region has
+    // no homologs the backend can see (e.g. low-complexity sequence the
+    // syng/alignment query cannot anchor) and nothing will ever mask it.
+    // Re-querying it forever spins a single core in silence. Detect that
+    // state and force-mask the region so selection moves on.
+    let mut last_round_windows: Option<Vec<(u32, i64, i64)>> = None;
 
     // If no windows are yet defined, select initial windows based on selection_mode
     if windows.is_empty() {
@@ -293,6 +298,9 @@ pub fn partition_alignments(
     let mut collected_partitions: Vec<(usize, Vec<Interval<u32>>)> = Vec::new();
 
     while !windows.is_empty() {
+        let round_windows = windows.clone();
+        let partitions_before_round = partition_num;
+
         if debug {
             debug!("Processing new set of {} windows", windows.len());
             for (seq_id, start, end) in &windows {
@@ -309,6 +317,7 @@ pub fn partition_alignments(
 
         for (seq_id, start, end) in windows.drain(..) {
             let chrom = impg.seq_index().get_name(seq_id).unwrap();
+            let window_start = std::time::Instant::now();
 
             if debug {
                 debug!(
@@ -551,6 +560,13 @@ pub fn partition_alignments(
                     end,
                     end - start,
                 );
+                debug!(
+                    "  Window {}:{}-{} took {:?} (query + mask + write)",
+                    chrom,
+                    start,
+                    end,
+                    window_start.elapsed()
+                );
 
                 //info!("  Partition {} timings: query={:?}, merge={:?}, merge2={:?}, extend={:?}, mask={:?}, calc={:?}, write={:?}",
                 //    partition_num, query_time, merge_time, merge2_time, extend_time, mask_time, calc_time, write_time);
@@ -577,6 +593,61 @@ pub fn partition_alignments(
         )?;
         //let window_time = window_start.elapsed();
         //info!("  select_and_window_sequences={:?}", window_time);
+
+        // Stall guard: no partitions emitted this round and the selection
+        // replayed the same windows. Mask the region by hand (it has no
+        // homologs to mask it for us) and reselect, so the loop terminates.
+        if partition_num == partitions_before_round && last_round_windows.as_ref() == Some(&round_windows)
+        {
+            let stalled: Vec<String> = round_windows
+                .iter()
+                .map(|(seq_id, start, end)| {
+                    format!(
+                        "{}:{}-{}",
+                        impg.seq_index().get_name(*seq_id).unwrap_or("?"),
+                        start,
+                        end
+                    )
+                })
+                .collect();
+            log::warn!(
+                "No homologs found for {} selected region(s) ({}); force-masking to keep partitioning moving forward",
+                stalled.len(),
+                stalled.join(", ")
+            );
+            for (seq_id, start, end) in &round_windows {
+                let masked = masked_regions.entry(*seq_id).or_default();
+                masked.insert((*start, *end));
+                if let Some(missing) = missing_regions.get_mut(seq_id) {
+                    let mut rebuilt = Vec::with_capacity(missing.ranges.len() + 1);
+                    for &(ms, me) in missing.ranges.iter() {
+                        if me <= *start || ms >= *end {
+                            rebuilt.push((ms, me));
+                        } else {
+                            if ms < *start {
+                                rebuilt.push((ms, *start));
+                            }
+                            if me > *end {
+                                rebuilt.push((*end, me));
+                            }
+                        }
+                    }
+                    missing.ranges = rebuilt;
+                    if missing.is_empty() {
+                        missing_regions.remove(seq_id);
+                    }
+                }
+            }
+            windows.clear();
+            select_and_window_sequences(
+                &mut windows,
+                impg,
+                &missing_regions,
+                selection_mode,
+                window_size,
+            )?;
+        }
+        last_round_windows = Some(round_windows);
     }
 
     // Convert temporary BED files to graph/MAF if needed
