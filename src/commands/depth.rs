@@ -61,8 +61,13 @@ pub struct DepthConfig {
     /// When true, use CIGAR-precise BFS for transitive depth (--use-BFS).
     /// When false (default), use raw-interval BFS with linear interpolation.
     pub use_cigar_bfs: bool,
-    /// Maximum number of locality-aware Phase-2 waves. The final wave is a
-    /// fallback containing all residual sequences; 1 disables wave splitting.
+    /// Maximum number of locality-aware Phase-2 waves. Each alignment-connected
+    /// component is split into at most this many ordered, balanced slices, and
+    /// wave `k` is the `k`-th slice of *every* component; the waves therefore
+    /// partition the Phase-2 sequences exactly -- there is no residual
+    /// catch-all wave. A component smaller than the cap contributes one
+    /// sequence per wave and then drops out, so the wave count is
+    /// `min(cap, largest component)`. 1 disables wave splitting.
     pub phase2_max_waves: usize,
     /// Statistics need the union length of every projected query interval.
     /// Ordinary TSV output only consumes the representative sample position,
@@ -1662,7 +1667,12 @@ fn is_self_alignment(
 // Windowed depth computation - fixed window size, sample by sample
 // ============================================================================
 
-/// Default window size for windowed depth computation (50kb)
+/// Inert fallback for the `--window-size` option; NOT a default window size.
+/// Window splitting is gated on the user having passed the flag
+/// (`user_window_size.is_some()` in `compute_depth_global`), so this value can
+/// never reach `split_intervals_by_window`. It exists only to give the
+/// unwrapped local an `i64`. Without `--window-size`, intervals keep the
+/// length the sweep produced.
 const DEFAULT_WINDOW_SIZE: i64 = 50_000;
 
 // ============================================================================
@@ -5988,6 +5998,10 @@ pub fn compute_depth_global(
 
     // ------------------------------------------------------------------
     let is_transitive = config.transitive || config.transitive_dfs;
+    // Two bindings on purpose: `user_window_size` is the GATE (splitting happens
+    // only if `--window-size` was given) and `window_size` is the value. Every
+    // consumer checks the gate, so `DEFAULT_WINDOW_SIZE` is never used as a
+    // split size -- see its definition.
     let user_window_size = window_size;
     let window_size = window_size.unwrap_or(DEFAULT_WINDOW_SIZE);
     if is_transitive {
@@ -6082,9 +6096,27 @@ pub fn compute_depth_global(
     // total number of per-file indices. The old tree-cache toggle is no longer
     // needed for the pre-scan — leave the main-phase cache setting untouched.
     let degrees = if ref_sample_id.is_some() {
-        // The requested reference determines Phase 1 completely. Walking every
-        // per-file index merely to order Phase-2 leaves by degree does not
-        // change correctness and is a costly 10^5-file pre-pass on VGP.
+        // The requested reference determines Phase 1 completely, and the
+        // degree pre-scan is a costly 10^5-file pre-pass on VGP.
+        //
+        // This comment used to end "does not change correctness". It does
+        // change the output, and by more than the saving is worth pretending
+        // otherwise. Zeroing every degree also kills the second sort key in
+        // build_sequence_order, so the order below collapses to pure
+        // length-descending: three runs anchored on genomes spanning a 63x
+        // size range produce byte-identical orders once each anchor's own
+        // block is removed. Measured over 380 alignments among 20 assemblies
+        // (VGP/anchor_invariance), the two paths disagree on per-base union
+        // depth by 1.3% pooled and up to 8.7% on a single genome, structured
+        // by clade -- birds worst, multi-gigabase genomes untouched.
+        //
+        // Which side is right was settled against a count taken from the PAFs
+        // alone: THIS path lands at 0.9975 of the independent total and
+        // scatters either side of it, while the pre-scan path lands at 1.0108
+        // and is above it in 20 of 20 genomes. So the shortcut is also the
+        // accurate branch -- but it is a different computation, not a
+        // scheduling detail, and a caller who drops --ref gets different
+        // numbers with no warning.
         info!("Reference supplied: skipping alignment-degree pre-scan");
         vec![0u16; num_sequences]
     } else {

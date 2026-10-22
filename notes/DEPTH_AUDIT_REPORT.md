@@ -1,3 +1,12 @@
+> **SUPERSEDED, 2026-09.**  This report describes `src/commands/depth.rs` as it
+> stood before the 2026-07 work.  Its findings on test coverage and on i32
+> coordinates are out of date: the depth path now carries 58 unit tests and 17
+> integration tests, coordinates are i64 throughout, and the checkpoint/resume
+> machinery it predates is in `depth_checkpoint.rs`.  For the current reference
+> -- the algorithm, the partition guarantee, what is and is not order-dependent,
+> and the production command -- see `docs/depth.md`.  Kept because its C4/C5
+> findings are still open and are tracked there.
+
 # `impg depth` 模块综合审阅报告
 
 **审阅对象**: `src/commands/depth.rs`（4260 行）及关联模块  

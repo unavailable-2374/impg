@@ -131,15 +131,21 @@ hash, not merely a different set of names.
 
 > Pangenome depth was computed with `impg depth` (impg, tag `depth-v1.0.0`), a
 > subcommand that counts, for every locus, the number of distinct assemblies
-> whose pairwise alignments cover it. No reference genome is required: the
-> `--ref` option determines only which sequences are offered as anchors first,
-> and CHM13v2.0 was used in that role for scheduling. The record partition — 
-> which assembly claims a region, and therefore the coordinate frame the region
-> is reported in — does depend on that order, as does which alignment file is
-> consulted at a locus, since pairwise homology is not transitive. Statistics
-> reported here are anchor-invariant reads (Σ length·depth, lineage
+> whose pairwise alignments cover it. No reference genome is required; CHM13v2.0
+> was passed to `--ref`, which schedules its sequences as the first anchors. The
+> record partition — which assembly claims a region, and therefore the coordinate
+> frame it is reported in — depends on that schedule, as does which alignment
+> file is consulted at a locus, since pairwise homology is not transitive.
+> Statistics reported here are schedule-invariant reads (Σ length·depth, lineage
 > co-occurrence, and per-base depth read in each assembly's own frame from every
 > record mentioning it); per-assembly statistics keyed on the claiming sequence
-> are not used. Order invariance was verified empirically by repeating the
-> analysis over 380 alignments among 20 assemblies under five different
-> processing orders (see Supplementary).
+> are not used. Two properties were verified empirically over 380 alignments
+> among 20 assemblies (see Supplementary). First, holding the scheduling path
+> fixed, per-base depth is invariant to the sequence order: a degree-ranked
+> order and a seeded random permutation of all 1,033 sequences agree to 7 parts
+> in 10^7 of claimed sequence. Second, the depth itself was checked against an
+> independent count made from the pairwise alignments alone, with no depth
+> output in it, under the identity depth = partners + 1; the totals agree to
+> 0.25%, and per base the two agree at a median of 98.8% of positions per
+> assembly, within the 5.8% median disagreement between the two directions of a
+> single pairwise alignment.

@@ -6160,7 +6160,14 @@ GFA engine shorthand:
         #[clap(short = 'O', long, value_parser)]
         output_prefix: Option<String>,
 
-        /// Window size in bp (default: 50000)
+        /// Split output intervals at fixed multiples of this size, in bp.
+        /// There is no default: without this flag nothing is split and each
+        /// interval keeps the length the sweep produced. Cuts land on the
+        /// absolute grid (0, N, 2N, ...), not at offsets from an interval's
+        /// start, and each piece's per-sample coordinates are re-derived by
+        /// linear interpolation -- so a window grid gives up some of the
+        /// accuracy `--cigar-precise` buys. Global depth only; ignored by
+        /// `-r` / `-b`.
         #[arg(help_heading = "Performance")]
         #[clap(long, value_parser)]
         window_size: Option<i64>,
