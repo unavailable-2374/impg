@@ -790,6 +790,17 @@ struct SubsettingResult {
     last_segment_info: (i64, i32, i64, i64, i32, i32),
 }
 
+fn tree_load_memory() -> String {
+    std::fs::read_to_string("/proc/self/status")
+        .unwrap_or_default()
+        .lines()
+        .filter(|s| s.starts_with("VmRSS:") || s.starts_with("VmHWM:"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub static TREE_LOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub struct Impg {
     pub trees: RwLock<TreeMap>,
     pub seq_index: SequenceIndex,
@@ -2323,6 +2334,8 @@ impl Impg {
     /// Load a specific tree from disk using the forest map
     fn load_tree_from_disk(&self, target_id: u32) -> Option<Arc<BasicCOITree<QueryMetadata, u32>>> {
         if let Some(tree_offset) = self.forest_map.get_tree_offset(target_id) {
+            let measure = std::env::var_os("IMPG_TREE_LOAD_STATS").is_some();
+            let load_start = std::time::Instant::now();
             let mut file = File::open(&self.index_file_path).expect("Failed to open index file");
             file.seek(std::io::SeekFrom::Start(tree_offset))
                 .expect("Failed to seek in index file");
@@ -2334,6 +2347,11 @@ impl Impg {
                         panic!("Failed to deserialize tree for target {target_id}")
                     });
 
+            if measure {
+                log::info!("tree-load phase=decoded target={target_id} intervals={} capacity={} serialized_heap_bytes={} elapsed_us={} status={}",
+                    intervals.len(), intervals.capacity(), intervals.capacity() * std::mem::size_of::<SerializableInterval>(),
+                    load_start.elapsed().as_micros(), tree_load_memory());
+            }
             // Verify we loaded the correct tree
             if loaded_target_id != target_id {
                 panic!("Tree mismatch: expected {target_id}, got {loaded_target_id}");
@@ -2352,6 +2370,15 @@ impl Impg {
                     .as_slice(),
             );
 
+            if measure {
+                log::info!(
+                    "tree-load phase=built target={target_id} nodes={} elapsed_us={} status={}",
+                    tree.len(),
+                    load_start.elapsed().as_micros(),
+                    tree_load_memory()
+                );
+            }
+            TREE_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let arc_tree = Arc::new(tree);
 
             // Only cache if tree caching is enabled
@@ -3895,7 +3922,25 @@ impl ImpgIndex for Impg {
     }
 
     fn remove_cached_tree(&self, target_id: u32) {
-        self.trees.write().unwrap().remove(&target_id);
+        if !self.index_file_path.is_empty() {
+            self.trees.write().unwrap().remove(&target_id);
+        }
+    }
+
+    fn cache_stats(&self) -> (usize, usize, usize) {
+        let trees = self.trees.read().unwrap();
+        (1, trees.len(), trees.values().map(|t| t.len()).sum())
+    }
+
+    fn cache_metadata_counts(&self) -> (usize, usize) {
+        (self.seq_index.len(), self.forest_map.entries.len())
+    }
+
+    fn clear_cached_trees(&self) {
+        // In-memory indices cannot reload evicted trees.
+        if !self.index_file_path.is_empty() {
+            self.trees.write().unwrap().clear();
+        }
     }
 
     fn num_targets(&self) -> usize {

@@ -6,6 +6,7 @@ pub mod graph;
 pub mod infer;
 pub mod lace;
 pub mod partition;
+pub mod partition_journal;
 pub mod refine;
 pub mod render;
 pub mod similarity;

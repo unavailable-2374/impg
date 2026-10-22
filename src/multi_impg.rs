@@ -1952,9 +1952,41 @@ impl ImpgIndex for MultiImpg {
         self.forest_map.keys().copied().collect()
     }
 
-    fn remove_cached_tree(&self, _target_id: u32) {
-        // For MultiImpg, we don't cache trees at this level.
-        // Sub-indices manage their own tree caches.
+    fn remove_cached_tree(&self, target_id: u32) {
+        let indices = self.sub_indices.read().unwrap();
+        if let Some(locations) = self.forest_map.get(&target_id) {
+            for loc in locations {
+                if let Some(impg) = &indices[loc.index_idx()] {
+                    impg.remove_cached_tree(loc.local_target_id());
+                }
+            }
+        }
+    }
+
+    fn cache_stats(&self) -> (usize, usize, usize) {
+        self.sub_indices
+            .read()
+            .unwrap()
+            .iter()
+            .flatten()
+            .map(|impg| impg.cache_stats())
+            .fold((0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
+    }
+
+    fn cache_metadata_counts(&self) -> (usize, usize) {
+        self.sub_indices
+            .read()
+            .unwrap()
+            .iter()
+            .flatten()
+            .map(|impg| impg.cache_metadata_counts())
+            .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
+    }
+
+    fn clear_cached_trees(&self) {
+        for impg in self.sub_indices.read().unwrap().iter().flatten() {
+            impg.clear_cached_trees();
+        }
     }
 
     fn num_targets(&self) -> usize {
@@ -2804,20 +2836,18 @@ impl MultiImpg {
         subset_filter: Option<&SubsetFilter>,
         use_dfs: bool,
     ) -> io::Result<Vec<AdjustedInterval>> {
-        // Initialize visited ranges.  Global depth --use-BFS calls this once
-        // per 5 MB chunk; without a mask, prebuilding an entry for every
-        // unified sequence is fixed O(num_sequences) work per chunk.  Keep
-        // masked runs exact, but allocate the unmasked map lazily.
-        let mut visited_ranges: FxHashMap<u32, SortedRanges> = if let Some(m) = masked_regions {
-            m.iter().map(|(&k, v)| (k, v.clone())).collect()
-        } else {
-            FxHashMap::default()
-        };
+        // Visited ranges start as a copy of the masks, but each sequence is
+        // copied on first touch rather than all of them up front. The eager copy
+        // cloned every mask of every sequence for every query: partition calls
+        // this once per window with masks that only grow, so each window cost
+        // O(all masked ranges) -- quadratic over a run, and nearly all of a
+        // 581-genome partition's time once past the first few percent. A
+        // sequence the walk never reaches is never read, so the lazy copy gives
+        // exactly what the eager one did (see `visited_entry`).
+        let mut visited_ranges: FxHashMap<u32, SortedRanges> = FxHashMap::default();
 
         // Filter input range
-        let filtered_input_range = visited_ranges
-            .entry(target_id)
-            .or_insert_with(SortedRanges::new)
+        let filtered_input_range = visited_entry(&mut visited_ranges, masked_regions, target_id)
             .insert((range_start, range_end));
 
         let carry = store_cigar && !approximate_mode;
@@ -2887,6 +2917,7 @@ impl MultiImpg {
                     if can_descend {
                         extend_multi_transitive_hit(
                             &mut visited_ranges,
+                            masked_regions,
                             &hit,
                             min_distance_between_ranges,
                             min_transitive_len,
@@ -2957,6 +2988,7 @@ impl MultiImpg {
                     if can_descend {
                         extend_multi_transitive_hit(
                             &mut visited_ranges,
+                            masked_regions,
                             &hit,
                             min_distance_between_ranges,
                             min_transitive_len,
@@ -3071,8 +3103,20 @@ fn transitive_hit_from_pairwise(
     }
 }
 
+/// Get a sequence's visited-range set, copying its mask on first touch.
+fn visited_entry<'a>(
+    visited: &'a mut FxHashMap<u32, SortedRanges>,
+    masked: Option<&FxHashMap<u32, SortedRanges>>,
+    id: u32,
+) -> &'a mut SortedRanges {
+    visited
+        .entry(id)
+        .or_insert_with(|| masked.and_then(|m| m.get(&id)).cloned().unwrap_or_default())
+}
+
 fn extend_multi_transitive_hit(
     visited_ranges: &mut FxHashMap<u32, SortedRanges>,
+    masked_regions: Option<&FxHashMap<u32, SortedRanges>>,
     hit: &BfsHit,
     min_distance_between_ranges: i64,
     min_transitive_len: i64,
@@ -3081,9 +3125,7 @@ fn extend_multi_transitive_hit(
     if hit.query_id == hit.parent_id {
         return;
     }
-    let new_ranges = visited_ranges
-        .entry(hit.query_id)
-        .or_insert_with(SortedRanges::new)
+    let new_ranges = visited_entry(visited_ranges, masked_regions, hit.query_id)
         .insert_with_boundary_snap((hit.query_first, hit.query_last), min_distance_between_ranges);
     extend_frontier_from_hit(hit, new_ranges, min_transitive_len, push);
 }

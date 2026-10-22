@@ -42,117 +42,190 @@ fn create_output_path(output_folder: Option<&str>, filename: &str) -> io::Result
 /// through runs of contiguous singletons.
 ///
 /// Alignment-source-agnostic — works identically on syng and paf partitions.
-pub fn rehome_singleton_slivers(collected_partitions: &mut Vec<(usize, Vec<Interval<u32>>)>) {
-    if collected_partitions.is_empty() {
-        return;
+pub fn rehome_singleton_slivers(partitions: &mut Vec<(usize, Vec<Interval<u32>>)>) {
+    // Preserve the public helper used by graph callers and regression tests.
+    let mut packed = Partitions::default();
+    for partition in std::mem::take(partitions) {
+        packed.push(partition);
     }
-    type Row = (u32, i64, i64, usize, Interval<u32>);
-    let mut rows: Vec<Row> = Vec::new();
-    for (pidx, (_, ivs)) in collected_partitions.iter().enumerate() {
-        for iv in ivs {
-            let (s, e) = if iv.first <= iv.last {
-                (iv.first, iv.last)
-            } else {
-                (iv.last, iv.first)
-            };
-            rows.push((iv.metadata, s, e, pidx, *iv));
-        }
-    }
-    rows.sort_by_key(|r| (r.0, r.1, r.2));
+    packed.rehome();
+    *partitions = packed.iter().map(|(n, v)| (n, v.to_vec())).collect();
+}
 
-    let mut counts = vec![0usize; collected_partitions.len()];
-    for r in &rows {
-        counts[r.3] += 1;
+/// Consecutive interval storage with (partition number, exclusive end) offsets.
+/// No per-partition allocations; identifiers and insertion order are preserved.
+#[derive(Default)]
+struct Partitions {
+    spans: Vec<(usize, usize)>,
+    intervals: Vec<Interval<u32>>,
+}
+impl Partitions {
+    fn len(&self) -> usize {
+        self.spans.len()
     }
-    let initial_singletons = counts.iter().filter(|&&c| c == 1).count();
-    if initial_singletons == 0 {
-        return;
+    fn is_empty(&self) -> bool {
+        self.spans.is_empty()
     }
-
-    let mut pass = 0;
-    loop {
-        pass += 1;
-        let singletons: std::collections::HashSet<usize> = counts
-            .iter()
-            .enumerate()
-            .filter(|(_, &c)| c == 1)
-            .map(|(i, _)| i)
-            .collect();
-        let mut pending: Vec<(usize, usize)> = Vec::new();
-        for i in 0..rows.len() {
-            let (c, s, e, pidx, _) = rows[i];
-            if !singletons.contains(&pidx) {
-                continue;
-            }
-            let left = if i > 0 && rows[i - 1].0 == c && rows[i - 1].2 == s {
-                Some(rows[i - 1].3)
-            } else {
-                None
-            };
-            let right = if i + 1 < rows.len() && rows[i + 1].0 == c && rows[i + 1].1 == e {
-                Some(rows[i + 1].3)
-            } else {
-                None
-            };
-            let ls = left.map(|p| !singletons.contains(&p)).unwrap_or(false);
-            let rs = right.map(|p| !singletons.contains(&p)).unwrap_or(false);
-            let target = if ls && rs {
-                let lp = left.unwrap();
-                let rp = right.unwrap();
-                if counts[lp] >= counts[rp] {
-                    lp
-                } else {
-                    rp
-                }
-            } else if ls {
-                left.unwrap()
-            } else if rs {
-                right.unwrap()
-            } else {
-                continue;
-            };
-            if target != pidx {
-                pending.push((i, target));
-            }
-        }
-        if pending.is_empty() || pass > 100 {
-            break;
-        }
-        for (row_idx, new_pidx) in &pending {
-            let old_pidx = rows[*row_idx].3;
-            counts[old_pidx] -= 1;
-            counts[*new_pidx] += 1;
-            rows[*row_idx].3 = *new_pidx;
-        }
+    fn push(&mut self, (number, intervals): (usize, Vec<Interval<u32>>)) {
+        self.intervals.extend(intervals);
+        self.spans.push((number, self.intervals.len()));
     }
-    let remaining = counts.iter().filter(|&&c| c == 1).count();
-    info!(
-        "Rehomed {} singleton slivers into flank partitions ({} → {} singletons, {} passes)",
-        initial_singletons - remaining,
-        initial_singletons,
-        remaining,
-        pass
-    );
-
-    let mut new_intervals: Vec<Vec<Interval<u32>>> = (0..collected_partitions.len())
-        .map(|_| Vec::new())
-        .collect();
-    for (_, _, _, pidx, iv) in rows.drain(..) {
-        new_intervals[pidx].push(iv);
-    }
-    let rebuilt: Vec<(usize, Vec<Interval<u32>>)> = collected_partitions
-        .iter()
-        .enumerate()
-        .filter_map(|(i, (pnum, _))| {
-            let ivs = std::mem::take(&mut new_intervals[i]);
-            if ivs.is_empty() {
-                None
-            } else {
-                Some((*pnum, ivs))
-            }
+    fn iter(&self) -> impl Iterator<Item = (usize, &[Interval<u32>])> {
+        let mut start = 0;
+        self.spans.iter().map(move |&(number, end)| {
+            let slice = &self.intervals[start..end];
+            start = end;
+            (number, slice)
         })
-        .collect();
-    *collected_partitions = rebuilt;
+    }
+    fn rehome(&mut self) {
+        if self.is_empty() {
+            return;
+        }
+        let mut counts: Vec<usize> = self.iter().map(|(_, v)| v.len()).collect();
+        let initial_singletons = counts.iter().filter(|&&c| c == 1).count();
+        if initial_singletons == 0 {
+            return;
+        }
+        type Row = (u32, i64, i64, usize, Interval<u32>);
+        let mut rows: Vec<Row> = Vec::with_capacity(counts.iter().sum());
+        let mut pidx = 0;
+        for (ordinal, iv) in std::mem::take(&mut self.intervals).into_iter().enumerate() {
+            while ordinal >= self.spans[pidx].1 {
+                pidx += 1;
+            }
+            let (s, e) = (iv.first.min(iv.last), iv.first.max(iv.last));
+            rows.push((iv.metadata, s, e, pidx, iv));
+        }
+        memory_process("rehome-rows");
+        rows.sort_by_key(|r| (r.0, r.1, r.2));
+        memory_process("rehome-sorted");
+
+        let mut pass = 0;
+        loop {
+            pass += 1;
+            let mut pending: Vec<(usize, usize)> = Vec::new();
+            for i in 0..rows.len() {
+                let (c, s, e, pidx, _) = rows[i];
+                if counts[pidx] != 1 {
+                    continue;
+                }
+                let left = if i > 0 && rows[i - 1].0 == c && rows[i - 1].2 == s {
+                    Some(rows[i - 1].3)
+                } else {
+                    None
+                };
+                let right = if i + 1 < rows.len() && rows[i + 1].0 == c && rows[i + 1].1 == e {
+                    Some(rows[i + 1].3)
+                } else {
+                    None
+                };
+                let ls = left.map(|p| counts[p] != 1).unwrap_or(false);
+                let rs = right.map(|p| counts[p] != 1).unwrap_or(false);
+                let target = if ls && rs {
+                    let lp = left.unwrap();
+                    let rp = right.unwrap();
+                    if counts[lp] >= counts[rp] {
+                        lp
+                    } else {
+                        rp
+                    }
+                } else if ls {
+                    left.unwrap()
+                } else if rs {
+                    right.unwrap()
+                } else {
+                    continue;
+                };
+                if target != pidx {
+                    pending.push((i, target));
+                }
+            }
+            if pending.is_empty() || pass > 100 {
+                break;
+            }
+            for (row_idx, new_pidx) in &pending {
+                let old_pidx = rows[*row_idx].3;
+                counts[old_pidx] -= 1;
+                counts[*new_pidx] += 1;
+                rows[*row_idx].3 = *new_pidx;
+            }
+        }
+        let remaining = counts.iter().filter(|&&c| c == 1).count();
+        info!(
+            "Rehomed {} singleton slivers into flank partitions ({} → {} singletons, {} passes)",
+            initial_singletons - remaining,
+            initial_singletons,
+            remaining,
+            pass
+        );
+
+        memory_process("rehome-rebuild");
+        let mut total = 0;
+        for ((_, end), count) in self.spans.iter_mut().zip(&mut counts) {
+            let length = *count;
+            *count = total; // reuse read-only pass counts as write cursors
+            total += length;
+            *end = total;
+        }
+        // Every slot is assigned exactly once below, including original orientation.
+        self.intervals = vec![
+            Interval {
+                first: 0,
+                last: 0,
+                metadata: 0
+            };
+            total
+        ];
+        for (_, _, _, pidx, iv) in rows {
+            self.intervals[counts[pidx]] = iv;
+            counts[pidx] += 1;
+        }
+        let mut previous_end = 0;
+        self.spans.retain(|&(_, end)| {
+            let keep = end != previous_end;
+            previous_end = end;
+            keep
+        });
+        memory_process("rehome-end");
+    }
+}
+
+fn memory_process(phase: &str) {
+    if std::env::var_os("IMPG_PARTITION_MEMORY_STATS").is_some() {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let rss: Vec<_> = status
+            .lines()
+            .filter(|s| s.starts_with("VmRSS:") || s.starts_with("VmHWM:"))
+            .collect();
+        info!("memory phase={phase} {}", rss.join(" "));
+    }
+}
+
+// Opt-in diagnostics: node counts are exact; the dependency hides node capacity.
+fn memory_sample(
+    impg: &impl ImpgIndex,
+    phase: &str,
+    partitions: &Partitions,
+    masks: &FxHashMap<u32, SortedRanges>,
+    missing: &FxHashMap<u32, SortedRanges>,
+) {
+    if std::env::var_os("IMPG_PARTITION_MEMORY_STATS").is_none() {
+        return;
+    }
+    let (indices, trees, nodes) = impg.cache_stats();
+    let iv_capacity = partitions.intervals.capacity();
+    let partition_capacity = partitions.spans.capacity();
+    let (metadata_sequences, metadata_targets) = impg.cache_metadata_counts();
+    let mask_capacity: usize = masks.values().map(|v| v.ranges.capacity()).sum();
+    let missing_capacity: usize = missing.values().map(|v| v.ranges.capacity()).sum();
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let rss = status
+        .lines()
+        .find(|s| s.starts_with("VmRSS:"))
+        .unwrap_or("VmRSS: unavailable");
+    info!("memory phase={phase} sub_indices={indices} trees={trees} nodes={nodes} tree_loads={} partitions={} partition_capacity={partition_capacity} metadata_sequences={metadata_sequences} metadata_targets={metadata_targets} interval_capacity={iv_capacity} mask_capacity={mask_capacity} missing_capacity={missing_capacity} {rss}",
+        crate::impg::TREE_LOADS.load(std::sync::atomic::Ordering::Relaxed), partitions.len());
 }
 
 pub fn partition_alignments(
@@ -272,6 +345,49 @@ pub fn partition_alignments(
 
     info!("Partitioning");
 
+    // Write-ahead journal, only when IMPG_PARTITION_JOURNAL is set. The header
+    // is everything that shapes the partition: resuming under any other value
+    // of it would replay one run's masks into another run.
+    let mut journal = {
+        let seqfp = super::partition_journal::seq_index_fingerprint(
+            (0..impg.seq_index().len() as u32).map(|id| {
+                (
+                    impg.seq_index().get_name(id).unwrap_or("").to_string(),
+                    impg.seq_index().get_len_from_id(id).unwrap_or(0),
+                )
+            }),
+        );
+        let header = format!(
+            "impg={} w={} sel={} d={} minid={:?} mms={} mbd={} dfs={} depth={} mtl={} mdr={} \
+             approx={} start={:?} rehome={} fmt={} sep={} nseq={} total={} seqfp={:016x} tag={}",
+            env!("CARGO_PKG_VERSION"),
+            window_size,
+            selection_mode,
+            merge_distance,
+            min_identity,
+            min_missing_size,
+            min_boundary_distance,
+            transitive_dfs,
+            max_depth,
+            min_transitive_len,
+            min_distance_between_ranges,
+            approximate_mode,
+            starting_sequences_file,
+            rehome_singletons,
+            output_format,
+            separate_files,
+            impg.seq_index().len(),
+            total_sequence_length,
+            seqfp,
+            std::env::var("IMPG_PARTITION_JOURNAL_TAG").unwrap_or_default(),
+        );
+        let max_seq_len = (0..impg.seq_index().len() as u32)
+            .filter_map(|id| impg.seq_index().get_len_from_id(id))
+            .max()
+            .unwrap_or(0) as i64;
+        super::partition_journal::Journal::from_env(&header, max_seq_len)?
+    };
+
     // Force-progress bookkeeping: if a round emits no partitions and the
     // next selection replays the exact same windows, the selected region has
     // no homologs the backend can see (e.g. low-complexity sequence the
@@ -295,8 +411,14 @@ pub fn partition_alignments(
     let mut temp_bed_files = Vec::new();
 
     // Collect partitions for single-file output
-    let mut collected_partitions: Vec<(usize, Vec<Interval<u32>>)> = Vec::new();
+    let mut collected_partitions = Partitions::default();
 
+    let mut cached_target = None;
+    let mut first_query = true;
+    let memory_stats = std::env::var_os("IMPG_PARTITION_MEMORY_STATS").is_some();
+    let mut last_memory_sample = std::time::Instant::now();
+    // Keep the diagnostic control outside the journal: retention cannot shape results.
+    let evict = max_depth == 1 && std::env::var_os("IMPG_PARTITION_KEEP_TREES").is_none();
     while !windows.is_empty() {
         let round_windows = windows.clone();
         let partitions_before_round = partition_num;
@@ -316,6 +438,16 @@ pub fn partition_alignments(
         }
 
         for (seq_id, start, end) in windows.drain(..) {
+            if memory_stats && last_memory_sample.elapsed().as_secs() >= 60 {
+                memory_sample(
+                    impg,
+                    "progress",
+                    &collected_partitions,
+                    &masked_regions,
+                    &missing_regions,
+                );
+                last_memory_sample = std::time::Instant::now();
+            }
             let chrom = impg.seq_index().get_name(seq_id).unwrap();
             let window_start = std::time::Instant::now();
 
@@ -365,62 +497,136 @@ pub fn partition_alignments(
 
             // Query overlaps for current window
             //let query_start = Instant::now();
-            let mut overlaps = if transitive_dfs {
-                impg.query_transitive_dfs(
-                    seq_id,
-                    start,
-                    end,
-                    Some(&masked_regions),
-                    max_depth,
-                    min_transitive_len,
-                    min_distance_between_ranges,
-                    None,  // No min_output_length for partition
-                    false, // Don't store CIGAR strings during partitioning
-                    min_identity,
-                    sequence_index,
-                    approximate_mode,
-                    None, // No subset filter for partition
-                )?
-            } else {
-                impg.query_transitive_bfs(
-                    seq_id,
-                    start,
-                    end,
-                    Some(&masked_regions),
-                    max_depth,
-                    min_transitive_len,
-                    min_distance_between_ranges,
-                    None,  // No min_output_length for partition
-                    false, // Don't store CIGAR strings during partitioning
-                    min_identity,
-                    sequence_index,
-                    approximate_mode,
-                    None, // No subset filter for partition
-                )?
+            // Journal replay (IMPG_PARTITION_JOURNAL): a window a killed run already
+            // queried takes its pre-mask overlaps from the journal instead of the
+            // index. Everything from masking on runs unchanged, so the state it
+            // rebuilds is the state the killed run had. Targets are not journaled:
+            // masking only rescales them and nothing downstream reads them.
+            let replayed = match journal.as_mut() {
+                Some(j) => j.take_replay(seq_id, start, end)?,
+                None => None,
             };
-            //let query_time = query_start.elapsed();
-            debug!("  Collected {} query overlaps", overlaps.len());
+            let mut overlaps = if let Some(ivs) = replayed {
+                ivs.into_iter()
+                    .map(|q| {
+                        let t = Interval {
+                            first: q.first,
+                            last: q.last,
+                            metadata: q.metadata,
+                        };
+                        (q, Vec::new(), t)
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                if first_query {
+                    memory_sample(
+                        impg,
+                        "replay-end",
+                        &collected_partitions,
+                        &masked_regions,
+                        &missing_regions,
+                    );
+                    first_query = false;
+                }
+                if cached_target != Some(seq_id) {
+                    let sample = memory_stats
+                        && (cached_target.is_none()
+                            || last_memory_sample.elapsed().as_secs() >= 60);
+                    if sample {
+                        memory_sample(
+                            impg,
+                            "target-before",
+                            &collected_partitions,
+                            &masked_regions,
+                            &missing_regions,
+                        );
+                    }
+                    if evict {
+                        if let Some(previous) = cached_target {
+                            impg.remove_cached_tree(previous);
+                        }
+                    }
+                    if sample {
+                        memory_sample(
+                            impg,
+                            "target-after",
+                            &collected_partitions,
+                            &masked_regions,
+                            &missing_regions,
+                        );
+                        last_memory_sample = std::time::Instant::now();
+                    }
+                    cached_target = Some(seq_id);
+                }
+                let mut overlaps = if transitive_dfs {
+                    impg.query_transitive_dfs(
+                        seq_id,
+                        start,
+                        end,
+                        Some(&masked_regions),
+                        max_depth,
+                        min_transitive_len,
+                        min_distance_between_ranges,
+                        None,  // No min_output_length for partition
+                        false, // Don't store CIGAR strings during partitioning
+                        min_identity,
+                        sequence_index,
+                        approximate_mode,
+                        None, // No subset filter for partition
+                    )?
+                } else {
+                    impg.query_transitive_bfs(
+                        seq_id,
+                        start,
+                        end,
+                        Some(&masked_regions),
+                        max_depth,
+                        min_transitive_len,
+                        min_distance_between_ranges,
+                        None,  // No min_output_length for partition
+                        false, // Don't store CIGAR strings during partitioning
+                        min_identity,
+                        sequence_index,
+                        approximate_mode,
+                        None, // No subset filter for partition
+                    )?
+                };
+                //let query_time = query_start.elapsed();
+                debug!("  Collected {} query overlaps", overlaps.len());
 
-            // Ignore CIGAR strings and target intervals.
-            //debug!("  Merging overlaps closer than {}bp", merge_distance); // bedtools sort | bedtools merge -d merge_distance
-            //let merge_start = Instant::now();
-            merge_overlaps(&mut overlaps, merge_distance);
-            //let merge_time = merge_start.elapsed();
-            debug!(
-                "  Collected {} query overlaps after merging those closer than {}bp",
-                overlaps.len(),
-                merge_distance
-            );
-
-            //let extend_start = Instant::now();
-            if min_boundary_distance > 0 {
-                //debug!("  Extending short intervals");
-                extend_to_close_boundaries(&mut overlaps, impg, min_boundary_distance);
+                // Ignore CIGAR strings and target intervals.
+                //debug!("  Merging overlaps closer than {}bp", merge_distance); // bedtools sort | bedtools merge -d merge_distance
+                //let merge_start = Instant::now();
+                merge_overlaps(&mut overlaps, merge_distance);
+                //let merge_time = merge_start.elapsed();
                 debug!(
-                    "  Collected {} query overlaps after extending those close to boundaries",
-                    overlaps.len()
+                    "  Collected {} query overlaps after merging those closer than {}bp",
+                    overlaps.len(),
+                    merge_distance
                 );
-            }
+
+                //let extend_start = Instant::now();
+                if min_boundary_distance > 0 {
+                    //debug!("  Extending short intervals");
+                    extend_to_close_boundaries(&mut overlaps, impg, min_boundary_distance);
+                    debug!(
+                        "  Collected {} query overlaps after extending those close to boundaries",
+                        overlaps.len()
+                    );
+                }
+                if let Some(j) = journal.as_mut() {
+                    let ivs: Vec<Interval<u32>> = overlaps
+                        .iter()
+                        .map(|(q, _, _)| Interval {
+                            first: q.first,
+                            last: q.last,
+                            metadata: q.metadata,
+                        })
+                        .collect();
+                    j.append(seq_id, start, end, &ivs)?;
+                }
+                overlaps
+            };
             //let extend_time = extend_start.elapsed();
 
             //debug!("  Excluding masked regions"); // bedtools subtract -a "partition$num.tmp.bed" -b "$MASK_BED"
@@ -527,11 +733,11 @@ pub fn partition_alignments(
                     match output_format {
                         "bed" => {
                             // Collect BED partitions
-                            collected_partitions.push((partition_num, query_intervals.clone()));
+                            collected_partitions.push((partition_num, query_intervals));
                         }
                         "gfa" | "vcf" if engine_config.partition_size.is_some() => {
                             // Partitioned GFA mode: collect intervals for later pipeline
-                            collected_partitions.push((partition_num, query_intervals.clone()));
+                            collected_partitions.push((partition_num, query_intervals));
                         }
                         "gfa" | "vcf" | "maf" | "fasta" => {
                             return Err(io::Error::new(
@@ -597,7 +803,8 @@ pub fn partition_alignments(
         // Stall guard: no partitions emitted this round and the selection
         // replayed the same windows. Mask the region by hand (it has no
         // homologs to mask it for us) and reselect, so the loop terminates.
-        if partition_num == partitions_before_round && last_round_windows.as_ref() == Some(&round_windows)
+        if partition_num == partitions_before_round
+            && last_round_windows.as_ref() == Some(&round_windows)
         {
             let stalled: Vec<String> = round_windows
                 .iter()
@@ -649,6 +856,27 @@ pub fn partition_alignments(
         }
         last_round_windows = Some(round_windows);
     }
+
+    if let Some(j) = journal.as_mut() {
+        j.finish()?;
+    }
+
+    memory_sample(
+        impg,
+        "query-end",
+        &collected_partitions,
+        &masked_regions,
+        &missing_regions,
+    );
+
+    if output_format == "bed" {
+        impg.clear_cached_trees();
+    }
+    drop(masked_regions);
+    drop(missing_regions);
+    drop(last_round_windows);
+    drop(windows);
+    memory_process("before-output");
 
     // Convert temporary BED files to graph/MAF if needed
     if !temp_bed_files.is_empty() {
@@ -706,7 +934,7 @@ pub fn partition_alignments(
     // leftover pieces created by greedy masking into the partition that owns
     // their biological context. Alignment-source-agnostic.
     if rehome_singletons && !separate_files && !collected_partitions.is_empty() {
-        rehome_singleton_slivers(&mut collected_partitions);
+        collected_partitions.rehome();
     }
 
     // Write collected partitions as single file if not using separate files
@@ -728,7 +956,7 @@ pub fn partition_alignments(
             // partition numbers; the usize is only needed for BED filename output.)
             let partition_intervals: Vec<Vec<Interval<u32>>> = collected_partitions
                 .iter()
-                .map(|(_, v)| v.clone())
+                .map(|(_, v)| v.to_vec())
                 .collect();
             let final_gfa = crate::partitioned_gfa_pipeline(
                 &partition_intervals,
@@ -1325,13 +1553,37 @@ fn mask_and_update_regions(
         }
 
         // Step 5: Efficiently update missing regions for this sequence
+        //
+        // Only the missing ranges that meet [lo, hi), the span of the masks just
+        // added, are rebuilt; the rest are spliced back untouched. Rebuilding
+        // the whole list (as before) re-inserted every missing range of every
+        // sequence a window touched, so a partner chromosome that masking had cut
+        // into 10^5 pieces cost 10^5 inserts per window -- 85% of a journal
+        // replay, and why replaying 7% of the 581-genome run took 8 h.
+        // Equivalent because, entering this step, missing is disjoint from the
+        // OLD masks (every mask insert, here and in the stall guard, is followed
+        // by subtracting it from missing) and no two missing ranges touch
+        // (SortedRanges::insert merges touching ranges). So a range outside
+        // [lo, hi) comes back from the full rebuild unchanged, and pieces of the
+        // ranges inside cannot merge with it.
         if let Some(missing) = missing_regions.get_mut(&seq_id) {
             if let Some(masked) = masked_regions.get(&seq_id) {
-                // Temporarily take ownership of the ranges to avoid cloning
-                let original_missing = std::mem::take(&mut missing.ranges);
-
-                // Clear current missing ranges and rebuild
-                missing.ranges.clear();
+                let lo = mask_buffer
+                    .iter()
+                    .map(|&(s, _)| s)
+                    .min()
+                    .unwrap_or(i64::MAX);
+                let hi = mask_buffer
+                    .iter()
+                    .map(|&(_, e)| e)
+                    .max()
+                    .unwrap_or(i64::MIN);
+                // Ranges are sorted, disjoint and non-touching, so their ends
+                // are sorted too and both bounds are binary searches.
+                let first = missing.ranges.partition_point(|&(_, e)| e <= lo);
+                let last = missing.ranges.partition_point(|&(s, _)| s < hi).max(first);
+                let original_missing: Vec<(i64, i64)> = missing.ranges[first..last].to_vec();
+                let mut rebuilt = SortedRanges::new();
 
                 for (miss_start, miss_end) in original_missing {
                     let mut current = miss_start;
@@ -1368,7 +1620,7 @@ fn mask_and_update_regions(
 
                         if current < mask_start {
                             // Found a gap - this part is still missing
-                            missing.insert((current, mask_start));
+                            rebuilt.insert((current, mask_start));
                         }
 
                         current = current.max(mask_end);
@@ -1377,9 +1629,10 @@ fn mask_and_update_regions(
 
                     // Check for remaining gap at the end
                     if current < miss_end {
-                        missing.insert((current, miss_end));
+                        rebuilt.insert((current, miss_end));
                     }
                 }
+                missing.ranges.splice(first..last, rebuilt.ranges);
 
                 // Remove sequence if no more missing regions
                 if missing.is_empty() {
@@ -1751,7 +2004,7 @@ fn write_partition_fasta(
 }
 
 fn write_single_partition_file(
-    collected_partitions: &[(usize, Vec<Interval<u32>>)],
+    collected_partitions: &Partitions,
     impg: &impl ImpgIndex,
     output_format: &str,
     output_folder: Option<&str>,
@@ -1764,7 +2017,7 @@ fn write_single_partition_file(
             let file = File::create(full_path)?;
             let mut writer = BufWriter::new(file);
 
-            for (partition_num, query_intervals) in collected_partitions {
+            for (partition_num, query_intervals) in collected_partitions.iter() {
                 for query_interval in query_intervals {
                     let name = impg.seq_index().get_name(query_interval.metadata).unwrap();
                     let (start, end) = if query_interval.first <= query_interval.last {
