@@ -7,6 +7,7 @@ use crate::alignment_record::{AlignmentRecord, Strand};
 use crate::seqidx::SequenceIndex;
 use log::debug;
 use noodles::bgzf;
+use std::cell::RefCell;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Error as IoError, Read, Seek, SeekFrom};
 use std::num::{NonZeroUsize, ParseIntError};
@@ -65,12 +66,17 @@ fn is_bgzf<R: Read + Seek>(reader: &mut R) -> std::io::Result<bool> {
     result
 }
 
-pub fn read_cigar_data(alignment_file: &str, offset: u64, buffer: &mut [u8]) -> Result<(), String> {
+/// Open an alignment file for CIGAR random access, validating BGZF framing once.
+///
+/// This is the *only* place the open + `is_bgzf` header probe happens; callers
+/// go through [`read_cigar_data`], which caches the returned handle per thread so
+/// repeated reads from the same file reuse one open fd + decoder.
+fn open_cigar_handle(alignment_file: &str) -> Result<PafHandle, String> {
     let is_compressed = [".gz", ".bgz"]
         .iter()
         .any(|extension| alignment_file.ends_with(extension));
 
-    let handle = if is_compressed {
+    if is_compressed {
         let mut file = File::open(alignment_file)
             .map_err(|e| format!("Failed to open compressed file '{}': {}", alignment_file, e))?;
         if !is_bgzf(&mut file)
@@ -81,15 +87,25 @@ pub fn read_cigar_data(alignment_file: &str, offset: u64, buffer: &mut [u8]) -> 
                 alignment_file, alignment_file
             ));
         }
-        PafHandle::Compressed(bgzf::io::Reader::new(file))
+        Ok(PafHandle::Compressed(bgzf::io::Reader::new(file)))
     } else {
         let file = File::open(alignment_file)
             .map_err(|e| format!("Failed to open file '{}': {}", alignment_file, e))?;
-        PafHandle::Plain(file)
-    };
+        Ok(PafHandle::Plain(file))
+    }
+}
 
+/// Seek to `offset` (a BGZF virtual position for compressed files, a plain byte
+/// offset otherwise) and fill `buffer`. Every read seeks first, so reusing a
+/// handle across unrelated reads is safe.
+fn read_cigar_from_handle(
+    handle: &mut PafHandle,
+    alignment_file: &str,
+    offset: u64,
+    buffer: &mut [u8],
+) -> Result<(), String> {
     match handle {
-        PafHandle::Compressed(mut reader) => {
+        PafHandle::Compressed(reader) => {
             let virtual_position = bgzf::VirtualPosition::from(offset);
             reader.seek(virtual_position).map_err(|e| {
                 format!(
@@ -104,13 +120,76 @@ pub fn read_cigar_data(alignment_file: &str, offset: u64, buffer: &mut [u8]) -> 
                 )
             })
         }
-        PafHandle::Plain(mut file) => {
+        PafHandle::Plain(file) => {
             file.seek(SeekFrom::Start(offset))
                 .map_err(|e| format!("Failed to seek in file '{}': {}", alignment_file, e))?;
             file.read_exact(buffer)
                 .map_err(|e| format!("Failed to read data from file '{}': {}", alignment_file, e))
         }
     }
+}
+
+/// Thread-local LRU of open CIGAR readers keyed by alignment-file path.
+///
+/// The depth `--cigar-precise` path reads one CIGAR per overlapping alignment via
+/// [`read_cigar_data`]; the previous implementation did a fresh `File::open` +
+/// `is_bgzf` probe + decoder construction on *every* read. At 10^5 per-file
+/// indices on a parallel filesystem (Lustre) with 112 threads, that `open()`
+/// metadata storm — not the O(1) virtual seek — dominated wall-clock. Reusing an
+/// already-open handle collapses the K reopens of one file within a single query
+/// (and repeat queries of the same file on the same worker) to at most one open.
+struct CigarReaderCache {
+    /// Front = most-recently-used. Small `cap`, so linear scan is fine.
+    entries: Vec<(String, PafHandle)>,
+    cap: usize,
+}
+
+impl CigarReaderCache {
+    fn new() -> Self {
+        // Per-thread open-fd budget. cap=1 already captures the dominant win
+        // (all CIGAR reads within one sub-index query hit the same file); a
+        // larger cap adds cross-query reuse. Bounded so cap × threads stays well
+        // under typical `ulimit -n`. Override with IMPG_CIGAR_READER_CACHE.
+        let cap = std::env::var("IMPG_CIGAR_READER_CACHE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(16);
+        Self {
+            entries: Vec::with_capacity(cap),
+            cap,
+        }
+    }
+
+    fn read(&mut self, alignment_file: &str, offset: u64, buffer: &mut [u8]) -> Result<(), String> {
+        if let Some(pos) = self.entries.iter().position(|(p, _)| p == alignment_file) {
+            if pos != 0 {
+                let entry = self.entries.remove(pos);
+                self.entries.insert(0, entry);
+            }
+        } else {
+            let handle = open_cigar_handle(alignment_file)?;
+            if self.entries.len() >= self.cap {
+                self.entries.pop(); // evict least-recently-used
+            }
+            self.entries.insert(0, (alignment_file.to_string(), handle));
+        }
+
+        let result = read_cigar_from_handle(&mut self.entries[0].1, alignment_file, offset, buffer);
+        if result.is_err() {
+            // Drop the (possibly desynced) reader so the next read re-opens fresh.
+            self.entries.remove(0);
+        }
+        result
+    }
+}
+
+thread_local! {
+    static CIGAR_READER_CACHE: RefCell<CigarReaderCache> = RefCell::new(CigarReaderCache::new());
+}
+
+pub fn read_cigar_data(alignment_file: &str, offset: u64, buffer: &mut [u8]) -> Result<(), String> {
+    CIGAR_READER_CACHE.with(|cache| cache.borrow_mut().read(alignment_file, offset, buffer))
 }
 
 /// Parse a single PAF line into an AlignmentRecord

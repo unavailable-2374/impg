@@ -1,0 +1,6 @@
+# The toolchain the production depth runs were built with.  Pinned so that
+# rebuilding from the depth-v1.0.0 tag is a check of the source rather than of
+# whatever rustc happens to be installed.
+[toolchain]
+channel = "1.92.0"
+components = ["rustfmt", "clippy"]

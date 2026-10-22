@@ -155,7 +155,7 @@ impl impg_index::ImpgIndex for SeqIndexWrapper {
         _: bool,
         _: Option<f64>,
         _: Option<&sequence_index::UnifiedSequenceIndex>,
-        _: &rustc_hash::FxHashMap<(u32, u64), Vec<impg::CigarOp>>,
+        _: &rustc_hash::FxHashMap<impg::CigarCacheKey, Vec<impg::CigarOp>>,
     ) -> std::io::Result<Vec<impg::AdjustedInterval>> {
         Ok(Vec::new())
     }
@@ -167,7 +167,7 @@ impl impg_index::ImpgIndex for SeqIndexWrapper {
         _: i64,
         _: Option<f64>,
         _: Option<&sequence_index::UnifiedSequenceIndex>,
-        _: &mut rustc_hash::FxHashMap<(u32, u64), Vec<impg::CigarOp>>,
+        _: &mut rustc_hash::FxHashMap<impg::CigarCacheKey, Vec<impg::CigarOp>>,
     ) {
     }
 
@@ -444,7 +444,7 @@ impl impg_index::ImpgIndex for SyngImpgWrapper {
         _: bool,
         _: Option<f64>,
         _: Option<&sequence_index::UnifiedSequenceIndex>,
-        _: &rustc_hash::FxHashMap<(u32, u64), Vec<impg::CigarOp>>,
+        _: &rustc_hash::FxHashMap<impg::CigarCacheKey, Vec<impg::CigarOp>>,
     ) -> std::io::Result<Vec<impg::AdjustedInterval>> {
         self.query_via_syng(target_id, range_start, range_end)
     }
@@ -456,7 +456,7 @@ impl impg_index::ImpgIndex for SyngImpgWrapper {
         _: i64,
         _: Option<f64>,
         _: Option<&sequence_index::UnifiedSequenceIndex>,
-        _: &mut rustc_hash::FxHashMap<(u32, u64), Vec<impg::CigarOp>>,
+        _: &mut rustc_hash::FxHashMap<impg::CigarCacheKey, Vec<impg::CigarOp>>,
     ) {
     }
 
