@@ -121,8 +121,8 @@ use coitrees::{Interval, IntervalTree};
 use crossbeam_channel as channel;
 use impg::alignment_record::{AlignmentFormat, AlignmentRecord, Strand};
 use impg::commands::{
-    align, depth, depth_checkpoint, depth_closure, genotype, graph, infer, lace, partition, refine,
-    render, similarity,
+    align, depth, depth_checkpoint, depth_closure, depth_presence, genotype, graph, infer, lace,
+    partition, refine, render, similarity,
 };
 use impg::impg::{AdjustedInterval, CigarOp, Impg};
 use impg::impg_index::{ImpgIndex, ImpgWrapper};
@@ -6224,6 +6224,43 @@ GFA engine shorthand:
         #[clap(long, action)]
         resume: bool,
 
+        /// Build the direct-alignment presence store in this directory.
+        ///
+        /// For every base of every genome it records which other samples align
+        /// to it directly (no transitive closure), plus a depth track and
+        /// per-sample statistics. Reads the PAF files once and does not load or
+        /// build impg indices; needs `--fai-list`. Rerunning the same command
+        /// resumes an interrupted build.
+        #[arg(help_heading = "Presence layer")]
+        #[clap(long, value_parser, conflicts_with_all = &["presence", "target_range", "target_bed", "resume", "stats"])]
+        presence_out: Option<String>,
+
+        /// Query a presence store built with `--presence-out` for `-r`/`-b` regions.
+        #[arg(help_heading = "Presence layer")]
+        #[clap(long, value_parser)]
+        presence: Option<String>,
+
+        /// Split alignments at insertions or deletions of at least this many bases.
+        #[arg(help_heading = "Presence layer")]
+        #[clap(long, value_parser = parse_size, default_value = "50")]
+        presence_gap: u64,
+
+        /// Query output: `segments` (where the sample set changes, with present and
+        /// absent samples) or `samples` (covered bases per other sample).
+        #[arg(help_heading = "Presence layer")]
+        #[clap(long, value_parser = ["segments", "samples"], default_value = "segments")]
+        presence_output: String,
+
+        /// Memory budget for the presence sweep (e.g. 120G).
+        #[arg(help_heading = "Presence layer")]
+        #[clap(long, value_parser = parse_size, default_value = "64G")]
+        presence_mem: u64,
+
+        /// Keep the per-sample block shards (`rec/`) after the build.
+        #[arg(help_heading = "Presence layer")]
+        #[clap(long, action)]
+        presence_keep_shards: bool,
+
         #[clap(flatten)]
         common: CommonOpts,
     },
@@ -10586,8 +10623,50 @@ fn run() -> io::Result<()> {
             target_range,
             target_bed,
             resume,
+            presence_out,
+            presence,
+            presence_gap,
+            presence_output,
+            presence_mem,
+            presence_keep_shards,
         } => {
             initialize_threads_and_log(&common);
+            if let Some(dir) = presence_out {
+                let fai = fai_list.as_deref().ok_or_else(|| {
+                    io::Error::other("--presence-out needs --fai-list to know every sequence and its sample")
+                })?;
+                let files = resolve_alignment_files(&alignment)?;
+                return depth_presence::build(
+                    &files,
+                    fai,
+                    &separator,
+                    presence_gap,
+                    presence_mem,
+                    presence_keep_shards,
+                    Path::new(&dir),
+                );
+            }
+            if let Some(dir) = presence {
+                let regions = match (&target_range, &target_bed) {
+                    (Some(r), _) => vec![depth_presence::parse_region(r)?],
+                    (None, Some(b)) => depth_presence::read_bed(b)?,
+                    (None, None) => {
+                        return Err(io::Error::other("--presence needs -r or -b"));
+                    }
+                };
+                let mode = if presence_output == "samples" {
+                    depth_presence::QueryMode::Samples
+                } else {
+                    depth_presence::QueryMode::Segments
+                };
+                let mut out: Box<dyn Write> = match &output_prefix {
+                    Some(p) => Box::new(BufWriter::new(File::create(format!("{p}.presence.tsv"))?)),
+                    None => Box::new(BufWriter::new(io::stdout().lock())),
+                };
+                depth_presence::query(Path::new(&dir), &regions, mode, &mut out)?;
+                out.flush()?;
+                return Ok(());
+            }
             let is_region = target_range.is_some() || target_bed.is_some();
             let coordinates = coordinate_mode.unwrap_or(depth_closure::CoordinateMode::Exact);
             if cigar_precise && coordinates == depth_closure::CoordinateMode::Approx {

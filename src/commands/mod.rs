@@ -2,6 +2,7 @@ pub mod align;
 pub mod depth;
 pub mod depth_checkpoint;
 pub mod depth_closure;
+pub mod depth_presence;
 mod depth_storage;
 pub mod genotype;
 pub mod graph;
