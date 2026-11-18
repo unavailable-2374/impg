@@ -7,10 +7,12 @@ use crate::alignment_record::{AlignmentRecord, Strand};
 use crate::seqidx::SequenceIndex;
 use log::debug;
 use noodles::bgzf;
+use parking_lot::{Condvar, Mutex};
 use std::cell::RefCell;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Error as IoError, Read, Seek, SeekFrom};
 use std::num::{NonZeroUsize, ParseIntError};
+use std::sync::OnceLock;
 
 #[derive(Debug)]
 pub enum ParseErr {
@@ -186,9 +188,78 @@ impl CigarReaderCache {
 
 thread_local! {
     static CIGAR_READER_CACHE: RefCell<CigarReaderCache> = RefCell::new(CigarReaderCache::new());
+    static DEPTH_READER_POOL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Scope the bounded shared reader pool to parallel depth source decoding.
+/// Ordinary query callers retain their existing thread-local cache.
+pub(crate) struct DepthReaderGuard(bool);
+impl DepthReaderGuard {
+    pub(crate) fn enter() -> Self {
+        Self(DEPTH_READER_POOL.with(|v| v.replace(true)))
+    }
+}
+impl Drop for DepthReaderGuard {
+    fn drop(&mut self) {
+        DEPTH_READER_POOL.with(|v| v.set(self.0));
+    }
+}
+struct ReaderPool {
+    idle: Vec<(String, PafHandle)>,
+    busy: usize,
+}
+fn read_depth_cigar(path: &str, offset: u64, buffer: &mut [u8]) -> Result<(), String> {
+    static POOL: OnceLock<(Mutex<ReaderPool>, Condvar)> = OnceLock::new();
+    let (pool, ready) = POOL.get_or_init(|| {
+        (
+            Mutex::new(ReaderPool {
+                idle: Vec::new(),
+                busy: 0,
+            }),
+            Condvar::new(),
+        )
+    });
+    let mut state = pool.lock();
+    while state.busy >= 32 {
+        ready.wait(&mut state);
+    }
+    let handle = if let Some(i) = state.idle.iter().position(|(p, _)| p == path) {
+        Some(state.idle.swap_remove(i).1)
+    } else {
+        if state.busy + state.idle.len() >= 32 {
+            state.idle.pop();
+        }
+        None
+    };
+    state.busy += 1;
+    drop(state);
+    let result = (|| {
+        let mut handle = match handle {
+            Some(h) => h,
+            None => open_cigar_handle(path)?,
+        };
+        let result = read_cigar_from_handle(&mut handle, path, offset, buffer);
+        Ok((handle, result))
+    })();
+    let mut state = pool.lock();
+    state.busy -= 1;
+    let result = match result {
+        Ok((handle, result)) => {
+            if result.is_ok() {
+                state.idle.push((path.to_string(), handle));
+            }
+            result
+        }
+        Err(e) => Err(e),
+    };
+    ready.notify_one();
+    result
 }
 
 pub fn read_cigar_data(alignment_file: &str, offset: u64, buffer: &mut [u8]) -> Result<(), String> {
+    if DEPTH_READER_POOL.with(|v| v.get()) {
+        return read_depth_cigar(alignment_file, offset, buffer);
+    }
     CIGAR_READER_CACHE.with(|cache| cache.borrow_mut().read(alignment_file, offset, buffer))
 }
 

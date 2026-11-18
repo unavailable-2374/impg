@@ -2111,28 +2111,8 @@ impl Impg {
             .map(|(_, alignment_file)| alignment_file.clone())
             .collect();
 
-        // Validate that all PAF records have CIGAR strings
-        // This is a fundamental requirement for transitive queries
-        for (records, alignment_file) in records_by_file {
-            // Skip .1aln files as they use tracepoints instead of CIGAR
-            if alignment_file.ends_with(".1aln") {
-                continue;
-            }
-
-            let missing_cigar_count = records.iter().filter(|r| r.data_bytes == 0).count();
-
-            if missing_cigar_count > 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "PAF file '{}' contains {} alignment(s) without CIGAR strings (cg:Z: tag). \
-                         All alignments must have CIGAR for transitive queries. \
-                         Please regenerate the PAF file with CIGAR output enabled (e.g., minimap2 -c or wfmash with default settings).",
-                        alignment_file, missing_cigar_count
-                    ),
-                ));
-            }
-        }
+        // Raw indexing also supports approximate global depth. Exact query
+        // paths validate CIGAR availability when reconstructing coordinates.
 
         if bidirectional {
             debug!("Creating bidirectional alignment entries");
@@ -3812,6 +3792,217 @@ impl Impg {
 
 // Implement ImpgIndex trait for Impg
 impl ImpgIndex for Impg {
+    fn scan_depth_unit_parallel(
+        &self,
+        unit: usize,
+        exact: bool,
+        sequence_index: Option<&UnifiedSequenceIndex>,
+        priorities: &[usize],
+        visit: &(dyn Fn(crate::impg_index::DepthAlignment) -> io::Result<()> + Sync),
+    ) -> io::Result<()> {
+        if unit != 0 {
+            return Err(io::Error::other("invalid single-index depth unit"));
+        }
+        let mut targets = self.target_ids();
+        targets.sort_unstable_by_key(|&id| {
+            (
+                priorities.get(id as usize).copied().unwrap_or(usize::MAX),
+                id,
+            )
+        });
+        targets
+            .into_par_iter()
+            .try_for_each(|target_id| -> io::Result<()> {
+                if priorities
+                    .get(target_id as usize)
+                    .copied()
+                    .unwrap_or(usize::MAX)
+                    == usize::MAX
+                {
+                    return Ok(());
+                }
+                // Reading serialized records avoids rebuilding an interval tree for
+                // a bulk scan, and preserves errors instead of treating them as gaps.
+                let mut metadata = if let Some(offset) = self
+                    .forest_map
+                    .get_tree_offset(target_id)
+                    .filter(|&offset| offset != 0)
+                {
+                    let mut file = File::open(&self.index_file_path)?;
+                    file.seek(SeekFrom::Start(offset))?;
+                    let (id, rows): (u32, Vec<SerializableInterval>) =
+                        bincode::serde::decode_from_std_read(
+                            &mut BufReader::new(file),
+                            bincode::config::standard(),
+                        )
+                        .map_err(|e| {
+                            io::Error::other(format!("read depth tree {target_id}: {e}"))
+                        })?;
+                    if id != target_id {
+                        return Err(io::Error::other("depth index tree ID mismatch"));
+                    }
+                    rows.into_iter()
+                        .filter(|r| !r.metadata.is_reversed())
+                        .map(|r| r.metadata)
+                        .collect::<Vec<_>>()
+                } else {
+                    let trees = self
+                        .trees
+                        .read()
+                        .map_err(|_| io::Error::other("depth tree lock poisoned"))?;
+                    let tree = trees
+                        .get(&target_id)
+                        .ok_or_else(|| io::Error::other("depth tree missing"))?;
+                    let mut rows = Vec::new();
+                    tree.query(0, i64::MAX, |r| {
+                        if !r.metadata.is_reversed() {
+                            rows.push(r.metadata.clone());
+                        }
+                    });
+                    rows
+                };
+                metadata.sort_unstable_by_key(|m| (m.alignment_file_index, m.data_offset()));
+                let mut batches = Vec::new();
+                let mut lo = 0;
+                let mut bytes = 0usize;
+                for (i, m) in metadata.iter().enumerate() {
+                    bytes = bytes.saturating_add(m.data_bytes);
+                    if i + 1 - lo >= 32768 || bytes >= 8 << 20 {
+                        batches.push((lo, i + 1));
+                        lo = i + 1;
+                        bytes = 0;
+                    }
+                }
+                if lo < metadata.len() {
+                    batches.push((lo, metadata.len()));
+                }
+                batches
+                    .into_par_iter()
+                    .try_for_each(|(lo, hi)| -> io::Result<()> {
+                        let _reader_pool = crate::paf::DepthReaderGuard::enter();
+                        for m in &metadata[lo..hi] {
+                            if priorities
+                                .get(m.query_id as usize)
+                                .copied()
+                                .unwrap_or(usize::MAX)
+                                == usize::MAX
+                            {
+                                continue;
+                            }
+                            let cigar = if exact {
+                                self.try_get_cigar_ops(m, target_id, sequence_index)?
+                            } else {
+                                Vec::new()
+                            };
+                            visit(crate::impg_index::DepthAlignment {
+                                target_id,
+                                query_id: m.query_id,
+                                target_start: m.target_start,
+                                target_end: m.target_end,
+                                query_start: m.query_start,
+                                query_end: m.query_end,
+                                is_reverse: m.is_reverse_strand(),
+                                cigar,
+                            })?;
+                        }
+                        Ok(())
+                    })
+            })
+    }
+    fn scan_depth_unit(
+        &self,
+        unit: usize,
+        exact: bool,
+        sequence_index: Option<&UnifiedSequenceIndex>,
+        priorities: &[usize],
+        visit: &mut (dyn FnMut(crate::impg_index::DepthAlignment) -> io::Result<()> + Send),
+    ) -> io::Result<()> {
+        if unit != 0 {
+            return Err(io::Error::other("invalid single-index depth unit"));
+        }
+        let mut targets = self.target_ids();
+        targets.sort_unstable_by_key(|&id| {
+            (
+                priorities.get(id as usize).copied().unwrap_or(usize::MAX),
+                id,
+            )
+        });
+        for target_id in targets {
+            if priorities
+                .get(target_id as usize)
+                .copied()
+                .unwrap_or(usize::MAX)
+                == usize::MAX
+            {
+                continue;
+            }
+            // Reading serialized records avoids rebuilding an interval tree for
+            // a bulk scan, and preserves errors instead of treating them as gaps.
+            let mut metadata = if let Some(offset) = self
+                .forest_map
+                .get_tree_offset(target_id)
+                .filter(|&offset| offset != 0)
+            {
+                let mut file = File::open(&self.index_file_path)?;
+                file.seek(SeekFrom::Start(offset))?;
+                let (id, rows): (u32, Vec<SerializableInterval>) =
+                    bincode::serde::decode_from_std_read(
+                        &mut BufReader::new(file),
+                        bincode::config::standard(),
+                    )
+                    .map_err(|e| io::Error::other(format!("read depth tree {target_id}: {e}")))?;
+                if id != target_id {
+                    return Err(io::Error::other("depth index tree ID mismatch"));
+                }
+                rows.into_iter()
+                    .filter(|r| !r.metadata.is_reversed())
+                    .map(|r| r.metadata)
+                    .collect::<Vec<_>>()
+            } else {
+                let trees = self
+                    .trees
+                    .read()
+                    .map_err(|_| io::Error::other("depth tree lock poisoned"))?;
+                let tree = trees
+                    .get(&target_id)
+                    .ok_or_else(|| io::Error::other("depth tree missing"))?;
+                let mut rows = Vec::new();
+                tree.query(0, i64::MAX, |r| {
+                    if !r.metadata.is_reversed() {
+                        rows.push(r.metadata.clone());
+                    }
+                });
+                rows
+            };
+            metadata.sort_unstable_by_key(|m| (m.alignment_file_index, m.data_offset()));
+            for m in metadata {
+                if priorities
+                    .get(m.query_id as usize)
+                    .copied()
+                    .unwrap_or(usize::MAX)
+                    == usize::MAX
+                {
+                    continue;
+                }
+                let cigar = if exact {
+                    self.try_get_cigar_ops(&m, target_id, sequence_index)?
+                } else {
+                    Vec::new()
+                };
+                visit(crate::impg_index::DepthAlignment {
+                    target_id,
+                    query_id: m.query_id,
+                    target_start: m.target_start,
+                    target_end: m.target_end,
+                    query_start: m.query_start,
+                    query_end: m.query_end,
+                    is_reverse: m.is_reverse_strand(),
+                    cigar,
+                })?;
+            }
+        }
+        Ok(())
+    }
     fn seq_index(&self) -> &SequenceIndex {
         &self.seq_index
     }

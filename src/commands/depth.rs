@@ -1,23 +1,39 @@
 use crate::alignment_record::Strand;
+#[cfg(test)]
 use crate::impg::{
-    compose_hop, extend_frontier_from_hit, AdjustedInterval, BfsHit, CigarOp, NextCarry,
-    SortedRanges, TransitiveRange,
+    compose_hop, extend_frontier_from_hit, AdjustedInterval, BfsHit, NextCarry, TransitiveRange,
 };
-use crate::impg_index::{ImpgIndex, RawAlignmentInterval};
+use crate::impg::{CigarOp, SortedRanges};
+use crate::impg_index::ImpgIndex;
+#[cfg(test)]
+use crate::impg_index::RawAlignmentInterval;
 use crate::sequence_index::UnifiedSequenceIndex;
 use bitvec::prelude::*;
+#[cfg(test)]
 use indicatif::{ProgressBar, ProgressStyle};
-use log::{debug, info, warn};
+#[cfg(test)]
+use log::warn;
+use log::{debug, info};
+#[cfg(test)]
 use parking_lot::{Mutex, RwLock};
+#[cfg(test)]
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
+#[cfg(test)]
 use std::collections::BTreeMap;
-use std::io::{self, BufWriter, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Write};
+#[cfg(test)]
+use std::io::{Seek, SeekFrom};
+#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(test)]
 use std::sync::mpsc::{sync_channel, SyncSender};
+#[cfg(test)]
 use std::sync::Arc;
+#[cfg(test)]
 use std::thread::JoinHandle;
 
+#[cfg(test)]
 use crate::commands::depth_checkpoint::{
     compute_invalidation_hash, encode_chunk_id_phase1, encode_chunk_id_phase2,
     encode_chunk_id_phase2_tile, encode_work_record, encode_worklog_header, is_phase2_gap_chunk_id,
@@ -588,6 +604,7 @@ pub fn write_region_depth_output<W: Write>(
 
 /// Stores sequence lengths and sample-to-sequence mappings
 #[derive(Debug, Clone)]
+#[cfg(test)]
 pub(crate) struct SequenceLengths {
     /// seq_name -> length
     pub lengths: FxHashMap<String, i64>,
@@ -595,6 +612,7 @@ pub(crate) struct SequenceLengths {
     pub sample_to_seqs: FxHashMap<String, Vec<String>>,
 }
 
+#[cfg(test)]
 impl SequenceLengths {
     /// Build from FAI file list
     pub fn from_fai_list(fai_list_path: &str, separator: &str) -> io::Result<Self> {
@@ -696,6 +714,7 @@ impl Default for SampleIndex {
 #[derive(Debug, Clone)]
 pub(crate) struct CompactSequenceLengths {
     /// Sequence lengths indexed by seq_id (from impg's SequenceIndex)
+    #[cfg(test)]
     lengths: Vec<i64>,
     /// seq_id -> sample_id (reverse lookup)
     seq_to_sample: Vec<u16>,
@@ -737,23 +756,28 @@ impl CompactSequenceLengths {
 
         // Second pass: build mappings
         let num_seqs = impg.seq_index().len();
+        #[cfg(test)]
         let mut lengths = vec![0i64; num_seqs];
         let mut seq_to_sample = vec![0u16; num_seqs];
 
         for seq_id in 0..num_seqs as u32 {
-            if let (Some(name), Some(len)) = (
+            if let (Some(name), Some(_len)) = (
                 impg.seq_index().get_name(seq_id),
                 impg.seq_index().get_len_from_id(seq_id),
             ) {
                 let sample_name = extract_sample(name, separator);
                 if let Some(sample_id) = sample_index.get_id(&sample_name) {
-                    lengths[seq_id as usize] = len as i64;
+                    #[cfg(test)]
+                    {
+                        lengths[seq_id as usize] = _len as i64;
+                    }
                     seq_to_sample[seq_id as usize] = sample_id;
                 }
             }
         }
 
         CompactSequenceLengths {
+            #[cfg(test)]
             lengths,
             seq_to_sample,
             sample_index,
@@ -762,6 +786,7 @@ impl CompactSequenceLengths {
 
     /// Get sequence length by ID
     #[inline]
+    #[cfg(test)]
     pub fn get_length(&self, seq_id: u32) -> i64 {
         self.lengths.get(seq_id as usize).copied().unwrap_or(0)
     }
@@ -784,6 +809,7 @@ impl CompactSequenceLengths {
     /// Borrow the full seq_id -> sample_id slice.
     /// Used by the pre-scan file-parallel degree computation in `MultiImpg`.
     #[inline]
+    #[cfg(test)]
     pub fn seq_to_sample_slice(&self) -> &[u16] {
         &self.seq_to_sample
     }
@@ -1181,6 +1207,7 @@ impl Default for SampleBitmap {
 /// under VGP 581-sample workloads that pushed claim_unprocessed to >90% of
 /// Phase 2 CPU as the per-sequence IntervalSet grew into the millions.
 #[derive(Debug, Clone, Default)]
+#[cfg(test)]
 pub(crate) struct IntervalSet {
     /// Sorted, non-overlapping, non-adjacent intervals keyed by start
     intervals: BTreeMap<i64, i64>,
@@ -1188,6 +1215,7 @@ pub(crate) struct IntervalSet {
     total_length: i64,
 }
 
+#[cfg(test)]
 impl IntervalSet {
     /// Create a new empty interval set
     pub fn new() -> Self {
@@ -1254,6 +1282,7 @@ impl IntervalSet {
     }
 
     /// Get total covered length
+    #[cfg(test)]
     pub fn total_length(&self) -> i64 {
         self.total_length
     }
@@ -1411,6 +1440,7 @@ fn map_target_to_query_linear(
 /// Map query sub-range [q_start, q_end] back to target coordinates using linear interpolation.
 /// Inverse of the target→query mapping used in sweep construction.
 #[inline]
+#[cfg(test)]
 fn inverse_map_query_to_target(
     aln_target_start: i64,
     aln_target_end: i64,
@@ -1673,6 +1703,7 @@ fn is_self_alignment(
 /// never reach `split_intervals_by_window`. It exists only to give the
 /// unwrapped local an `i64`. Without `--window-size`, intervals keep the
 /// length the sweep produced.
+#[cfg(test)]
 const DEFAULT_WINDOW_SIZE: i64 = 50_000;
 
 // ============================================================================
@@ -1681,11 +1712,13 @@ const DEFAULT_WINDOW_SIZE: i64 = 50_000;
 
 /// Sample position entry (sparse representation)
 /// (sample_id, query_seq_id, query_start, query_end)
+#[cfg(test)]
 type SamplePosition = (u16, u32, i64, i64);
 
 /// Depth interval with sparse sample storage
 /// Memory: 24 bytes base + 16 bytes per actual sample (vs 16 bytes per ALL samples)
 #[derive(Debug, Clone)]
+#[cfg(test)]
 struct SparseDepthInterval {
     start: i64,
     end: i64,
@@ -1698,6 +1731,7 @@ struct SparseDepthInterval {
     pangenome_bases: i64,
 }
 
+#[cfg(test)]
 impl SparseDepthInterval {
     #[inline]
     fn depth(&self) -> usize {
@@ -1712,6 +1746,7 @@ impl SparseDepthInterval {
 /// contig while its coordinate range expands, matching the previous HashMap
 /// implementation. A two-way merge avoids rebuilding a hash table and sorting
 /// after every short-interval absorption.
+#[cfg(test)]
 fn merge_sample_positions(existing: &mut Vec<SamplePosition>, incoming: Vec<SamplePosition>) {
     if incoming.is_empty() {
         return;
@@ -1758,6 +1793,7 @@ fn merge_sample_positions(existing: &mut Vec<SamplePosition>, incoming: Vec<Samp
 ///
 /// This eliminates the O(K × N_samples) peak memory from collecting all
 /// SparseDepthIntervals into a Vec, reducing it to O(N_samples) per interval.
+#[cfg(test)]
 struct StreamingDepthEmitter<'a> {
     // ---- Output buffer with periodic flushing ----
     buf: Vec<u8>,
@@ -1806,6 +1842,7 @@ struct StreamingDepthEmitter<'a> {
     defer_buf_flush: bool,
 }
 
+#[cfg(test)]
 impl<'a> StreamingDepthEmitter<'a> {
     /// Process one interval from the sweep line through the full pipeline.
     ///
@@ -1857,7 +1894,10 @@ impl<'a> StreamingDepthEmitter<'a> {
                 self.pending = Some(new);
             }
             Some(mut pending) => {
-                if new_is_short {
+                if !can_merge_owned_intervals(&pending, &new) {
+                    self.emit_final(pending);
+                    self.pending = Some(new);
+                } else if new_is_short {
                     Self::absorb_right(&mut pending, new);
                     self.pending = Some(pending);
                 } else if (pending.end - pending.start) >= self.min_interval_len {
@@ -1916,12 +1956,13 @@ impl<'a> StreamingDepthEmitter<'a> {
                     let new_qe = qs + proj_offset(off_e, q_len, interval_len);
                     (sid, qid, new_qs, new_qe)
                 })
+                .filter(|&(_, _, start, end)| start < end)
                 .collect();
 
-            let chunk_pangenome_bases = if interval_len > 0 {
-                proj_offset(chunk_end - pos, interval.pangenome_bases, interval_len)
+            let chunk_pangenome_bases = if interval.pangenome_bases > 0 {
+                samples.iter().map(|&(_, _, start, end)| end - start).sum()
             } else {
-                interval.pangenome_bases
+                0
             };
 
             self.seq_intervals.push(SparseDepthInterval {
@@ -2104,6 +2145,7 @@ impl<'a> StreamingDepthEmitter<'a> {
 /// Split intervals at fixed window boundaries.
 /// Each interval crossing a window edge is cut into pieces,
 /// with sample query coordinates proportionally adjusted.
+#[cfg(test)]
 fn split_intervals_by_window(
     intervals: Vec<SparseDepthInterval>,
     window_size: i64,
@@ -2136,13 +2178,14 @@ fn split_intervals_by_window(
                     let new_qe = qs + proj_offset(off_e, q_len, interval_len);
                     (sid, qid, new_qs, new_qe)
                 })
+                .filter(|&(_, _, start, end)| start < end)
                 .collect();
 
             // Proportionally split pangenome_bases
-            let chunk_pangenome_bases = if interval_len > 0 {
-                proj_offset(chunk_end - pos, interval.pangenome_bases, interval_len)
+            let chunk_pangenome_bases = if interval.pangenome_bases > 0 {
+                samples.iter().map(|&(_, _, start, end)| end - start).sum()
             } else {
-                interval.pangenome_bases
+                0
             };
 
             result.push(SparseDepthInterval {
@@ -2157,113 +2200,82 @@ fn split_intervals_by_window(
     result
 }
 
-/// Absorb intervals shorter than `min_len` bp into adjacent neighbors.
-///
-/// Short intervals caused by transient alignment dropouts (e.g., one sample
-/// briefly loses coverage) are absorbed into their left neighbor; if no left
-/// neighbor exists, they are absorbed into the right neighbor.  The absorbing
-/// neighbor's depth and sample set are preserved — only its coordinate span
-/// grows and its `pangenome_bases` accumulates the absorbed interval's bases.
-///
-/// Two passes are sufficient: the left-to-right pass handles all interior and
-/// trailing short intervals; the second pass absorbs any leading short
-/// intervals into the first long interval.
+/// Short-interval absorption must preserve the emitted partition: only
+/// adjacent intervals with identical samples and touching positions on the
+/// same contigs can be combined. A bounding box over a gap would re-emit bases
+/// owned by another record (or invent positions on a different contig).
+#[cfg(test)]
+fn can_merge_owned_intervals(left: &SparseDepthInterval, right: &SparseDepthInterval) -> bool {
+    left.end == right.start
+        && left.samples.len() == right.samples.len()
+        && left
+            .samples
+            .iter()
+            .zip(&right.samples)
+            .all(|(a, b)| a.0 == b.0 && a.1 == b.1 && (a.3 == b.2 || b.3 == a.2))
+}
+
+#[cfg(test)]
 fn merge_short_intervals(
     intervals: Vec<SparseDepthInterval>,
     min_len: i64,
 ) -> Vec<SparseDepthInterval> {
-    if min_len <= 0 || intervals.len() <= 1 {
+    if min_len <= 0 {
         return intervals;
     }
-
-    // Pass 1: left-to-right — absorb each short interval into its left neighbor.
-    let mut result: Vec<SparseDepthInterval> = Vec::with_capacity(intervals.len());
-    for interval in intervals {
-        if interval.end - interval.start < min_len {
-            if let Some(left) = result.last_mut() {
-                left.end = interval.end;
-                left.pangenome_bases += interval.pangenome_bases;
-                merge_sample_positions(&mut left.samples, interval.samples);
-                continue;
-            }
-            // No left neighbor yet — fall through; pass 2 will absorb into right.
-        }
-        result.push(interval);
-    }
-
-    // Pass 2: absorb any remaining leading short intervals into the first long one.
-    let boundary = result.iter().position(|iv| iv.end - iv.start >= min_len);
-    if let Some(b) = boundary {
-        if b > 0 {
-            let extra_pb: i64 = result[..b].iter().map(|iv| iv.pangenome_bases).sum();
-            let new_start = result[0].start;
-            // Union samples from all absorbed leading intervals into result[b]
-            let mut absorbed_samples: Vec<SamplePosition> = result[..b]
-                .iter()
-                .flat_map(|iv| iv.samples.iter().copied())
-                .collect();
-            result[b].start = new_start;
-            result[b].pangenome_bases += extra_pb;
-            absorbed_samples.sort_by_key(|s| s.0);
-            absorbed_samples.dedup_by(|next, current| {
-                if next.0 == current.0 {
-                    current.2 = current.2.min(next.2);
-                    current.3 = current.3.max(next.3);
-                    true
+    let mut result = Vec::new();
+    let mut pending: Option<SparseDepthInterval> = None;
+    for new in intervals {
+        match pending.take() {
+            None => pending = Some(new),
+            Some(mut prev) => {
+                if can_merge_owned_intervals(&prev, &new)
+                    && (new.end - new.start < min_len || prev.end - prev.start < min_len)
+                {
+                    StreamingDepthEmitter::absorb_right(&mut prev, new);
+                    pending = Some(prev);
                 } else {
-                    false
+                    result.push(prev);
+                    pending = Some(new);
                 }
-            });
-            merge_sample_positions(&mut result[b].samples, absorbed_samples);
-            result.drain(..b);
+            }
         }
     }
-    // If boundary is None every interval is shorter than min_len — keep as-is.
-
+    result.extend(pending);
     result
 }
 
-/// Same absorption logic as `merge_short_intervals` but for the stats `DepthIntervalWithSamples`
-/// type. Short intervals are absorbed into their left neighbor (or right if no left exists);
-/// the absorbing neighbor's depth is kept and the sample sets are unioned.
+/// Stats output follows the same rule: a short interval cannot grow across a
+/// sequence boundary or borrow the sample set of a different interval.
 fn merge_short_depth_intervals(
     intervals: Vec<DepthIntervalWithSamples>,
     min_len: i64,
 ) -> Vec<DepthIntervalWithSamples> {
-    if min_len <= 0 || intervals.len() <= 1 {
+    if min_len <= 0 {
         return intervals;
     }
-
-    // Pass 1: left-to-right absorption
-    let mut result: Vec<DepthIntervalWithSamples> = Vec::with_capacity(intervals.len());
-    for interval in intervals {
-        if interval.end - interval.start < min_len {
-            if let Some(left) = result.last_mut() {
-                left.end = interval.end;
-                merge_sorted_sample_names(&mut left.samples, interval.samples);
-                continue;
+    let mut result = Vec::new();
+    let mut pending: Option<DepthIntervalWithSamples> = None;
+    for new in intervals {
+        match pending.take() {
+            None => pending = Some(new),
+            Some(mut prev) => {
+                if prev.seq_name == new.seq_name
+                    && prev.end == new.start
+                    && prev.depth == new.depth
+                    && prev.samples == new.samples
+                    && (new.end - new.start < min_len || prev.end - prev.start < min_len)
+                {
+                    prev.end = new.end;
+                    pending = Some(prev);
+                } else {
+                    result.push(prev);
+                    pending = Some(new);
+                }
             }
         }
-        result.push(interval);
     }
-
-    // Pass 2: absorb leading short intervals into the first long one
-    let boundary = result.iter().position(|iv| iv.end - iv.start >= min_len);
-    if let Some(b) = boundary {
-        if b > 0 {
-            let new_start = result[0].start;
-            let mut extra_samples: Vec<String> = result[..b]
-                .iter()
-                .flat_map(|iv| iv.samples.iter().cloned())
-                .collect();
-            extra_samples.sort_unstable();
-            extra_samples.dedup();
-            result[b].start = new_start;
-            merge_sorted_sample_names(&mut result[b].samples, extra_samples);
-            result.drain(..b);
-        }
-    }
-
+    result.extend(pending);
     result
 }
 
@@ -2271,6 +2283,7 @@ fn merge_short_depth_intervals(
 /// are assigned from lexicographically sorted names, so stats intervals arrive
 /// in this order; preserving it avoids repeated `Vec::contains` scans during
 /// short-interval absorption.
+#[cfg(test)]
 fn merge_sorted_sample_names(existing: &mut Vec<String>, incoming: Vec<String>) {
     if incoming.is_empty() {
         return;
@@ -2306,11 +2319,13 @@ fn merge_sorted_sample_names(existing: &mut Vec<String>, incoming: Vec<String>) 
 /// sequences has zero contention. This enables fully parallel depth
 /// computation across all sequences without batch synchronization barriers.
 #[derive(Debug)]
+#[cfg(test)]
 struct ConcurrentProcessedTracker {
     /// Per-sequence IntervalSet behind a Mutex for thread-safe access
     processed: Vec<Mutex<IntervalSet>>,
 }
 
+#[cfg(test)]
 impl ConcurrentProcessedTracker {
     /// Create a new tracker for the given number of sequences
     fn new(num_sequences: usize) -> Self {
@@ -2422,6 +2437,7 @@ impl ConcurrentProcessedTracker {
     }
 
     /// Atomically claim unprocessed ranges within [start, end): returns what was claimed and marks it processed.
+    #[cfg(test)]
     fn claim_unprocessed(&self, seq_id: u32, start: i64, end: i64) -> Vec<(i64, i64)> {
         let mut lock = self.processed[seq_id as usize].lock();
         let unprocessed = if lock.is_empty() {
@@ -2456,6 +2472,7 @@ impl ConcurrentProcessedTracker {
     /// invocations and the original Vec allocation showed up as significant
     /// allocator pressure under jemalloc profiling).
     #[allow(dead_code)] // retained for parity tests vs claim_any_unprocessed_batch
+    #[cfg(test)]
     fn claim_any_unprocessed(&self, seq_id: u32, start: i64, end: i64) -> bool {
         if start >= end {
             return false;
@@ -2489,6 +2506,7 @@ impl ConcurrentProcessedTracker {
     /// per-range semantics as the single-shot version. The output is appended
     /// to `out` in input order so callers can map results back to range indices.
     /// End state and per-range bool sequence are identical to N serial calls.
+    #[allow(dead_code)] // retained as a tracker parity/benchmark helper
     fn claim_any_unprocessed_batch(&self, seq_id: u32, ranges: &[(i64, i64)], out: &mut Vec<bool>) {
         out.reserve(ranges.len());
         if ranges.is_empty() {
@@ -2549,6 +2567,7 @@ impl ConcurrentProcessedTracker {
 /// `impg depth` invocations with different `--output-prefix` against the
 /// same alignment list should all share the same cached degrees.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[cfg(test)]
 struct DegreesCache {
     /// Schema version — bump when the on-disk layout changes incompatibly.
     schema_version: u32,
@@ -2561,11 +2580,13 @@ struct DegreesCache {
     degrees: Vec<u16>,
 }
 
+#[cfg(test)]
 const DEGREES_CACHE_SCHEMA_VERSION: u32 = 1;
 
 /// Compute the invalidation hash from alignment file mtime/size tuples,
 /// `seq_included`, and `min_seq_length`. Returns None if any alignment file
 /// metadata cannot be read (cache cannot be reliably keyed → bypass).
+#[cfg(test)]
 fn compute_degrees_invalidation_hash(
     alignment_files: &[String],
     seq_included: &[bool],
@@ -2625,6 +2646,7 @@ fn compute_degrees_invalidation_hash(
 /// The filename incorporates the invalidation hash so concurrent runs against
 /// different `seq_included` / `min_seq_length` configurations don't trample
 /// each other.
+#[cfg(test)]
 fn degrees_cache_path(alignment_files: &[String], hash: u64) -> Option<std::path::PathBuf> {
     use std::path::Path;
     let first = alignment_files.first()?;
@@ -2633,6 +2655,7 @@ fn degrees_cache_path(alignment_files: &[String], hash: u64) -> Option<std::path
 }
 
 /// Try to load a previously-saved degrees cache.
+#[cfg(test)]
 fn try_load_degrees_cache(
     cache_path: &std::path::Path,
     expected_hash: u64,
@@ -2660,6 +2683,7 @@ fn try_load_degrees_cache(
 /// Save degrees to the sidecar file atomically (write to temp file then
 /// rename). Returns Ok even if the rename succeeds; logs but does not
 /// surface write errors to the caller (cache is best-effort).
+#[cfg(test)]
 fn save_degrees_cache(
     cache_path: &std::path::Path,
     invalidation_hash: u64,
@@ -2691,6 +2715,7 @@ fn save_degrees_cache(
 /// configuration, loads the result from a sidecar bin file (next to the
 /// first alignment file). On any cache miss / hash mismatch / IO error, falls
 /// back to a full pre-scan and writes a fresh sidecar.
+#[cfg(test)]
 fn compute_alignment_degrees(
     impg: &(impl ImpgIndex + Sync),
     compact_lengths: &CompactSequenceLengths,
@@ -2753,6 +2778,7 @@ fn compute_alignment_degrees(
 /// `explicit` names sequences to anchor first, in exactly the order given.
 /// Everything it does not name follows under the default rule (the --ref
 /// sample first, then degree descending, then length descending).
+#[cfg(test)]
 fn build_sequence_order(
     impg: &impl ImpgIndex,
     compact_lengths: &CompactSequenceLengths,
@@ -2821,6 +2847,7 @@ fn build_sequence_order(
 /// and hundreds of effectively serial barriers. After a wave finishes, callers
 /// re-read `ConcurrentProcessedTracker`, so regions discovered by earlier
 /// anchors are masked before the next slice from the same component is queried.
+#[cfg(test)]
 fn build_phase2_waves(
     sequence_order: &[u32],
     component_labels: &[u32],
@@ -2868,6 +2895,7 @@ fn build_phase2_waves(
 }
 
 /// Result of processing a single anchor region
+#[cfg(test)]
 struct AnchorRegionResult {
     /// Depth intervals for output
     intervals: Vec<SparseDepthInterval>,
@@ -2897,12 +2925,14 @@ struct DepthBfsHit {
 /// independently. `batch_depth_bfs` drives all chunk states together, loading
 /// each sub-index file only once per round regardless of how many chunks need
 /// it, so peak memory is bounded to one sub-index at a time.
+#[cfg(test)]
 struct BfsChunkState {
     queue: std::collections::VecDeque<(u32, i64, i64, u16)>, // (target_id, start, end, depth)
     visited_ranges: FxHashMap<u32, SortedRanges>,
     results: Vec<DepthBfsHit>,
 }
 
+#[cfg(test)]
 impl BfsChunkState {
     fn new(
         anchor_seq_id: u32,
@@ -3077,6 +3107,7 @@ impl BfsChunkState {
 /// rather than 50 times.
 ///
 /// Returns one `Vec<DepthBfsHit>` per input chunk, in the same order.
+#[cfg(test)]
 fn batch_depth_bfs(
     impg: &impl ImpgIndex,
     chunks: &[(u32, i64, i64)], // (anchor_seq_id, chunk_start, chunk_end)
@@ -3160,6 +3191,7 @@ fn batch_depth_bfs(
     Ok(states.into_iter().map(|s| s.results).collect())
 }
 
+#[cfg(test)]
 struct CigarBfsChunkState {
     visited_ranges: FxHashMap<u32, SortedRanges>,
     results: Vec<AdjustedInterval>,
@@ -3171,6 +3203,7 @@ struct CigarBfsChunkState {
 /// file-first batch query API together. For `MultiImpg`, this changes index I/O
 /// from one transient file load per anchor chunk to one load per file per BFS
 /// level and batch while preserving an independent visited-range set per root.
+#[cfg(test)]
 fn batch_cigar_depth_bfs(
     impg: &impl ImpgIndex,
     chunks: &[(u32, i64, i64)],
@@ -3330,6 +3363,7 @@ fn batch_cigar_depth_bfs(
 /// chunks in one coordinated pass (sequential file loading, O(sub_index_size)
 /// peak memory), then this function runs the sweep-line in parallel across
 /// all chunks (CPU-only, no sub-index loading).
+#[cfg(test)]
 fn process_anchor_region_transitive_raw_with_hits(
     hits: Vec<DepthBfsHit>,
     compact_lengths: &CompactSequenceLengths,
@@ -3343,9 +3377,6 @@ fn process_anchor_region_transitive_raw_with_hits(
     global_used: &ConcurrentProcessedTracker,
     compute_pangenome_bases: bool,
 ) -> AnchorRegionResult {
-    let mut discovered_regions: Vec<(u32, i64, i64)> = Vec::with_capacity(hits.len() + 1);
-    discovered_regions.push((anchor_seq_id, region_start, region_end));
-
     let mut alignments: Vec<CompactAlignmentInfo> = Vec::with_capacity(hits.len() + 1);
     alignments.push(CompactAlignmentInfo::new(
         anchor_sample_id,
@@ -3427,10 +3458,7 @@ fn process_anchor_region_transitive_raw_with_hits(
             continue;
         }
 
-        // Always add the hit to the sweep-line for correct depth counting. See
-        // process_anchor_region_raw_streaming for the full rationale — gating
-        // the sweep on claim_unprocessed undercounts samples when another anchor
-        // has already claimed the query range.
+        // Ownership is checked atomically when the sweep selects output positions.
         let (ua_start, ua_end) = inverse_map_query_to_target(
             full_a_start,
             full_a_end,
@@ -3451,11 +3479,6 @@ fn process_anchor_region_transitive_raw_with_hits(
                 hit.is_reverse,
             ));
         }
-
-        let claimed = global_used.claim_unprocessed(hit.query_id, query_start, query_end);
-        for (uq_start, uq_end) in claimed {
-            discovered_regions.push((hit.query_id, uq_start, uq_end));
-        }
     }
 
     #[cfg(feature = "depth-trace")]
@@ -3470,12 +3493,14 @@ fn process_anchor_region_transitive_raw_with_hits(
             unique.len()
         );
     }
-    let seq_intervals = sweep_line_depth(
+    let (seq_intervals, discovered_regions) = sweep_line_depth_owned(
         &alignments,
         &[],
         num_samples,
+        anchor_seq_id,
         region_start,
         region_end,
+        global_used,
         compute_pangenome_bases,
     );
 
@@ -3672,6 +3697,7 @@ fn depth_transitive_bfs(
 /// This is the default transitive path. Uses `depth_transitive_bfs()` which
 /// operates on raw alignment extents with linear interpolation, avoiding
 /// CIGAR walk overhead and chunk boundary gaps.
+#[cfg(test)]
 fn process_anchor_region_transitive_raw(
     impg: &impl ImpgIndex,
     config: &DepthConfig,
@@ -3685,9 +3711,6 @@ fn process_anchor_region_transitive_raw(
     min_seq_length: i64,
     global_used: &ConcurrentProcessedTracker,
 ) -> AnchorRegionResult {
-    let mut discovered_regions: Vec<(u32, i64, i64)> = Vec::new();
-    discovered_regions.push((anchor_seq_id, region_start, region_end));
-
     let hits = depth_transitive_bfs(
         impg,
         anchor_seq_id,
@@ -3700,7 +3723,6 @@ fn process_anchor_region_transitive_raw(
     );
 
     let hit_count = hits.len();
-    discovered_regions.reserve(hit_count + 1);
     let mut alignments: Vec<CompactAlignmentInfo> = Vec::with_capacity(hit_count + 1);
 
     // Self alignment (anchor covers itself)
@@ -3788,8 +3810,7 @@ fn process_anchor_region_transitive_raw(
             continue;
         }
 
-        // Always add the hit to the sweep-line for correct depth counting. See
-        // process_anchor_region_raw_streaming for the full rationale.
+        // Ownership is checked atomically when the sweep selects output positions.
         let (ua_start, ua_end) = inverse_map_query_to_target(
             full_a_start,
             full_a_end,
@@ -3810,11 +3831,6 @@ fn process_anchor_region_transitive_raw(
                 hit.is_reverse,
             ));
         }
-
-        let claimed = global_used.claim_unprocessed(hit.query_id, query_start, query_end);
-        for (uq_start, uq_end) in claimed {
-            discovered_regions.push((hit.query_id, uq_start, uq_end));
-        }
     }
 
     #[cfg(feature = "depth-trace")]
@@ -3830,12 +3846,14 @@ fn process_anchor_region_transitive_raw(
         );
     }
     // Sweep-line to compute depth intervals
-    let seq_intervals = sweep_line_depth(
+    let (seq_intervals, discovered_regions) = sweep_line_depth_owned(
         &alignments,
         &[],
         num_samples,
+        anchor_seq_id,
         region_start,
         region_end,
+        global_used,
         config.compute_pangenome_bases,
     );
 
@@ -3855,6 +3873,7 @@ fn process_anchor_region_transitive_raw(
 ///   impg's bidirectional index means 1-hop already captures both alignment directions.
 /// - Transitive (-x): routes to raw BFS (default) or CIGAR BFS (--use-BFS).
 ///   Caller should pass bounded-size regions (see TRANSITIVE_CHUNK_SIZE).
+#[cfg(test)]
 fn process_anchor_region(
     impg: &impl ImpgIndex,
     config: &DepthConfig,
@@ -3905,7 +3924,7 @@ fn process_anchor_region(
     } else if config.use_cigar_bfs {
         // Non-transitive + `--cigar-precise`: hop-0 CIGAR-precise depth. Direct
         // alignments only, projected base-by-base through their CIGARs.
-        return Ok(process_anchor_region_cigar_hop0(
+        return process_anchor_region_cigar_hop0(
             impg,
             compact_lengths,
             num_samples,
@@ -3917,12 +3936,10 @@ fn process_anchor_region(
             min_seq_length,
             global_used,
             config.compute_pangenome_bases,
-        ));
+        );
     }
 
     // Non-transitive mode (default): direct 1-hop query + linear interpolation
-    let mut discovered_regions: Vec<(u32, i64, i64)> = Vec::new();
-    discovered_regions.push((anchor_seq_id, region_start, region_end));
 
     let overlaps = impg.query(
         anchor_seq_id,
@@ -4011,17 +4028,17 @@ fn process_anchor_region(
             clipped_target_end,
             is_reverse,
         ));
-
-        discovered_regions.push((query_id, query_start, query_end));
     }
 
     // Sweep-line to compute depth intervals
-    let seq_intervals = sweep_line_depth(
+    let (seq_intervals, discovered_regions) = sweep_line_depth_owned(
         &alignments,
         &[],
         num_samples,
+        anchor_seq_id,
         region_start,
         region_end,
+        global_used,
         config.compute_pangenome_bases,
     );
 
@@ -4036,6 +4053,48 @@ fn process_anchor_region(
 /// Process a single anchor region using pre-scanned raw alignment data.
 /// No CIGAR projection — uses raw coordinates from interval tree metadata.
 /// This is the fast path for non-transitive depth computation.
+#[cfg(test)]
+fn raw_depth_alignments(
+    raw_intervals: &[RawAlignmentInterval],
+    compact_lengths: &CompactSequenceLengths,
+    anchor_seq_id: u32,
+    anchor_sample_id: u16,
+    region_start: i64,
+    region_end: i64,
+) -> Vec<CompactAlignmentInfo> {
+    let mut alignments = vec![CompactAlignmentInfo::new(
+        anchor_sample_id,
+        anchor_seq_id,
+        region_start,
+        region_end,
+        region_start,
+        region_end,
+        false,
+    )];
+    for aln in raw_intervals {
+        if aln.target_start >= region_end || aln.target_end <= region_start {
+            continue;
+        }
+        let sample_id = compact_lengths.get_sample_id(aln.query_id);
+        if is_self_alignment(sample_id, anchor_sample_id, aln.query_id, anchor_seq_id) {
+            continue;
+        }
+        // Keep the original projection frame. Claiming is deferred until a
+        // representative position has actually been selected for output.
+        alignments.push(CompactAlignmentInfo::new(
+            sample_id,
+            aln.query_id,
+            aln.query_start,
+            aln.query_end,
+            aln.target_start,
+            aln.target_end,
+            aln.is_reverse,
+        ));
+    }
+    alignments
+}
+
+#[cfg(test)]
 fn process_anchor_region_raw(
     raw_intervals: &[RawAlignmentInterval],
     compact_lengths: &CompactSequenceLengths,
@@ -4047,147 +4106,26 @@ fn process_anchor_region_raw(
     global_used: &ConcurrentProcessedTracker,
     compute_pangenome_bases: bool,
 ) -> AnchorRegionResult {
-    let mut discovered_regions: Vec<(u32, i64, i64)> = Vec::with_capacity(raw_intervals.len() + 1);
-    discovered_regions.push((anchor_seq_id, region_start, region_end));
-
-    let mut alignments: Vec<CompactAlignmentInfo> = Vec::with_capacity(raw_intervals.len() + 1);
-
-    // Self alignment (anchor covers itself)
-    alignments.push(CompactAlignmentInfo::new(
-        anchor_sample_id,
+    let alignments = raw_depth_alignments(
+        raw_intervals,
+        compact_lengths,
         anchor_seq_id,
+        anchor_sample_id,
         region_start,
         region_end,
-        region_start,
-        region_end,
-        false,
-    ));
-
-    // Per-task buffer: collects (orig_idx, query_id, cq_start, cq_end). After
-    // the loop we group runs of equal query_id and call claim_*_batch once per
-    // group, holding the per-seq mutex for the whole group instead of per-aln.
-    let mut claim_buf: Vec<(usize, u32, i64, i64)> = Vec::with_capacity(raw_intervals.len());
-
-    // Binary search: only scan intervals where target_start < region_end
-    // (alignment_table is sorted by target_start after pre-scan)
-    let end_idx = raw_intervals.partition_point(|aln| (aln.target_start as i64) < region_end);
-    for aln in &raw_intervals[..end_idx] {
-        let target_start = aln.target_start as i64;
-        let target_end = aln.target_end as i64;
-
-        // Skip intervals that end before region starts
-        if target_end <= region_start {
-            continue;
-        }
-
-        let query_sample_id = compact_lengths.get_sample_id(aln.query_id);
-
-        // Filter self-alignments (same sample, different sequence)
-        if is_self_alignment(
-            query_sample_id,
-            anchor_sample_id,
-            aln.query_id,
-            anchor_seq_id,
-        ) {
-            continue;
-        }
-
-        let query_start = aln.query_start as i64;
-        let query_end = aln.query_end as i64;
-
-        // Stage 2 J: do NOT pre-clip target/query for storage. The sweep-line
-        // clips per-emit-interval, performing a single projection + single
-        // rounding (instead of two compounded roundings). We compute the
-        // clipped query range here ONLY for the ownership claim below.
-        let clipped_t_start = target_start.max(region_start);
-        let clipped_t_end = target_end.min(region_end);
-        let target_len = target_end - target_start;
-        let query_len = query_end - query_start;
-        let (cq_start, cq_end) = if target_len > 0 {
-            let off_s = clipped_t_start - target_start;
-            let off_e = clipped_t_end - target_start;
-            if aln.is_reverse {
-                let qe = query_end - proj_offset(off_s, query_len, target_len);
-                let qs = query_end - proj_offset(off_e, query_len, target_len);
-                (qs.min(qe), qs.max(qe))
-            } else {
-                let qs = query_start + proj_offset(off_s, query_len, target_len);
-                let qe = query_start + proj_offset(off_e, query_len, target_len);
-                (qs.min(qe), qs.max(qe))
-            }
-        } else {
-            (query_start, query_end)
-        };
-
-        // Always add the alignment to the sweep-line for correct depth counting.
-        // See the streaming variant for the full rationale — gating the sweep on
-        // claim_unprocessed causes samples that genuinely cover the anchor region
-        // to be omitted when their query range was claimed by a prior anchor.
-        //
-        // Stage 2 J: store ORIGINAL alignment coords (not pre-clipped). Sweep-line
-        // events at aln.target_start / aln.target_end may fall outside
-        // [region_start, region_end), but the sweep already clips per-emit interval,
-        // so out-of-region events trigger no emit while still toggling sample-active
-        // state correctly across the region boundary.
-        let aln_idx = alignments.len();
-        alignments.push(CompactAlignmentInfo::new(
-            query_sample_id,
-            aln.query_id,
-            query_start,
-            query_end,
-            target_start,
-            target_end,
-            aln.is_reverse,
-        ));
-
-        claim_buf.push((aln_idx, aln.query_id, cq_start, cq_end));
-    }
-
-    // Stage 1 F: batch claims by query_id. Stable sort_by_key keeps secondary
-    // idx ascending so within-group call order matches iteration order; the
-    // post-pass sort by idx restores discovered_regions to original order.
-    if !claim_buf.is_empty() {
-        claim_buf.sort_by_key(|&(idx, qid, _, _)| (qid, idx));
-        let mut group_buf: Vec<(i64, i64)> = Vec::new();
-        let mut bool_buf: Vec<bool> = Vec::new();
-        let mut newly_owned: Vec<(usize, u32, i64, i64)> = Vec::new();
-        let mut i = 0;
-        while i < claim_buf.len() {
-            let qid = claim_buf[i].1;
-            let mut j = i;
-            while j < claim_buf.len() && claim_buf[j].1 == qid {
-                j += 1;
-            }
-            group_buf.clear();
-            group_buf.extend(claim_buf[i..j].iter().map(|&(_, _, s, e)| (s, e)));
-            bool_buf.clear();
-            global_used.claim_any_unprocessed_batch(qid, &group_buf, &mut bool_buf);
-            for (k, &b) in bool_buf.iter().enumerate() {
-                if b {
-                    let (idx, _, s, e) = claim_buf[i + k];
-                    newly_owned.push((idx, qid, s, e));
-                }
-            }
-            i = j;
-        }
-        newly_owned.sort_by_key(|&(idx, _, _, _)| idx);
-        for (_, qid, s, e) in newly_owned {
-            discovered_regions.push((qid, s, e));
-        }
-    }
-
-    // Sweep-line to compute depth intervals
-    let seq_intervals = sweep_line_depth(
+    );
+    let (intervals, discovered_regions) = sweep_line_depth_owned(
         &alignments,
         &[],
         num_samples,
+        anchor_seq_id,
         region_start,
         region_end,
+        global_used,
         compute_pangenome_bases,
     );
-
     AnchorRegionResult {
-        intervals: seq_intervals,
+        intervals,
         discovered_regions,
         anchor_seq_id,
         anchor_sample_id,
@@ -4203,6 +4141,7 @@ fn process_anchor_region_raw(
 /// - Hop 1+ results (target on intermediate): projected back via the intermediate's
 ///   known anchor coverage from hop 0 results (linear interpolation)
 /// - Deeper hops with unknown intermediate: full anchor region as fallback
+#[cfg(test)]
 fn process_anchor_region_transitive_cigar(
     impg: &impl ImpgIndex,
     config: &DepthConfig,
@@ -4217,13 +4156,10 @@ fn process_anchor_region_transitive_cigar(
     global_used: &ConcurrentProcessedTracker,
     precomputed: Option<(Vec<AdjustedInterval>, Vec<RawAlignmentInterval>)>,
 ) -> io::Result<AnchorRegionResult> {
-    let mut discovered_regions: Vec<(u32, i64, i64)> = Vec::new();
-    discovered_regions.push((anchor_seq_id, region_start, region_end));
-
     // Use the same CIGAR-precise BFS/DFS as the query command (--use-BFS path),
     // unless the global depth scheduler already queried this chunk as part of
     // a file-first multi-root batch.
-    let (overlaps, raw_hop0) = if let Some(precomputed) = precomputed {
+    let (overlaps, _raw_hop0) = if let Some(precomputed) = precomputed {
         precomputed
     } else {
         let overlaps = if config.transitive_dfs {
@@ -4259,13 +4195,11 @@ fn process_anchor_region_transitive_cigar(
                 None,
             )
         }?;
-        // Query while the CIGAR query's trees are still warm.
-        let raw = impg.query_raw_overlapping(anchor_seq_id, region_start, region_end);
-        (overlaps, raw)
+        // Discovery extents are no longer used as output ownership masks.
+        (overlaps, Vec::new())
     };
 
     let overlap_count = overlaps.len();
-    discovered_regions.reserve(overlap_count + 1);
     let mut alignments: Vec<CompactAlignmentInfo> = Vec::with_capacity(overlap_count + 1);
     // Per-region CIGAR side-table. With the CIGAR-precise carry BFS/DFS
     // (store_cigar=true), EVERY hit — hop-0 and hop≥1 alike — arrives with its
@@ -4380,8 +4314,7 @@ fn process_anchor_region_transitive_cigar(
             continue;
         }
 
-        // Always add the hit to the sweep-line for correct depth counting. See
-        // process_anchor_region_raw_streaming for the full rationale.
+        // Ownership is checked atomically when the sweep selects output positions.
         // The alignment spans the full projected query interval, so mapping
         // [query_start, query_end] back through that same interval is exactly
         // [full_a_start, full_a_end]. Avoid redundant interpolation/division.
@@ -4423,52 +4356,6 @@ fn process_anchor_region_transitive_cigar(
                 cigar_idx,
             ));
         }
-
-        let claimed = global_used.claim_unprocessed(query_id, query_start, query_end);
-        for (uq_start, uq_end) in claimed {
-            discovered_regions.push((query_id, uq_start, uq_end));
-        }
-    }
-
-    // Augment discovered_regions with raw alignment extents for direct (hop 0) overlaps.
-    // The BFS loop above records CIGAR-projected sub-ranges (line 1899) which may leave
-    // gaps at chunk boundaries due to indels. Raw extents ensure the full alignment
-    // coverage is marked as processed, preventing Phase 2 from re-processing these
-    // regions and producing duplicate output (e.g., CHM13 appearing in Phase 2 rows).
-    // Reuse the sub-indices and COITrees populated by the CIGAR query above.
-    // The transient path would reopen and deserialize the same files, then
-    // rebuild the same trees solely to recover their raw extents.
-    for aln in &raw_hop0 {
-        if min_seq_length > 0
-            && !seq_included
-                .get(aln.query_id as usize)
-                .copied()
-                .unwrap_or(false)
-        {
-            continue;
-        }
-        let query_sample_id = compact_lengths.get_sample_id(aln.query_id);
-        if is_self_alignment(
-            query_sample_id,
-            anchor_sample_id,
-            aln.query_id,
-            anchor_seq_id,
-        ) {
-            continue;
-        }
-        // Record only the portion not already owned by another anchor.  The
-        // projected CIGAR ranges above have already claimed most of this raw
-        // extent; appending the full span again made every chunk persist large
-        // duplicate regions in the work-log.  Claiming the remainder preserves
-        // the final union while keeping tracker/work-log growth proportional to
-        // newly discovered coverage.
-        for (start, end) in global_used.claim_unprocessed(
-            aln.query_id,
-            aln.query_start as i64,
-            aln.query_end as i64,
-        ) {
-            discovered_regions.push((aln.query_id, start, end));
-        }
     }
 
     #[cfg(feature = "depth-trace")]
@@ -4484,12 +4371,14 @@ fn process_anchor_region_transitive_cigar(
         );
     }
     // Sweep-line to compute depth intervals
-    let seq_intervals = sweep_line_depth(
+    let (seq_intervals, discovered_regions) = sweep_line_depth_owned(
         &alignments,
         &cigars,
         num_samples,
+        anchor_seq_id,
         region_start,
         region_end,
+        global_used,
         config.compute_pangenome_bases,
     );
 
@@ -4515,6 +4404,7 @@ fn process_anchor_region_transitive_cigar(
 /// `[region_start, region_end]`, with `overlap.1` being the target→query CIGAR
 /// of that clipped window — exactly the frame `CigarEntry`/`CigarCursor` expect.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn process_anchor_region_cigar_hop0(
     impg: &impl ImpgIndex,
     compact_lengths: &CompactSequenceLengths,
@@ -4527,7 +4417,7 @@ fn process_anchor_region_cigar_hop0(
     min_seq_length: i64,
     global_used: &ConcurrentProcessedTracker,
     compute_pangenome_bases: bool,
-) -> AnchorRegionResult {
+) -> io::Result<AnchorRegionResult> {
     // Direct query with CIGAR so each hit feeds the CIGAR-precise sweep cursor.
     //
     // Use the per-file-streaming, CIGAR-compressing query: the plain
@@ -4539,14 +4429,15 @@ fn process_anchor_region_cigar_hop0(
     // compresses each file's alignments as the file is read and frees the
     // uncompressed form, so peak uncompressed CIGAR is one alignment file per
     // worker (~one file's overlaps, not all ~degree files' at once).
-    let (overlaps, raw_hop0) = impg.query_overlapping_cigar_compressed_with_raw(
-        anchor_seq_id,
-        region_start,
-        region_end,
-        &|ops: &[CigarOp]| coordinate_compress_cigar(ops),
-    );
+    let (overlaps, raw_hop0) = impg
+        .batch_query_overlapping_cigar_compressed_with_raw(
+            &[(anchor_seq_id, region_start, region_end)],
+            &|ops: &[CigarOp]| coordinate_compress_cigar(ops),
+        )?
+        .pop()
+        .ok_or_else(|| io::Error::other("CIGAR depth query returned no result slot"))?;
 
-    process_anchor_region_cigar_hop0_with_hits(
+    Ok(process_anchor_region_cigar_hop0_with_hits(
         overlaps,
         raw_hop0,
         compact_lengths,
@@ -4559,16 +4450,17 @@ fn process_anchor_region_cigar_hop0(
         min_seq_length,
         global_used,
         compute_pangenome_bases,
-    )
+    ))
 }
 
 /// CPU-only half of hop-0 CIGAR depth. The batch Phase 2 driver supplies hits
 /// gathered file-first; the single-region path above supplies identical hits
 /// through the legacy query API.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn process_anchor_region_cigar_hop0_with_hits(
     overlaps: Vec<AdjustedInterval>,
-    raw_hop0: Vec<RawAlignmentInterval>,
+    _raw_hop0: Vec<RawAlignmentInterval>,
     compact_lengths: &CompactSequenceLengths,
     num_samples: usize,
     anchor_seq_id: u32,
@@ -4580,9 +4472,6 @@ fn process_anchor_region_cigar_hop0_with_hits(
     global_used: &ConcurrentProcessedTracker,
     compute_pangenome_bases: bool,
 ) -> AnchorRegionResult {
-    let mut discovered_regions: Vec<(u32, i64, i64)> = Vec::new();
-    discovered_regions.push((anchor_seq_id, region_start, region_end));
-
     let mut alignments: Vec<CompactAlignmentInfo> = Vec::new();
     // Per-region CIGAR side-table; every direct hit registers one entry.
     let mut cigars: Vec<CigarEntry> = Vec::new();
@@ -4667,52 +4556,16 @@ fn process_anchor_region_cigar_hop0_with_hits(
             is_reverse,
             cigar_idx,
         ));
-
-        let claimed = global_used.claim_unprocessed(query_id, query_start, query_end);
-        for (uq_start, uq_end) in claimed {
-            discovered_regions.push((query_id, uq_start, uq_end));
-        }
     }
 
-    // Augment discovered_regions with raw alignment extents (same rationale as
-    // process_anchor_region_transitive_cigar): the CIGAR-projected query
-    // sub-ranges above may leave indel gaps, so mark the full direct-alignment
-    // extents processed to keep Phase 2 from re-emitting these regions.
-    // `raw_hop0` was collected alongside the CIGAR projections while each
-    // sub-index and COITree was still resident, avoiding a second index pass.
-    for aln in &raw_hop0 {
-        if min_seq_length > 0
-            && !seq_included
-                .get(aln.query_id as usize)
-                .copied()
-                .unwrap_or(false)
-        {
-            continue;
-        }
-        let query_sample_id = compact_lengths.get_sample_id(aln.query_id);
-        if is_self_alignment(
-            query_sample_id,
-            anchor_sample_id,
-            aln.query_id,
-            anchor_seq_id,
-        ) {
-            continue;
-        }
-        for (start, end) in global_used.claim_unprocessed(
-            aln.query_id,
-            aln.query_start as i64,
-            aln.query_end as i64,
-        ) {
-            discovered_regions.push((aln.query_id, start, end));
-        }
-    }
-
-    let seq_intervals = sweep_line_depth(
+    let (seq_intervals, discovered_regions) = sweep_line_depth_owned(
         &alignments,
         &cigars,
         num_samples,
+        anchor_seq_id,
         region_start,
         region_end,
+        global_used,
         compute_pangenome_bases,
     );
 
@@ -4733,6 +4586,7 @@ fn process_anchor_region_cigar_hop0_with_hits(
 /// by the caller to avoid per-sample/per-contig `Vec` allocations) and computes the
 /// per-contig unions in one `sort_unstable` + linear sweep. This is behaviorally
 /// identical to grouping by contig and summing each group's union length.
+#[cfg(test)]
 fn union_length_by_contig(projs: &mut [(u32, i64, i64)]) -> i64 {
     if projs.is_empty() {
         return 0;
@@ -4767,6 +4621,7 @@ fn union_length_by_contig(projs: &mut [(u32, i64, i64)]) -> i64 {
 /// `cigars` is the per-region CIGAR side-table referenced by
 /// `CompactAlignmentInfo::cigar_idx`. Pass `&[]` when no CIGAR is available
 /// (the sweep falls back to linear interpolation for every window).
+#[cfg(test)]
 fn sweep_line_depth(
     alignments: &[CompactAlignmentInfo],
     cigars: &[CigarEntry],
@@ -4910,134 +4765,253 @@ fn sweep_line_depth(
     seq_intervals
 }
 
-/// Streaming variant of [`sweep_line_depth`]. Calls `emit` for each depth interval
-/// instead of collecting into a Vec. Peak memory is O(N_samples) per interval
-/// rather than O(K × N_samples) for the full result set.
-fn sweep_line_depth_streaming(
+/// Project a processed query boundary back into the anchor's coordinate frame.
+/// Add both sides of a deletion and floor/ceiling for raw interpolation:
+/// an insertion can map several query bases to one
+/// anchor boundary. The final availability check below always runs in query
+/// coordinates, so rounding can never authorize a previously emitted base.
+#[cfg(test)]
+fn add_owned_boundary(
+    cuts: &mut Vec<i64>,
+    aln: &CompactAlignmentInfo,
+    cigars: &[CigarEntry],
+    query_pos: i64,
+    start: i64,
+    end: i64,
+) {
+    let mut add = |pos: i64| {
+        if start < pos && pos < end {
+            cuts.push(pos);
+        }
+    };
+    if let Some(entry) = cigars.get(aln.cigar_idx as usize) {
+        let mut t = entry.target_start;
+        let mut q = if entry.strand == Strand::Forward {
+            entry.query_start
+        } else {
+            entry.query_end
+        };
+        for op in &entry.ops {
+            let td = op.target_delta() as i64;
+            let qd = op.query_delta(entry.strand) as i64;
+            let next_q = q + qd;
+            if q.min(next_q) <= query_pos && query_pos <= q.max(next_q) {
+                if qd == 0 {
+                    add(t);
+                    add(t + td);
+                } else if td == 0 {
+                    add(t);
+                } else {
+                    add(t + (query_pos - q).abs());
+                }
+            }
+            t += td;
+            q = next_q;
+        }
+    } else if aln.query_start < aln.query_end {
+        let offset = if aln.is_reverse {
+            aln.query_end - query_pos
+        } else {
+            query_pos - aln.query_start
+        };
+        let numerator = offset as i128 * (aln.target_end - aln.target_start) as i128;
+        let denominator = (aln.query_end - aln.query_start) as i128;
+        add(aln.target_start + (numerator / denominator) as i64);
+        add(aln.target_start + ((numerator + denominator - 1) / denominator) as i64);
+    }
+}
+
+/// Largest available part of a projected interval. Usually there is just one
+/// part because processed boundaries split the sweep window first. Insertions
+/// can put several parts at the same anchor boundary; leave unselected parts
+/// unmarked so they remain available as later anchors.
+#[cfg(test)]
+fn available_projection(used: &IntervalSet, start: i64, end: i64) -> Option<(i64, i64)> {
+    let mut pos = start;
+    let mut best = None;
+    for (s, e) in used.iter_overlapping(start, end) {
+        let gap_end = s.min(end);
+        if pos < gap_end && best.is_none_or(|(a, b)| gap_end - pos > b - a) {
+            best = Some((pos, gap_end));
+        }
+        pos = pos.max(e);
+    }
+    if pos < end && best.is_none_or(|(a, b)| end - pos > b - a) {
+        best = Some((pos, end));
+    }
+    best
+}
+
+/// Global output sweep. Discovery is not ownership: claim only the positions
+/// that this sweep actually emits, including the anchor. Lock participating
+/// sequences in ID order for the CPU-only sweep (never during index I/O), so
+/// two concurrent chunks cannot observe the same bases as available. Region
+/// queries deliberately keep their independent, non-owning sweep semantics.
+#[cfg(test)]
+fn sweep_line_depth_owned_streaming(
     alignments: &[CompactAlignmentInfo],
     cigars: &[CigarEntry],
     num_samples: usize,
+    anchor_seq_id: u32,
     region_start: i64,
     region_end: i64,
+    global_used: &ConcurrentProcessedTracker,
     compute_pangenome_bases: bool,
     emit: &mut impl FnMut(SparseDepthInterval),
-) {
-    // Build sweep-line events
-    let mut events: Vec<CompactDepthEvent> = Vec::with_capacity(alignments.len() * 2);
+) -> Vec<(u32, i64, i64)> {
+    let mut seq_ids: Vec<u32> = alignments.iter().map(|aln| aln.query_id).collect();
+    seq_ids.push(anchor_seq_id);
+    seq_ids.sort_unstable();
+    seq_ids.dedup();
+    let slots: FxHashMap<u32, usize> = seq_ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+    let mut used: Vec<_> = seq_ids
+        .iter()
+        .map(|&id| global_used.processed[id as usize].lock())
+        .collect();
+    let anchor_slot = slots[&anchor_seq_id];
+    let mut events = Vec::with_capacity(alignments.len() * 2);
     for (idx, aln) in alignments.iter().enumerate() {
-        events.push(CompactDepthEvent::new(
-            aln.target_start,
-            true,
-            aln.sample_id,
-            idx,
-        ));
-        events.push(CompactDepthEvent::new(
-            aln.target_end,
-            false,
-            aln.sample_id,
-            idx,
-        ));
+        if aln.target_start < aln.target_end {
+            events.push(CompactDepthEvent::new(
+                aln.target_start,
+                true,
+                aln.sample_id,
+                idx,
+            ));
+            events.push(CompactDepthEvent::new(
+                aln.target_end,
+                false,
+                aln.sample_id,
+                idx,
+            ));
+        }
     }
-    // Unstable sort is sufficient: `sort_key` encodes a total order over
-    // (position, !is_start, sample_id), and events sharing a key are interchangeable
-    // (active_alns removes by exact alignment_idx), so stability is not required.
-    events.sort_unstable_by_key(|e| e.sort_key);
-
-    let mut active_bitmap = SampleBitmap::new(num_samples);
+    events.sort_unstable_by_key(|event| event.sort_key);
+    let mut active = SampleBitmap::new(num_samples);
     let mut active_alns = ActiveAlignments::new(num_samples, alignments.len());
+    let mut cursors = vec![None; alignments.len()];
     let mut prev_pos: Option<i64> = None;
-    // Reused flat (query_id, q_start, q_end) buffer; cleared (capacity retained)
-    // before each per-sample use to avoid per-contig Vec allocation churn.
-    let mut query_projections: Vec<(u32, i64, i64)> = Vec::new();
-    let mut cursors: Vec<Option<CigarCursor>> = vec![None; alignments.len()];
-
+    let mut discovered: Vec<IntervalSet> = seq_ids.iter().map(|_| IntervalSet::new()).collect();
+    let mut cuts = Vec::new();
     for event in events {
-        let event_position = event.position();
+        let pos = event.position();
         if let Some(prev) = prev_pos {
-            if event_position > prev && active_bitmap.depth() > 0 {
-                let clipped_start = prev.max(region_start);
-                let clipped_end = event_position.min(region_end);
-
-                if clipped_start < clipped_end {
-                    let mut samples: Vec<SamplePosition> =
-                        Vec::with_capacity(active_bitmap.depth());
-                    let mut pangenome_bases: i64 = 0;
-
-                    for sample_id in active_bitmap.active_samples() {
-                        let alns = active_alns.for_sample(sample_id);
-                        query_projections.clear();
-                        let mut best_idx: Option<usize> = None;
-                        let mut best_overlap: i64 = -1;
-                        let mut best_qs: i64 = 0;
-                        let mut best_qe: i64 = 0;
-
-                        for &idx in alns {
+            let start = prev.max(region_start);
+            let end = pos.min(region_end);
+            if start < end && active.depth() > 0 {
+                cuts.clear();
+                cuts.extend([start, end]);
+                for sid in active.active_samples() {
+                    for &idx in active_alns.for_sample(sid) {
+                        let aln = &alignments[idx];
+                        let (qs, qe) =
+                            project_window_for_sweep(aln, cigars, &mut cursors, idx, start, end);
+                        for (s, e) in used[slots[&aln.query_id]].iter_overlapping(qs, qe) {
+                            add_owned_boundary(&mut cuts, aln, cigars, s.max(qs), start, end);
+                            add_owned_boundary(&mut cuts, aln, cigars, e.min(qe), start, end);
+                        }
+                    }
+                }
+                cuts.sort_unstable();
+                cuts.dedup();
+                for pair in cuts.windows(2) {
+                    let (s, e) = (pair[0], pair[1]);
+                    // The identity anchor alignment contributed its processed
+                    // boundaries above, so this piece is wholly owned or free.
+                    if used[anchor_slot].iter_overlapping(s, e).next().is_some() {
+                        continue;
+                    }
+                    let mut samples = Vec::with_capacity(active.depth());
+                    for sid in active.active_samples() {
+                        let mut best = None;
+                        for &idx in active_alns.for_sample(sid) {
                             let aln = &alignments[idx];
-                            let overlap_start = clipped_start.max(aln.target_start);
-                            let overlap_end = clipped_end.min(aln.target_end);
-                            let overlap = overlap_end - overlap_start;
-                            if overlap <= 0 {
-                                continue;
-                            }
-
-                            let (q_start, q_end) = project_window_for_sweep(
-                                aln,
-                                cigars,
-                                &mut cursors,
-                                idx,
-                                clipped_start,
-                                clipped_end,
-                            );
-                            if compute_pangenome_bases {
-                                query_projections.push((aln.query_id, q_start, q_end));
-                            }
-                            if overlap > best_overlap {
-                                best_overlap = overlap;
-                                best_idx = Some(idx);
-                                best_qs = q_start;
-                                best_qe = q_end;
+                            let (qs, qe) =
+                                project_window_for_sweep(aln, cigars, &mut cursors, idx, s, e);
+                            if let Some((qs, qe)) =
+                                available_projection(&used[slots[&aln.query_id]], qs, qe)
+                            {
+                                best = Some((sid, aln.query_id, qs, qe));
+                                break;
                             }
                         }
-
-                        if let Some(idx) = best_idx {
-                            let aln = &alignments[idx];
-                            samples.push((sample_id, aln.query_id, best_qs, best_qe));
+                        if let Some(sample) = best {
+                            samples.push(sample);
                         }
-
+                    }
+                    if !samples
+                        .iter()
+                        .any(|&(_, id, qs, qe)| id == anchor_seq_id && qs == s && qe == e)
+                    {
+                        continue;
+                    }
+                    let mut pangenome_bases = 0;
+                    for &(_, id, qs, qe) in &samples {
+                        used[slots[&id]].add(qs, qe);
+                        discovered[slots[&id]].add(qs, qe);
                         if compute_pangenome_bases {
-                            pangenome_bases += union_length_by_contig(&mut query_projections);
+                            pangenome_bases += qe - qs;
                         }
                     }
-
-                    if !samples.is_empty() {
-                        // active_samples() yields IDs via iter_ones() in ascending order,
-                        // so samples is already sorted — no sort needed.
-                        emit(SparseDepthInterval {
-                            start: clipped_start,
-                            end: clipped_end,
-                            samples,
-                            pangenome_bases,
-                        });
-                    }
+                    emit(SparseDepthInterval {
+                        start: s,
+                        end: e,
+                        samples,
+                        pangenome_bases,
+                    });
                 }
             }
         }
-
-        let sample_id = event.sample_id();
-        let alignment_idx = event.alignment_idx();
         if event.is_start() {
-            active_bitmap.add(sample_id);
-            active_alns.add(sample_id, alignment_idx);
+            active.add(event.sample_id());
+            active_alns.add(event.sample_id(), event.alignment_idx());
         } else {
-            active_bitmap.remove(sample_id);
-            active_alns.remove(sample_id, alignment_idx);
+            active.remove(event.sample_id());
+            active_alns.remove(event.sample_id(), event.alignment_idx());
         }
-        prev_pos = Some(event_position);
+        prev_pos = Some(pos);
     }
+    seq_ids
+        .into_iter()
+        .zip(discovered)
+        .flat_map(|(id, ranges)| {
+            ranges
+                .intervals()
+                .map(|(s, e)| (id, s, e))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn sweep_line_depth_owned(
+    alignments: &[CompactAlignmentInfo],
+    cigars: &[CigarEntry],
+    num_samples: usize,
+    anchor_seq_id: u32,
+    region_start: i64,
+    region_end: i64,
+    global_used: &ConcurrentProcessedTracker,
+    compute_pangenome_bases: bool,
+) -> (Vec<SparseDepthInterval>, Vec<(u32, i64, i64)>) {
+    let mut intervals = Vec::new();
+    let discovered = sweep_line_depth_owned_streaming(
+        alignments,
+        cigars,
+        num_samples,
+        anchor_seq_id,
+        region_start,
+        region_end,
+        global_used,
+        compute_pangenome_bases,
+        &mut |interval| intervals.push(interval),
+    );
+    (intervals, discovered)
 }
 
 /// Streaming variant of [`process_anchor_region_raw`]. Returns only discovered_regions,
 /// streaming depth intervals through `emit` for immediate processing.
+#[cfg(test)]
 fn process_anchor_region_raw_streaming(
     raw_intervals: &[RawAlignmentInterval],
     compact_lengths: &CompactSequenceLengths,
@@ -5050,139 +5024,31 @@ fn process_anchor_region_raw_streaming(
     compute_pangenome_bases: bool,
     emit: &mut impl FnMut(SparseDepthInterval),
 ) -> Vec<(u32, i64, i64)> {
-    let mut discovered_regions: Vec<(u32, i64, i64)> = Vec::with_capacity(raw_intervals.len() + 1);
-    discovered_regions.push((anchor_seq_id, region_start, region_end));
-
-    let mut alignments: Vec<CompactAlignmentInfo> = Vec::with_capacity(raw_intervals.len() + 1);
-    alignments.push(CompactAlignmentInfo::new(
-        anchor_sample_id,
+    let alignments = raw_depth_alignments(
+        raw_intervals,
+        compact_lengths,
         anchor_seq_id,
+        anchor_sample_id,
         region_start,
         region_end,
-        region_start,
-        region_end,
-        false,
-    ));
-
-    // Per-task buffer: see process_anchor_region_raw for rationale (Stage 1 F).
-    let mut claim_buf: Vec<(usize, u32, i64, i64)> = Vec::with_capacity(raw_intervals.len());
-
-    let end_idx = raw_intervals.partition_point(|aln| (aln.target_start as i64) < region_end);
-    for aln in &raw_intervals[..end_idx] {
-        let target_start = aln.target_start as i64;
-        let target_end = aln.target_end as i64;
-        if target_end <= region_start {
-            continue;
-        }
-
-        let query_sample_id = compact_lengths.get_sample_id(aln.query_id);
-        if is_self_alignment(
-            query_sample_id,
-            anchor_sample_id,
-            aln.query_id,
-            anchor_seq_id,
-        ) {
-            continue;
-        }
-
-        let query_start = aln.query_start as i64;
-        let query_end = aln.query_end as i64;
-
-        // Stage 2 J: clipped query coords used ONLY for the ownership claim;
-        // alignment is stored with original coords so sweep-line performs a
-        // single projection + single rounding per emit.
-        let clipped_t_start = target_start.max(region_start);
-        let clipped_t_end = target_end.min(region_end);
-        let target_len = target_end - target_start;
-        let query_len = query_end - query_start;
-        let (cq_start, cq_end) = if target_len > 0 {
-            let off_s = clipped_t_start - target_start;
-            let off_e = clipped_t_end - target_start;
-            if aln.is_reverse {
-                let qe = query_end - proj_offset(off_s, query_len, target_len);
-                let qs = query_end - proj_offset(off_e, query_len, target_len);
-                (qs.min(qe), qs.max(qe))
-            } else {
-                let qs = query_start + proj_offset(off_s, query_len, target_len);
-                let qe = query_start + proj_offset(off_e, query_len, target_len);
-                (qs.min(qe), qs.max(qe))
-            }
-        } else {
-            (query_start, query_end)
-        };
-
-        // Always add the alignment to the sweep-line for correct depth counting.
-        // Depth at the anchor's target position is a function of sample coverage
-        // and is independent of which anchor "owns" the query sub-range for output.
-        // Using claim_unprocessed to gate the sweep causes samples that genuinely
-        // cover the anchor region to be omitted when their query range was claimed
-        // by a prior anchor, producing a silent undercount.
-        //
-        // Stage 2 J: store ORIGINAL alignment coords (not pre-clipped). Out-of-region
-        // events toggle sample-active state but produce no emit (sweep clips per
-        // emit interval), so the correct samples are active across [region_start,
-        // region_end) without compounded clipping rounding error.
-        let aln_idx = alignments.len();
-        alignments.push(CompactAlignmentInfo::new(
-            query_sample_id,
-            aln.query_id,
-            query_start,
-            query_end,
-            target_start,
-            target_end,
-            aln.is_reverse,
-        ));
-
-        claim_buf.push((aln_idx, aln.query_id, cq_start, cq_end));
-    }
-
-    // Stage 1 F: batched claim by query_id. See process_anchor_region_raw.
-    if !claim_buf.is_empty() {
-        claim_buf.sort_by_key(|&(idx, qid, _, _)| (qid, idx));
-        let mut group_buf: Vec<(i64, i64)> = Vec::new();
-        let mut bool_buf: Vec<bool> = Vec::new();
-        let mut newly_owned: Vec<(usize, u32, i64, i64)> = Vec::new();
-        let mut i = 0;
-        while i < claim_buf.len() {
-            let qid = claim_buf[i].1;
-            let mut j = i;
-            while j < claim_buf.len() && claim_buf[j].1 == qid {
-                j += 1;
-            }
-            group_buf.clear();
-            group_buf.extend(claim_buf[i..j].iter().map(|&(_, _, s, e)| (s, e)));
-            bool_buf.clear();
-            global_used.claim_any_unprocessed_batch(qid, &group_buf, &mut bool_buf);
-            for (k, &b) in bool_buf.iter().enumerate() {
-                if b {
-                    let (idx, _, s, e) = claim_buf[i + k];
-                    newly_owned.push((idx, qid, s, e));
-                }
-            }
-            i = j;
-        }
-        newly_owned.sort_by_key(|&(idx, _, _, _)| idx);
-        for (_, qid, s, e) in newly_owned {
-            discovered_regions.push((qid, s, e));
-        }
-    }
-
-    sweep_line_depth_streaming(
+    );
+    sweep_line_depth_owned_streaming(
         &alignments,
         &[],
         num_samples,
+        anchor_seq_id,
         region_start,
         region_end,
+        global_used,
         compute_pangenome_bases,
         emit,
-    );
-
-    discovered_regions
+    )
 }
 
 /// Maximum region size for a single transitive BFS query (5 MB).
 /// Prevents BFS from visiting the entire pangenome when starting from a large chromosome.
 /// Non-transitive queries don't need this limit (they're O(log n) per lookup).
+#[cfg(test)]
 const TRANSITIVE_CHUNK_SIZE: i64 = 5_000_000;
 
 /// Default byte budget for the CIGAR-precise sub-index cache: ~40% of detected
@@ -5194,6 +5060,7 @@ const TRANSITIVE_CHUNK_SIZE: i64 = 5_000_000;
 /// it. 40% leaves headroom for the unified metadata (GBs), concurrent in-flight
 /// sub-index loads (rayon-pool × per-file), the bounded CIGAR working set, and
 /// the TSV/work output buffers.
+#[cfg(test)]
 fn adaptive_sub_index_cache_byte_budget() -> u64 {
     match total_system_memory_bytes() {
         Some(total) => total / 5 * 2, // 40% (order avoids u64 overflow / precision loss)
@@ -5201,6 +5068,7 @@ fn adaptive_sub_index_cache_byte_budget() -> u64 {
     }
 }
 
+#[cfg(test)]
 fn cigar_transitive_batch_memory_budget() -> u64 {
     if let Ok(raw) = std::env::var("IMPG_CIGAR_TRANSITIVE_BATCH_BYTES") {
         if let Ok(bytes) = raw.parse::<u64>() {
@@ -5220,6 +5088,7 @@ fn cigar_transitive_batch_memory_budget() -> u64 {
         .unwrap_or(512 * MIB)
 }
 
+#[cfg(test)]
 fn estimate_cigar_batch_result_bytes(
     overlaps: &[Vec<AdjustedInterval>],
     raw: &[Vec<RawAlignmentInterval>],
@@ -5241,6 +5110,7 @@ fn estimate_cigar_batch_result_bytes(
     bytes
 }
 
+#[cfg(test)]
 fn next_adaptive_batch_size(current: usize, observed_bytes: u64, budget_bytes: u64) -> usize {
     const MIN_BATCH: usize = 16;
     const MAX_BATCH: usize = 8_192;
@@ -5261,6 +5131,7 @@ fn next_adaptive_batch_size(current: usize, observed_bytes: u64, budget_bytes: u
 /// physical RAM (`/proc/meminfo` `MemTotal`) and any cgroup memory limit
 /// (SLURM/containers may cap below physical). `None` if nothing is detectable
 /// (e.g. non-Linux). Unlimited cgroup sentinels are ignored.
+#[cfg(test)]
 fn total_system_memory_bytes() -> Option<u64> {
     let mut total = meminfo_memtotal_bytes();
     let mut apply_limit = |value: u64| {
@@ -5303,6 +5174,7 @@ fn total_system_memory_bytes() -> Option<u64> {
 }
 
 /// Parse `MemTotal` (kB) from `/proc/meminfo` into bytes.
+#[cfg(test)]
 fn meminfo_memtotal_bytes() -> Option<u64> {
     let content = std::fs::read_to_string("/proc/meminfo").ok()?;
     for line in content.lines() {
@@ -5319,6 +5191,7 @@ fn meminfo_memtotal_bytes() -> Option<u64> {
 /// Each thread accumulates TSV text up to this limit before sending the
 /// buffer over the writer channel, balancing memory usage against per-send
 /// channel overhead.
+#[cfg(test)]
 const STREAMING_FLUSH_THRESHOLD: usize = 4 * 1024 * 1024;
 
 /// Bounded MPSC channel capacity for the dedicated TSV writer thread.
@@ -5328,6 +5201,7 @@ const STREAMING_FLUSH_THRESHOLD: usize = 4 * 1024 * 1024;
 /// queue only postpones backpressure while consuming memory; one buffer per
 /// worker, capped at 64, keeps useful elasticity without an excessive backlog.
 /// `IMPG_WRITER_CHANNEL_CAPACITY` permits workload-specific tuning.
+#[cfg(test)]
 fn writer_channel_capacity() -> usize {
     if let Ok(raw) = std::env::var("IMPG_WRITER_CHANNEL_CAPACITY") {
         if let Ok(capacity) = raw.parse::<usize>() {
@@ -5367,6 +5241,7 @@ fn writer_channel_capacity() -> usize {
 /// pair stay consistent — anything past the captured offsets gets truncated
 /// on resume regardless of whether it was a half-flushed TSV row or a
 /// half-flushed work-log record.
+#[cfg(test)]
 enum WriterMsg {
     /// Plain TSV bytes with no matching work-log record. Used for the
     /// non-resume path and for boundary writes that don't correspond to a
@@ -5381,11 +5256,13 @@ enum WriterMsg {
 
 /// TSV destination: a file we can `sync_data` + query stream position on, or
 /// stdout (no checkpointing — barrier returns dummies).
+#[cfg(test)]
 enum TsvSink {
     File(BufWriter<std::fs::File>),
     Stdout(BufWriter<std::io::Stdout>),
 }
 
+#[cfg(test)]
 impl TsvSink {
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
         match self {
@@ -5417,6 +5294,7 @@ impl TsvSink {
     }
 }
 
+#[cfg(test)]
 struct DepthWriter {
     tx: SyncSender<WriterMsg>,
     handle: JoinHandle<io::Result<()>>,
@@ -5426,6 +5304,7 @@ struct DepthWriter {
 }
 
 /// Options for opening the writer; controls header-write and work-log paths.
+#[cfg(test)]
 struct WriterOpts<'a> {
     /// Output prefix; when None, TSV goes to stdout and resume is disabled.
     output_prefix: Option<&'a str>,
@@ -5441,6 +5320,7 @@ struct WriterOpts<'a> {
     skip_header: bool,
 }
 
+#[cfg(test)]
 impl DepthWriter {
     fn open(opts: WriterOpts<'_>) -> io::Result<Self> {
         let WriterOpts {
@@ -5657,6 +5537,7 @@ impl DepthWriter {
 // freezes plus fdatasync calls against TB-sized files. 8192 bounds rework after
 // a crash while reducing synchronous commits by 128x. Users can tune this with
 // IMPG_CHECKPOINT_INTERVAL; tests retain the dedicated override below.
+#[cfg(test)]
 const CHECKPOINT_CHUNK_INTERVAL: usize = 8_192;
 
 /// Drives periodic ckpt commits and **chunk-freeze barriers** without
@@ -5704,10 +5585,12 @@ const CHECKPOINT_CHUNK_INTERVAL: usize = 8_192;
 ///
 /// When `state` is `None` (resume disabled or a stats-mode run) every method
 /// is a no-op so call sites can stay branchless.
+#[cfg(test)]
 struct CheckpointController<'a> {
     state: Option<CheckpointState<'a>>,
 }
 
+#[cfg(test)]
 struct CheckpointState<'a> {
     prefix: &'a str,
     invalidation_hash: u64,
@@ -5723,6 +5606,7 @@ struct CheckpointState<'a> {
     writer: &'a DepthWriter,
 }
 
+#[cfg(test)]
 impl<'a> CheckpointController<'a> {
     fn disabled() -> Self {
         Self { state: None }
@@ -5860,31 +5744,68 @@ impl<'a> CheckpointController<'a> {
 /// terminating `send_chunk_bundle` has been queued to the writer.
 ///
 /// When the controller is disabled (resume off), this guard holds nothing.
+#[cfg(test)]
 struct ChunkGuard<'a> {
     _read: Option<parking_lot::RwLockReadGuard<'a, ()>>,
 }
 
-/// Reference-free global depth computation.
-///
-/// Algorithm:
-/// 1. Sort all sequences by length descending (--ref sample gets priority)
-/// 2. For each sequence, find unprocessed regions
-/// 3. Query alignments for each unprocessed region (direct or transitive)
-/// 4. Compute depth via sweep-line, mark all discovered regions as processed
-/// 5. Every base in the pangenome is assigned to exactly one output row
-///
-/// Query modes:
-/// - Default (non-transitive): direct 1-hop queries. Fast, bounded memory.
-///   impg's bidirectional index captures both alignment directions in one lookup.
-/// - Transitive (-x): BFS with 5MB region chunking to bound memory.
-///
-/// Key properties:
-/// - Every base processed exactly once (no double-counting)
-/// - Hub-first ordering: high-connectivity sequences anchor first (auto-detected or via --ref)
-/// - --ref: ref-anchored mode, guarantees ref sample's coordinate system for covered regions
-/// - --ref-only: ref-only mode, output filtered to ref sample's anchored regions only
+/// Compute complete global coordinate homology groups. Legacy traversal
+/// controls do not limit transitive closure; use depth_closure::Options for
+/// explicit copy/coordinate modes. Region-query APIs retain their semantics.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_depth_global(
+    impg: &impl ImpgIndex,
+    _config: &DepthConfig,
+    separator: &str,
+    output_prefix: Option<&str>,
+    fai_list: Option<&str>,
+    window_size: Option<i64>,
+    min_interval_len: i64,
+    ref_sample: Option<&str>,
+    ref_only: bool,
+    min_seq_length: i64,
+    stats_mode: bool,
+    stats_combined: bool,
+    resume: bool,
+    _alignment_files: &[String],
+    explicit_order: Option<&[String]>,
+    dump_order: Option<&str>,
+) -> io::Result<()> {
+    if min_seq_length < 0 {
+        return Err(io::Error::other(
+            "minimum sequence length must be nonnegative",
+        ));
+    }
+    if min_interval_len > 0 {
+        info!("Global depth preserves homology/copy boundaries during merging");
+    }
+    super::depth_closure::compute(
+        impg,
+        &super::depth_closure::Options {
+            copies: super::depth_closure::CopyMode::All,
+            coordinates: super::depth_closure::CoordinateMode::Exact,
+            separator,
+            output_prefix,
+            fai_list,
+            samples: None,
+            sequence_index: None,
+            min_seq_length: min_seq_length as u64,
+            reference: ref_sample,
+            ref_only,
+            window_size,
+            stats: stats_mode,
+            combined: stats_combined,
+            resume,
+            explicit_order,
+            dump_order,
+        },
+    )
+}
+
+/// Previous anchor ownership pipeline, retained only as a TEST regression reference.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn compute_depth_global_legacy(
     impg: &impl ImpgIndex,
     config: &DepthConfig,
     separator: &str,
@@ -6345,6 +6266,13 @@ pub fn compute_depth_global(
     // proportional to the compact merged state instead of work-log volume.
     let global_used = std::sync::Arc::new(tracker.snapshot_clone());
 
+    // A completed chunk may have skipped anchor bases owned by another,
+    // still-uncommitted chunk when the process stopped. Recovery can skip it
+    // only if the replayed output also covers the whole anchor range.
+    let chunk_is_done = |id: u64, seq_id: u32, start: i64, end: i64| {
+        completed_chunks.contains(&id) && !tracker.has_unprocessed(seq_id, start, end)
+    };
+
     // =========================================================================
     // Two-phase parallel processing with hub-first guarantee.
     //
@@ -6640,7 +6568,7 @@ pub fn compute_depth_global(
                         .filter_map(|(local_idx, &(seq_id, sample_id, start, end))| {
                             let idx = base_idx + local_idx;
                             let chunk_id = encode_chunk_id_phase1(idx);
-                            if work_log_active && completed_chunks.contains(&chunk_id) {
+                            if work_log_active && chunk_is_done(chunk_id, seq_id, start, end) {
                                 let count = phase1_count.fetch_add(1, Ordering::Relaxed) + 1;
                                 pb_phase1.set_position(count as u64);
                                 None
@@ -6720,7 +6648,9 @@ pub fn compute_depth_global(
                     phase1_chunks.par_iter().enumerate().try_for_each(
                         |(idx, &(seq_id, sample_id, chunk_start, chunk_end))| -> io::Result<()> {
                             let chunk_id = encode_chunk_id_phase1(idx);
-                            if work_log_active && completed_chunks.contains(&chunk_id) {
+                            if work_log_active
+                                && chunk_is_done(chunk_id, seq_id, chunk_start, chunk_end)
+                            {
                                 let count = phase1_count.fetch_add(1, Ordering::Relaxed) + 1;
                                 pb_phase1.set_position(count as u64);
                                 return Ok(());
@@ -6817,7 +6747,7 @@ pub fn compute_depth_global(
                             .filter_map(|(local_idx, &(seq_id, sample_id, start, end))| {
                                 let idx = base_idx + local_idx;
                                 let chunk_id = encode_chunk_id_phase1(idx);
-                                if work_log_active && completed_chunks.contains(&chunk_id) {
+                                if work_log_active && chunk_is_done(chunk_id, seq_id, start, end) {
                                     let count = phase1_count.fetch_add(1, Ordering::Relaxed) + 1;
                                     pb_phase1.set_position(count as u64);
                                     None
@@ -6924,7 +6854,7 @@ pub fn compute_depth_global(
                         .filter_map(|(local_idx, &(seq_id, sample_id, start, end))| {
                             let idx = base_idx + local_idx;
                             let chunk_id = encode_chunk_id_phase1(idx);
-                            if work_log_active && completed_chunks.contains(&chunk_id) {
+                            if work_log_active && chunk_is_done(chunk_id, seq_id, start, end) {
                                 None
                             } else {
                                 Some((idx, seq_id, sample_id, start, end))
@@ -7085,7 +7015,7 @@ pub fn compute_depth_global(
                     // sweep would just produce identical TSV bytes. Short-
                     // circuiting here makes resume strictly faster.
                     let chunk_id = encode_chunk_id_phase1(idx);
-                    if work_log_active && completed_chunks.contains(&chunk_id) {
+                    if work_log_active && chunk_is_done(chunk_id, seq_id, chunk_start, chunk_end) {
                         let count = phase1_count.fetch_add(1, Ordering::Relaxed) + 1;
                         pb_phase1.set_position(count as u64);
                         return Ok(());
@@ -7204,13 +7134,8 @@ pub fn compute_depth_global(
             pb_phase1.finish_and_clear();
         }
 
-        // Mark all Phase 1 sequences as fully processed in both trackers.
-        // global_used prevents Phase 2 from double-counting bases already counted as anchor.
-        for &seq_id in &phase1_seqs {
-            let seq_len = compact_lengths.get_length(seq_id);
-            tracker.mark_processed(seq_id, 0, seq_len);
-            global_used.mark_processed(seq_id, 0, seq_len);
-        }
+        // Output sweeps already marked the exact emitted positions. Do not
+        // replace those masks with full sequence extents at a phase boundary.
 
         // When checkpointing is active emit a synthetic work-log record at
         // the Phase 1 → Phase 2 boundary so a resume that loses Phase 1 in
@@ -7220,11 +7145,7 @@ pub fn compute_depth_global(
         // here only when the boundary has not yet been committed in a
         // previous run.
         if work_log_active && !completed_chunks.contains(&CHUNK_ID_BOUNDARY) {
-            let regions: Vec<(u32, i64, i64)> = phase1_seqs
-                .iter()
-                .map(|&seq_id| (seq_id, 0i64, compact_lengths.get_length(seq_id)))
-                .collect();
-            let work_buf = encode_work_record(CHUNK_ID_BOUNDARY, &regions);
+            let work_buf = encode_work_record(CHUNK_ID_BOUNDARY, &[]);
             if let Some(ref w) = writer {
                 w.send_chunk_bundle(Vec::new(), work_buf)?;
             }
@@ -7319,7 +7240,7 @@ pub fn compute_depth_global(
                 while tile_start < seq_len {
                     let tile_end = (tile_start + TRANSITIVE_CHUNK_SIZE).min(seq_len);
                     let tile_id = encode_chunk_id_phase2_tile(seq_id, tile_start);
-                    if work_log_active && completed_chunks.contains(&tile_id) {
+                    if work_log_active && chunk_is_done(tile_id, seq_id, tile_start, tile_end) {
                         completed_tiles_skipped += 1;
                     } else if tracker.has_unprocessed(seq_id, tile_start, tile_end) {
                         phase2_tiles.push((seq_id, tile_start, tile_end));
@@ -7350,9 +7271,13 @@ pub fn compute_depth_global(
                     batch
                         .iter()
                         .copied()
-                        .filter(|&(seq_id, tile_start, _)| {
-                            !completed_chunks
-                                .contains(&encode_chunk_id_phase2_tile(seq_id, tile_start))
+                        .filter(|&(seq_id, tile_start, tile_end)| {
+                            !chunk_is_done(
+                                encode_chunk_id_phase2_tile(seq_id, tile_start),
+                                seq_id,
+                                tile_start,
+                                tile_end,
+                            )
                         })
                         .collect()
                 } else {
@@ -7771,8 +7696,13 @@ pub fn compute_depth_global(
                     batch
                         .iter()
                         .copied()
-                        .filter(|&(seq_id, start, _)| {
-                            !completed_chunks.contains(&encode_chunk_id_phase2(seq_id, start))
+                        .filter(|&(seq_id, start, end)| {
+                            !chunk_is_done(
+                                encode_chunk_id_phase2(seq_id, start),
+                                seq_id,
+                                start,
+                                end,
+                            )
                         })
                         .collect()
                 } else {
@@ -7829,8 +7759,13 @@ pub fn compute_depth_global(
                     batch
                         .iter()
                         .copied()
-                        .filter(|&(seq_id, start, _)| {
-                            !completed_chunks.contains(&encode_chunk_id_phase2(seq_id, start))
+                        .filter(|&(seq_id, start, end)| {
+                            !chunk_is_done(
+                                encode_chunk_id_phase2(seq_id, start),
+                                seq_id,
+                                start,
+                                end,
+                            )
                         })
                         .collect()
                 } else {
@@ -7986,9 +7921,13 @@ pub fn compute_depth_global(
                     batch
                         .iter()
                         .copied()
-                        .filter(|&(seq_id, region_start, _)| {
-                            !completed_chunks
-                                .contains(&encode_chunk_id_phase2(seq_id, region_start))
+                        .filter(|&(seq_id, region_start, region_end)| {
+                            !chunk_is_done(
+                                encode_chunk_id_phase2(seq_id, region_start),
+                                seq_id,
+                                region_start,
+                                region_end,
+                            )
                         })
                         .collect()
                 } else {
@@ -8077,8 +8016,13 @@ pub fn compute_depth_global(
                     batch
                         .iter()
                         .copied()
-                        .filter(|&(seq_id, chunk_start, _)| {
-                            !completed_chunks.contains(&encode_chunk_id_phase2(seq_id, chunk_start))
+                        .filter(|&(seq_id, chunk_start, chunk_end)| {
+                            !chunk_is_done(
+                                encode_chunk_id_phase2(seq_id, chunk_start),
+                                seq_id,
+                                chunk_start,
+                                chunk_end,
+                            )
                         })
                         .collect()
                 } else {
@@ -9218,6 +9162,397 @@ mod tests {
     use std::num::NonZeroUsize;
     use tempfile::TempDir;
 
+    // TEST data: two disjoint anchor intervals project onto overlapping query
+    // intervals. This is the shape of the reported VGP records 66 and 164.
+    #[test]
+    fn depth_output_claims_query_bases_only_once() {
+        let (_tmp, impg) = build_test_cigar_chain();
+        let lengths = CompactSequenceLengths::from_impg(&impg, "#");
+        let anchor = impg.seq_index.get_id("seqA").unwrap();
+        let query = impg.seq_index.get_id("seqB").unwrap();
+        let used = ConcurrentProcessedTracker::new(impg.seq_index.len());
+        let mut seen = IntervalSet::new();
+        let mut total = 0;
+        for (ts, te, qs, qe) in [(0, 100, 0, 100), (200, 300, 50, 150)] {
+            let raw = [RawAlignmentInterval {
+                target_start: ts,
+                target_end: te,
+                query_id: query,
+                query_start: qs,
+                query_end: qe,
+                is_reverse: false,
+            }];
+            let result = process_anchor_region_raw(
+                &raw,
+                &lengths,
+                lengths.sample_index().len(),
+                anchor,
+                lengths.get_sample_id(anchor),
+                ts,
+                te,
+                &used,
+                true,
+            );
+            for interval in result.intervals {
+                for (_, qid, start, end) in interval.samples {
+                    if qid == query {
+                        assert!(
+                            seen.iter_overlapping(start, end).next().is_none(),
+                            "TEST query bases emitted twice: {start}..{end}"
+                        );
+                        seen.add(start, end);
+                        total += end - start;
+                    }
+                }
+            }
+        }
+        assert_eq!(total, 150, "TEST unclaimed tail must still be emitted");
+    }
+
+    fn assert_owned_partition(intervals: &[SparseDepthInterval], num_sequences: usize) -> Vec<i64> {
+        let mut seen: Vec<_> = (0..num_sequences).map(|_| IntervalSet::new()).collect();
+        let mut totals = vec![0; num_sequences];
+        for interval in intervals {
+            for &(_, id, start, end) in &interval.samples {
+                assert!(start < end, "TEST empty output position");
+                assert!(
+                    seen[id as usize]
+                        .iter_overlapping(start, end)
+                        .next()
+                        .is_none(),
+                    "TEST duplicate position on sequence {id}: {start}..{end}"
+                );
+                seen[id as usize].add(start, end);
+                totals[id as usize] += end - start;
+            }
+        }
+        totals
+    }
+
+    #[test]
+    fn depth_output_marks_only_selected_positions() {
+        let used = ConcurrentProcessedTracker::new(3);
+        let alignments = [
+            CompactAlignmentInfo::new(0, 0, 0, 100, 0, 100, false),
+            CompactAlignmentInfo::new(1, 1, 0, 100, 0, 100, false),
+            // TEST alternative contig from the same sample is not selected.
+            CompactAlignmentInfo::new(1, 2, 0, 100, 0, 100, false),
+        ];
+        let (intervals, regions) =
+            sweep_line_depth_owned(&alignments, &[], 2, 0, 0, 100, &used, true);
+        assert_eq!(assert_owned_partition(&intervals, 3), [100, 100, 0]);
+        assert_eq!(used.get_unprocessed(2, 0, 100), [(0, 100)]);
+        assert!(!regions.iter().any(|&(id, _, _)| id == 2));
+        assert_eq!(
+            intervals.iter().map(|i| i.pangenome_bases).sum::<i64>(),
+            200
+        );
+    }
+
+    #[test]
+    fn depth_output_claims_reverse_indel_and_deletion_fallback_once() {
+        for reverse in [false, true] {
+            let used = ConcurrentProcessedTracker::new(2);
+            used.mark_processed(1, 15, 35);
+            used.mark_processed(1, 50, 60);
+            let entry = CigarEntry {
+                ops: ops_from(&[('M', 20), ('I', 10), ('M', 20), ('D', 5), ('M', 20)]),
+                target_start: 0,
+                target_end: 65,
+                query_start: 0,
+                query_end: 70,
+                strand: if reverse {
+                    Strand::Reverse
+                } else {
+                    Strand::Forward
+                },
+            };
+            // TEST overlapping alignment events force a window inside a D op.
+            let alignments = [
+                CompactAlignmentInfo::new(0, 0, 0, 65, 0, 65, false),
+                CompactAlignmentInfo::new_with_cigar(1, 1, 0, 70, 0, 65, reverse, 0),
+                CompactAlignmentInfo::new_with_cigar(1, 1, 0, 70, 41, 44, reverse, 0),
+            ];
+            let (intervals, regions) =
+                sweep_line_depth_owned(&alignments, &[entry], 2, 0, 0, 65, &used, true);
+            assert_eq!(assert_owned_partition(&intervals, 2)[0], 65);
+            for (_, id, start, end) in intervals.iter().flat_map(|i| i.samples.iter().copied()) {
+                if id == 1 {
+                    assert!(end <= 15 || start >= 35);
+                    assert!(end <= 50 || start >= 60);
+                }
+            }
+            // TEST recovery must reconstruct exactly the emitted marker state.
+            let replayed = ConcurrentProcessedTracker::new(2);
+            replayed.mark_processed(1, 15, 35);
+            replayed.mark_processed(1, 50, 60);
+            replayed.mark_processed_batch(&regions);
+            for id in 0..2 {
+                assert_eq!(
+                    used.get_unprocessed(id, 0, 70),
+                    replayed.get_unprocessed(id, 0, 70)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn depth_output_concurrent_anchors_cannot_claim_the_same_query() {
+        let used = ConcurrentProcessedTracker::new(3);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let results: Vec<_> = pool.install(|| {
+            (0..2u32)
+                .into_par_iter()
+                .map(|anchor| {
+                    let alignments = [
+                        CompactAlignmentInfo::new(anchor as u16, anchor, 0, 100, 0, 100, false),
+                        CompactAlignmentInfo::new(2, 2, 0, 100, 0, 100, anchor == 1),
+                    ];
+                    sweep_line_depth_owned(&alignments, &[], 3, anchor, 0, 100, &used, true).0
+                })
+                .collect()
+        });
+        let intervals: Vec<_> = results.into_iter().flatten().collect();
+        assert_eq!(assert_owned_partition(&intervals, 3), [100, 100, 100]);
+    }
+
+    #[test]
+    fn depth_output_resume_revisits_completed_chunk_with_uncommitted_owners() {
+        let (tmp, impg) = build_test_cigar_chain();
+        let anchor = impg.seq_index.get_id("seqA").unwrap();
+        let query = impg.seq_index.get_id("seqB").unwrap();
+        let prefix = tmp
+            .path()
+            .join("TEST_partial_commit")
+            .to_string_lossy()
+            .into_owned();
+        let config = DepthConfig {
+            transitive: false,
+            transitive_dfs: false,
+            max_depth: 2,
+            min_transitive_len: 1,
+            min_distance_between_ranges: 0,
+            merge_adjacent: false,
+            use_cigar_bfs: true,
+            phase2_max_waves: 4,
+            compute_pangenome_bases: false,
+        };
+        let inputs = HashInputs {
+            explicit_order: None,
+            ref_sample: Some("seqA"),
+            ref_only: false,
+            min_seq_length: 0,
+            min_interval_len: 0,
+            window_size: None,
+            merge_adjacent: false,
+            stats_mode: false,
+            stats_combined: false,
+            separator: "#",
+            fai_list: None,
+            use_cigar_bfs: true,
+            transitive: false,
+            transitive_dfs: false,
+            max_depth: 2,
+            phase2_max_waves: 4,
+            min_transitive_len: 1,
+            min_distance_between_ranges: 0,
+        };
+        // TEST recovery state: this chunk completed, but only 0..100 was
+        // written. Another in-flight chunk had owned the rest before crashing.
+        let tsv = b"#id\tlength\tdepth\tpositions\n1\t100\t2\tseqA:0-100;seqB:0-100\n";
+        let mut work = encode_worklog_header().to_vec();
+        work.extend(encode_work_record(
+            encode_chunk_id_phase1(0),
+            &[(anchor, 0, 100), (query, 0, 100)],
+        ));
+        std::fs::write(format!("{prefix}.depth.tsv"), tsv).unwrap();
+        std::fs::write(format!("{prefix}.depth.work.bin"), &work).unwrap();
+        let mut ck =
+            DepthCheckpoint::new(compute_invalidation_hash(impg.alignment_files(), &inputs));
+        ck.tsv_byte_offset = tsv.len() as u64;
+        ck.work_byte_offset = work.len() as u64;
+        ck.row_counter = 1;
+        ck.intervals_counter = 1;
+        ck.save_atomic(&prefix).unwrap();
+        compute_depth_global_legacy(
+            &impg,
+            &config,
+            "#",
+            Some(&prefix),
+            None,
+            None,
+            0,
+            Some("seqA"),
+            false,
+            0,
+            false,
+            false,
+            true,
+            impg.alignment_files(),
+            None,
+            None,
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(format!("{prefix}.depth.tsv")).unwrap();
+        let mut ranges: FxHashMap<String, Vec<(i64, i64)>> = FxHashMap::default();
+        for row in text.lines().skip(1) {
+            for token in row.split('\t').nth(3).unwrap().split(';') {
+                let (name, coords) = token.rsplit_once(':').unwrap();
+                let (start, end) = coords.split_once('-').unwrap();
+                ranges
+                    .entry(name.to_string())
+                    .or_default()
+                    .push((start.parse().unwrap(), end.parse().unwrap()));
+            }
+        }
+        for name in ["seqA", "seqB", "seqC"] {
+            let positions = ranges.get_mut(name).unwrap();
+            positions.sort_unstable();
+            let mut end = 0;
+            for &(s, e) in positions.iter() {
+                assert_eq!(s, end, "TEST recovery gap/overlap on {name}");
+                end = e;
+            }
+            assert_eq!(end, 300);
+        }
+    }
+
+    #[test]
+    fn depth_output_short_merges_preserve_holes_and_sample_sets() {
+        let cases = [
+            (vec![(0, 0, 0, 10)], vec![(0, 0, 20, 30)]), // TEST query hole
+            (vec![(0, 0, 0, 10)], vec![(0, 1, 10, 20)]), // TEST contig switch
+            (vec![(0, 0, 0, 10)], vec![(1, 1, 10, 20)]), // TEST sample switch
+        ];
+        for (left, right) in cases {
+            let intervals = vec![
+                SparseDepthInterval {
+                    start: 0,
+                    end: 10,
+                    samples: left,
+                    pangenome_bases: 10,
+                },
+                SparseDepthInterval {
+                    start: 10,
+                    end: 20,
+                    samples: right,
+                    pangenome_bases: 10,
+                },
+            ];
+            assert_eq!(merge_short_intervals(intervals.clone(), 100).len(), 2);
+            assert_eq!(stream_merge(intervals, 100).len(), 2);
+        }
+        let touching = vec![make_iv(0, 10, &[0]), make_iv(10, 20, &[0])];
+        assert_eq!(merge_short_intervals(touching, 100).len(), 1);
+    }
+
+    #[test]
+    fn depth_output_global_partition_all_modes() {
+        // TEST PAFs include duplications, alternative contigs, a reverse
+        // insertion, and a deletion. Every sequence's emitted tokens must tile
+        // its full length exactly once, independently of row order/depth.
+        let tmp = TempDir::new().unwrap();
+        let paf = tmp.path().join("TEST_overlap.paf");
+        std::fs::write(&paf, concat!(
+            "TEST_B#0#chr1\t200\t0\t100\t+\tTEST_A#0#chr1\t400\t0\t100\t100\t100\t60\tcg:Z:100=\n",
+            "TEST_B#0#chr1\t200\t50\t150\t+\tTEST_A#0#chr1\t400\t200\t300\t100\t100\t60\tcg:Z:100=\n",
+            "TEST_B#0#chr1\t200\t100\t160\t-\tTEST_A#0#chr1\t400\t300\t350\t50\t60\t60\tcg:Z:20=10I30=\n",
+            "TEST_B#0#chr2\t80\t0\t80\t+\tTEST_A#0#chr1\t400\t0\t80\t80\t80\t60\tcg:Z:80=\n",
+            "TEST_C#0#chr1\t170\t0\t170\t+\tTEST_A#0#chr1\t400\t100\t280\t170\t180\t60\tcg:Z:30=10D140=\n",
+        )).unwrap();
+        let mut seq_index = SequenceIndex::new();
+        let path = paf.to_str().unwrap().to_string();
+        let records = crate::paf::parse_paf_file(
+            &path,
+            File::open(&paf).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            &mut seq_index,
+        )
+        .unwrap();
+        let impg =
+            Impg::from_multi_alignment_records(&[(records, path.clone())], seq_index, None, true)
+                .unwrap();
+        for cigar in [false, true] {
+            for (transitive, dfs) in [(false, false), (true, false), (false, true)] {
+                for threads in [1, 4] {
+                    for windows in [None, Some(7)] {
+                        let prefix = tmp.path().join(format!(
+                            "TEST_{cigar}_{transitive}_{dfs}_{threads}_{windows:?}"
+                        ));
+                        let config = DepthConfig {
+                            transitive,
+                            transitive_dfs: dfs,
+                            max_depth: 2,
+                            min_transitive_len: 1,
+                            min_distance_between_ranges: 0,
+                            merge_adjacent: false,
+                            use_cigar_bfs: cigar,
+                            phase2_max_waves: 4,
+                            compute_pangenome_bases: false,
+                        };
+                        let pool = rayon::ThreadPoolBuilder::new()
+                            .num_threads(threads)
+                            .build()
+                            .unwrap();
+                        pool.install(|| {
+                            compute_depth_global_legacy(
+                                &impg,
+                                &config,
+                                "#",
+                                prefix.to_str(),
+                                None,
+                                windows,
+                                20,
+                                Some("TEST_A"),
+                                false,
+                                0,
+                                false,
+                                false,
+                                false,
+                                std::slice::from_ref(&path),
+                                None,
+                                None,
+                            )
+                        })
+                        .unwrap();
+                        let text =
+                            std::fs::read_to_string(format!("{}.depth.tsv", prefix.display()))
+                                .unwrap();
+                        let mut seen: FxHashMap<String, Vec<(i64, i64)>> = FxHashMap::default();
+                        for line in text.lines().skip(1) {
+                            let cols: Vec<_> = line.split('\t').collect();
+                            assert_eq!(cols.len(), 4, "TEST preserve existing output schema");
+                            let tokens: Vec<_> = cols[3].split(';').collect();
+                            assert_eq!(cols[2].parse::<usize>().unwrap(), tokens.len());
+                            for token in tokens {
+                                let (name, coords) = token.rsplit_once(':').unwrap();
+                                let (start, end) = coords.split_once('-').unwrap();
+                                let (start, end) =
+                                    (start.parse::<i64>().unwrap(), end.parse::<i64>().unwrap());
+                                assert!(start < end, "TEST empty output token: {token}");
+                                seen.entry(name.to_string()).or_default().push((start, end));
+                            }
+                        }
+                        assert_eq!(seen.len(), impg.seq_index.len());
+                        for (name, ranges) in &mut seen {
+                            ranges.sort_unstable();
+                            let mut end = 0;
+                            for &(s, e) in ranges.iter() {
+                                assert_eq!(s, end, "TEST gap/overlap on {name}: {ranges:?}");
+                                end = e;
+                            }
+                            let id = impg.seq_index.get_id(name).unwrap();
+                            assert_eq!(end as usize, impg.seq_index.get_len_from_id(id).unwrap());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn build_test_cigar_chain() -> (TempDir, Impg) {
         let tmp = TempDir::new().expect("TEST tempdir");
         let fixtures = [
@@ -10053,7 +10388,10 @@ mod tests {
             match pending.take() {
                 None => pending = Some(new),
                 Some(mut p) => {
-                    if new_is_short {
+                    if !can_merge_owned_intervals(&p, &new) {
+                        out.push(p);
+                        pending = Some(new);
+                    } else if new_is_short {
                         StreamingDepthEmitter::absorb_right(&mut p, new);
                         pending = Some(p);
                     } else if (p.end - p.start) >= min_len {
@@ -10212,8 +10550,8 @@ mod tests {
         let baseline = merge_short_intervals(ivs.clone(), 100);
         let streamed = stream_merge(ivs, 100);
         assert_intervals_equivalent(&baseline, &streamed);
-        // Sanity: this case really hit the [merged-shorts, long] split.
-        assert_eq!(baseline.len(), 2);
+        // Different sample sets must keep their original ownership boundaries.
+        assert_eq!(baseline.len(), 3);
     }
 
     #[test]

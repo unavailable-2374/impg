@@ -27,11 +27,58 @@ pub struct RawAlignmentInterval {
     pub is_reverse: bool,
 }
 
+/// A native source alignment, before bidirectional duplication or clipping.
+/// Used by global depth to decode each source record once, not once per query.
+pub struct DepthAlignment {
+    pub target_id: u32,
+    pub query_id: u32,
+    pub target_start: i64,
+    pub target_end: i64,
+    pub query_start: i64,
+    pub query_end: i64,
+    pub is_reverse: bool,
+    pub cigar: Vec<CigarOp>,
+}
+
 /// Trait for IMPG index operations.
 ///
 /// Both `Impg` (single-file) and `MultiImpg` (multi-file) implement this trait,
 /// allowing query commands to work transparently with either.
 pub trait ImpgIndex: Send + Sync {
+    /// Independently restartable, file-local units for strict bulk depth I/O.
+    fn depth_scan_units(&self) -> usize {
+        1
+    }
+    fn depth_unit_sequence_ids(&self, _unit: usize) -> io::Result<Vec<u32>> {
+        Ok((0..self.seq_index().len() as u32).collect())
+    }
+
+    /// The visitor is concurrent: implementations may split a single file
+    /// into independently decoded target/record batches on the Rayon pool.
+    fn scan_depth_unit_parallel(
+        &self,
+        unit: usize,
+        exact: bool,
+        sequence_index: Option<&UnifiedSequenceIndex>,
+        priorities: &[usize],
+        visit: &(dyn Fn(DepthAlignment) -> io::Result<()> + Sync),
+    ) -> io::Result<()> {
+        self.scan_depth_unit(unit, exact, sequence_index, priorities, &mut |a| visit(a))
+    }
+
+    fn scan_depth_unit(
+        &self,
+        _unit: usize,
+        _exact: bool,
+        _sequence_index: Option<&UnifiedSequenceIndex>,
+        _priorities: &[usize],
+        _visit: &mut (dyn FnMut(DepthAlignment) -> io::Result<()> + Send),
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this index does not support global homology depth",
+        ))
+    }
     /// Get a reference to the sequence index (unified for MultiImpg).
     fn seq_index(&self) -> &SequenceIndex;
 
@@ -529,6 +576,49 @@ impl ImpgWrapper {
 }
 
 impl ImpgIndex for ImpgWrapper {
+    fn depth_unit_sequence_ids(&self, unit: usize) -> io::Result<Vec<u32>> {
+        match self {
+            Self::Single(i) => i.depth_unit_sequence_ids(unit),
+            Self::Multi(i) => i.depth_unit_sequence_ids(unit),
+        }
+    }
+    fn scan_depth_unit_parallel(
+        &self,
+        unit: usize,
+        exact: bool,
+        sequence_index: Option<&UnifiedSequenceIndex>,
+        priorities: &[usize],
+        visit: &(dyn Fn(DepthAlignment) -> io::Result<()> + Sync),
+    ) -> io::Result<()> {
+        match self {
+            Self::Single(i) => {
+                i.scan_depth_unit_parallel(unit, exact, sequence_index, priorities, visit)
+            }
+            Self::Multi(i) => {
+                i.scan_depth_unit_parallel(unit, exact, sequence_index, priorities, visit)
+            }
+        }
+    }
+    fn depth_scan_units(&self) -> usize {
+        match self {
+            Self::Single(i) => i.depth_scan_units(),
+            Self::Multi(i) => i.depth_scan_units(),
+        }
+    }
+
+    fn scan_depth_unit(
+        &self,
+        unit: usize,
+        exact: bool,
+        sequence_index: Option<&UnifiedSequenceIndex>,
+        priorities: &[usize],
+        visit: &mut (dyn FnMut(DepthAlignment) -> io::Result<()> + Send),
+    ) -> io::Result<()> {
+        match self {
+            Self::Single(i) => i.scan_depth_unit(unit, exact, sequence_index, priorities, visit),
+            Self::Multi(i) => i.scan_depth_unit(unit, exact, sequence_index, priorities, visit),
+        }
+    }
     fn seq_index(&self) -> &SequenceIndex {
         match self {
             ImpgWrapper::Single(impg) => impg.seq_index(),

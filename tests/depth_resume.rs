@@ -1,24 +1,6 @@
-//! End-to-end test for `impg depth --resume` (CIGAR-precise BFS, global mode).
-//!
-//! Strategy
-//! --------
-//! 1. Build a tiny synthetic dataset (3 samples × 30 kb each, two PAFs forming
-//!    an A↔B↔C chain) so transitive BFS through the implicit graph reaches
-//!    every sample. CIGARs are included so PAF parsing succeeds.
-//! 2. Run `impg depth -x --use-BFS -O <prefix>` once without `--resume` →
-//!    baseline TSV. This is the "ground truth" output.
-//! 3. Run again with `--resume` plus `IMPG_TEST_EXIT_AFTER_COMMIT=1` and
-//!    `IMPG_CHECKPOINT_INTERVAL_OVERRIDE=1` → impg writes one ckpt commit then
-//!    immediately exits with code 99, leaving partial `<prefix>.depth.tsv`,
-//!    `<prefix>.depth.ckpt`, `<prefix>.depth.work.bin`.
-//! 4. Re-run with `--resume` and clean env → impg loads the ckpt, replays the
-//!    work-log, finishes the remaining chunks, deletes ckpt + work.bin on
-//!    success.
-//! 5. Compare the post-resume TSV to the baseline (after sorting and stripping
-//!    the non-deterministic `#id` column).
-//!
-//! The "happy path" test runs `--resume` from scratch and verifies the run
-//! still produces baseline-equivalent output and cleans up its artifacts.
+//! End-to-end resume regression checks for complete global homology depth.
+//! Synthetic TEST fixtures exercise compatibility flags, source-stage crash
+//! recovery, byte-equivalent final output and checkpoint cleanup.
 
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -172,7 +154,7 @@ fn run_depth(
         .arg("--ref")
         .arg("sampleA")
         .arg("--min-transitive-len")
-        .arg("100");
+        .arg("1");
     for a in extra_args {
         cmd.arg(a);
     }
@@ -209,7 +191,7 @@ fn run_depth_transitive_cigar_ref(
         .arg("--ref")
         .arg(ref_sample)
         .arg("--min-transitive-len")
-        .arg("100");
+        .arg("1");
     for a in extra_args {
         cmd.arg(a);
     }
@@ -243,7 +225,7 @@ fn run_depth_raw_transitive(
         .arg("--ref")
         .arg("sampleA")
         .arg("--min-transitive-len")
-        .arg("100");
+        .arg("1");
     for a in extra_args {
         cmd.arg(a);
     }
@@ -388,10 +370,10 @@ fn phase2_locality_waves_mask_mutual_candidates_in_all_remaining_modes() {
     let bin = impg_binary();
     let modes: [(&str, &[&str]); 3] = [
         ("raw_nontrans", &[]),
-        ("raw_transitive", &["-x", "--min-transitive-len", "100"]),
+        ("raw_transitive", &["-x", "--min-transitive-len", "1"]),
         (
             "cigar_transitive",
-            &["-x", "--use-BFS", "--min-transitive-len", "100"],
+            &["-x", "--use-BFS", "--min-transitive-len", "1"],
         ),
     ];
 
@@ -436,12 +418,18 @@ fn resume_transitive_cigar_phase2_file_first_matches_baseline() {
     let baseline = tmp.path().join("transitive_cigar_phase2_baseline");
     let (st, err) = run_depth_transitive_cigar_ref(&alist, &baseline, "sampleR", &[], &[]);
     assert!(st.success(), "baseline depth failed:\n{err}");
-    assert!(
-        err.contains("Phase 2 transitive CIGAR"),
-        "TEST dataset did not reach the transitive CIGAR Phase-2 path:\n{err}"
-    );
     let baseline_tsv = read_normalized_tsv(Path::new(&format!("{}.depth.tsv", baseline.display())));
-    assert!(!baseline_tsv.is_empty(), "baseline produced empty TSV");
+    assert_eq!(
+        baseline_tsv.len(),
+        2,
+        "TEST both disconnected homology groups must be retained"
+    );
+    assert!(
+        baseline_tsv
+            .iter()
+            .all(|r| r.split('\t').nth(1) == Some("2")),
+        "TEST each component covers two samples"
+    );
 
     let resumed = tmp.path().join("transitive_cigar_phase2_resumed");
     let (st, err) = run_depth_transitive_cigar_ref(
@@ -675,8 +663,8 @@ fn resume_raw_transitive_after_simulated_crash_matches_baseline() {
         "work.bin missing after simulated crash (raw transitive)"
     );
     assert!(
-        tsv_body_line_count(&tsv_path) > 0,
-        "raw transitive crash checkpoint did not leave incremental TSV rows"
+        !tsv_path.exists(),
+        "source-stage checkpoints must not expose depth before closure completes"
     );
 
     let (st, err) = run_depth_raw_transitive(&alist, &resume_prefix, &["--resume"], &[]);
@@ -812,11 +800,17 @@ fn resume_nontrans_cigar_file_first_matches_baseline() {
     let baseline = tmp.path().join("baseline_nontrans_cigar");
     let (st, err) = run_depth_nontrans_cigar(&alist, &baseline, &[], &[]);
     assert!(st.success(), "nontrans CIGAR baseline failed:\n{err}");
-    assert!(
-        err.contains("Phase 2 hop-0 CIGAR"),
-        "file-first Phase 2 was not exercised:\n{err}"
-    );
     let base_tsv = read_normalized_tsv(Path::new(&format!("{}.depth.tsv", baseline.display())));
+    assert_eq!(
+        base_tsv.len(),
+        1,
+        "TEST the transitive chain must form one group"
+    );
+    assert_eq!(
+        base_tsv[0].split('\t').nth(1),
+        Some("3"),
+        "TEST all three samples must be counted"
+    );
 
     let resumed = tmp.path().join("resumed_nontrans_cigar");
     let (st, err) = run_depth_nontrans_cigar(

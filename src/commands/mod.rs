@@ -1,6 +1,8 @@
 pub mod align;
 pub mod depth;
 pub mod depth_checkpoint;
+pub mod depth_closure;
+mod depth_storage;
 pub mod genotype;
 pub mod graph;
 pub mod infer;

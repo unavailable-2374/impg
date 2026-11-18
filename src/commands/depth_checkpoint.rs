@@ -63,7 +63,14 @@ use serde::{Deserialize, Serialize};
 /// bidirectional index entries can share a backing-file offset while requiring
 /// opposite I/D orientation; v3 could therefore emit directionally incorrect
 /// positions after cache reuse. Refuse to append corrected rows to those TSVs.
-pub const CKPT_SCHEMA_VERSION: u32 = 4;
+///
+/// v5 (2026-11-02): output ownership is enforced for every emitted sample
+/// position, and recovery logs record only those positions. Older checkpoints
+/// contain discovery masks that can suppress bases never actually emitted.
+///
+/// v6: global depth uses persistent interval homology closure, not ownership
+/// masks. Its checkpoint has a separate magic and cannot load v1-v5 state.
+pub const CKPT_SCHEMA_VERSION: u32 = 6;
 
 /// Bumped on any breaking layout change to the work-log binary format.
 pub const WORKLOG_VERSION: u16 = 1;
@@ -765,6 +772,21 @@ mod tests {
         let dir = tempdir().unwrap();
         let prefix = dir.path().join("nope").to_string_lossy().into_owned();
         assert!(DepthCheckpoint::try_load(&prefix).unwrap().is_none());
+    }
+
+    #[test]
+    fn ckpt_rejects_discovery_only_ownership_masks() {
+        let dir = tempdir().unwrap();
+        let prefix = dir
+            .path()
+            .join("TEST_legacy")
+            .to_string_lossy()
+            .into_owned();
+        let mut ck = DepthCheckpoint::new(123);
+        ck.schema_version = 4;
+        ck.save_atomic(&prefix).unwrap();
+        let err = DepthCheckpoint::try_load(&prefix).unwrap_err();
+        assert!(err.to_string().contains("schema"), "{err}");
     }
 
     #[test]

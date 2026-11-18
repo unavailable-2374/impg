@@ -116,13 +116,13 @@ compile_error!(
      `--features jemalloc` (default) or `--no-default-features --features system-alloc`"
 );
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use coitrees::{Interval, IntervalTree};
 use crossbeam_channel as channel;
 use impg::alignment_record::{AlignmentFormat, AlignmentRecord, Strand};
 use impg::commands::{
-    align, depth, depth_checkpoint, genotype, graph, infer, lace, partition, refine, render,
-    similarity,
+    align, depth, depth_checkpoint, depth_closure, genotype, graph, infer, lace, partition, refine,
+    render, similarity,
 };
 use impg::impg::{AdjustedInterval, CigarOp, Impg};
 use impg::impg_index::{ImpgIndex, ImpgWrapper};
@@ -6055,20 +6055,26 @@ GFA engine shorthand:
     },
 
     /// Compute pangenome coverage depth across sequences.
-    ///
-    /// Modes:
-    ///   (default)     Whole-pangenome depth with auto hub detection
-    ///   --ref SAMPLE  Ref-anchored: prioritize SAMPLE as coordinate-system anchor
-    ///   --ref + --ref-only  Ref-only: output only the ref sample's anchored regions
-    ///   -r / -b       Region query: depth for specific genomic regions
-    ///
-    /// Add-on:
-    ///   --stats       Produce summary statistics and per-depth BED files
+    /// Global mode computes complete transitive homology groups. Every
+    /// participating input base belongs to exactly one output record; depth
+    /// counts distinct samples, including all homologous copies.
+    /// -r / -b retain the independent local region-query interface.
     Depth {
         #[clap(flatten)]
         alignment: AlignmentOpts,
 
-        /// Enable transitive queries (with Breadth-First Search)
+        #[clap(flatten)]
+        sequence: SequenceOpts,
+
+        /// Keep all member coordinates; optionally append one representative per sample.
+        #[arg(long, value_enum, default_value_t = depth_closure::CopyMode::All)]
+        copy_mode: depth_closure::CopyMode,
+
+        /// Global coordinate evidence: exact CIGAR (default), or explicitly approximate linear mapping.
+        #[arg(long, value_enum)]
+        coordinate_mode: Option<depth_closure::CoordinateMode>,
+
+        /// Enable transitive local queries; accepted for compatibility in global mode (always transitive).
         #[arg(help_heading = "Transitive queries")]
         #[clap(short = 'x', long, action, conflicts_with = "transitive_dfs")]
         transitive: bool,
@@ -6076,16 +6082,12 @@ GFA engine shorthand:
         #[clap(flatten)]
         transitive_opts: TransitiveOpts,
 
-        /// File of sequence names, one per line, to process in exactly that
-        /// order. Named sequences are anchored first, in the order given; any
-        /// sequence not named follows under the default rule. The order is part
-        /// of the checkpoint's invalidation hash, so changing it starts a fresh
-        /// run rather than resuming into a different partition.
+        /// Sequence scheduling preference. Global homology membership is independent of this order.
         #[arg(help_heading = "Reference order")]
         #[clap(long, value_parser, conflicts_with = "ref_order")]
         ref_order_file: Option<String>,
 
-        /// Comma-separated sequence names to process in exactly that order
+        /// Comma-separated sequence names to prioritize during source scanning
         #[arg(help_heading = "Reference order")]
         #[clap(
             long,
@@ -6095,10 +6097,8 @@ GFA engine shorthand:
         )]
         ref_order: Option<Vec<String>>,
 
-        /// Write the sequence processing order actually used to this file, one
-        /// name per line, and carry on. The partition a depth run produces is a
-        /// function of this order, so an experiment that varies the order has to
-        /// be able to show that it did.
+        /// Write sequence scheduling priorities, one name per line.
+        /// Global homology membership is independent of scheduling.
         #[arg(help_heading = "Reference order")]
         #[clap(long, value_parser)]
         dump_order: Option<String>,
@@ -6109,17 +6109,12 @@ GFA engine shorthand:
         #[clap(long, value_parser)]
         fai_list: Option<String>,
 
-        /// Ref-anchored mode: prioritize this sample's sequences as anchors.
-        /// Guarantees all regions covered by this sample use its coordinate system.
-        /// All sequences are still output unless --ref-only is also specified.
-        /// Only meaningful for global depth; region queries (-r / -b) ignore it.
+        /// Prefer this sample as the displayed coordinate representative, without changing global groups.
         #[arg(help_heading = "Mode selection")]
         #[clap(long = "ref", value_parser, conflicts_with_all = &["target_range", "target_bed"])]
         ref_sample: Option<String>,
 
-        /// Ref-only mode: only output depth for the --ref sample's sequences.
-        /// Regions not covered by the ref sample are omitted entirely.
-        /// Requires --ref.
+        /// Emit only complete homology groups containing --ref; preserve all their member coordinates.
         #[arg(help_heading = "Mode selection")]
         #[clap(long, action, requires = "ref_sample")]
         ref_only: bool,
@@ -6136,16 +6131,8 @@ GFA engine shorthand:
         #[clap(long, action)]
         merge_adjacent: bool,
 
-        /// Compute CIGAR-precise depth: interval boundaries are projected
-        /// base-by-base through alignment CIGARs (exact at indels) instead of by
-        /// linear interpolation. Slower and higher memory than the default
-        /// (raw-interval + linear) path.
-        ///
-        /// Without a transitive flag this computes hop-0 (direct alignments)
-        /// only — ideal for all-vs-all inputs where every sample pair already has
-        /// a direct alignment, so no transitive exploration is needed. Combined
-        /// with `-x` / `--transitive-dfs` it makes the whole transitive chain
-        /// CIGAR-precise. (Alias: `--use-BFS`.)
+        /// Compatibility alias for --coordinate-mode exact (global default).
+        /// In local -r/-b queries, enable CIGAR-precise projection.
         #[arg(help_heading = "Performance")]
         #[clap(long = "cigar-precise", visible_alias = "use-BFS", action)]
         cigar_precise: bool,
@@ -6163,20 +6150,14 @@ GFA engine shorthand:
         /// Split output intervals at fixed multiples of this size, in bp.
         /// There is no default: without this flag nothing is split and each
         /// interval keeps the length the sweep produced. Cuts land on the
-        /// absolute grid (0, N, 2N, ...), not at offsets from an interval's
-        /// start, and each piece's per-sample coordinates are re-derived by
-        /// linear interpolation -- so a window grid gives up some of the
-        /// accuracy `--cigar-precise` buys. Global depth only; ignored by
-        /// `-r` / `-b`.
+        /// absolute grid (0, N, 2N, ...). Global groups are split using their
+        /// exact oriented member offsets. Ignored by -r / -b.
         #[arg(help_heading = "Performance")]
         #[clap(long, value_parser)]
         window_size: Option<i64>,
 
-        /// Maximum locality-aware Phase-2 waves. Each alignment-connected
-        /// component is split into ordered, balanced slices across at most this
-        /// many waves; discovered regions are masked between waves. Small
-        /// components retain one anchor sequence per wave. Set to 1 to disable
-        /// wave splitting.
+        /// Legacy scheduling option, accepted for compatibility.
+        /// Global homology closure does not use anchor waves.
         #[arg(help_heading = "Performance")]
         #[clap(long, value_parser, default_value_t = NonZeroUsize::new(64).unwrap())]
         phase2_max_waves: NonZeroUsize,
@@ -6204,14 +6185,14 @@ GFA engine shorthand:
         stats: bool,
 
         /// Add-on: output combined file with sample lists (requires --stats).
-        /// Creates a single BED file sorted by position with depth and sample columns.
+        /// Creates a single BED file in homology-group order with depth and sample columns.
         #[arg(help_heading = "Statistics add-on")]
         #[clap(long, action, requires = "stats")]
         combined_output: bool,
 
-        /// Absorb intervals shorter than this length (bp) into adjacent neighbors.
-        /// Prevents fragmentation caused by transient single-sample alignment dropouts.
-        /// The absorbing neighbor's depth is preserved; only its coordinate span grows.
+        /// Legacy merging threshold. Global mode always merges adjacent groups
+        /// only when every homologous member continues at the same offset;
+        /// copy boundaries and depth changes are preserved.
         /// 0 = disabled (default).
         #[arg(help_heading = "Output options")]
         #[clap(long, value_parser, default_value = "0")]
@@ -6234,10 +6215,8 @@ GFA engine shorthand:
         /// alignment fingerprint matches, work resumes from the most recent
         /// committed batch instead of starting over.
         ///
-        /// Supported on the global `impg depth` pipeline:
-        ///   - non-transitive (default) path
-        ///   - transitive raw-interval path (`-x` / `--transitive-dfs`)
-        ///   - transitive CIGAR-precise path (`-x --cigar-precise`)
+        /// Resumes source scans, boundary refinement, closure, grouping and output.
+        /// Checkpoints from the legacy anchor pipeline are rejected.
         ///
         /// Not supported: `-r` / `-b` region queries and `--stats`.
         /// `--output-prefix` is required.
@@ -6480,7 +6459,16 @@ fn main() {
 }
 
 fn run() -> io::Result<()> {
-    let args = Args::parse();
+    let matches = Args::command().get_matches();
+    let depth_explicit = |name: &str| {
+        matches
+            .subcommand()
+            .filter(|(name, _)| *name == "depth")
+            .is_some_and(|(_, m)| {
+                m.value_source(name) == Some(clap::parser::ValueSource::CommandLine)
+            })
+    };
+    let args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
     match args {
         Args::Index {
@@ -10572,6 +10560,9 @@ fn run() -> io::Result<()> {
         Args::Depth {
             common,
             alignment,
+            sequence,
+            copy_mode,
+            coordinate_mode,
             transitive,
             transitive_opts,
             ref_order_file,
@@ -10597,6 +10588,41 @@ fn run() -> io::Result<()> {
             resume,
         } => {
             initialize_threads_and_log(&common);
+            let is_region = target_range.is_some() || target_bed.is_some();
+            let coordinates = coordinate_mode.unwrap_or(depth_closure::CoordinateMode::Exact);
+            if cigar_precise && coordinates == depth_closure::CoordinateMode::Approx {
+                return Err(io::Error::other(
+                    "--cigar-precise/--use-BFS conflicts with --coordinate-mode approx",
+                ));
+            }
+            if !is_region {
+                if depth_explicit("max_depth") && transitive_opts.max_depth != 0 {
+                    return Err(io::Error::other("global depth computes complete homology closure; --max-depth must be 0 (unlimited), or use -r/-b for bounded queries"));
+                }
+                if depth_explicit("min_transitive_len")
+                    && transitive_opts.min_transitive_len.is_some_and(|n| n > 1)
+                {
+                    return Err(io::Error::other("global homology closure cannot discard short links; --min-transitive-len must be <= 1"));
+                }
+                if depth_explicit("min_distance_between_ranges")
+                    && transitive_opts.min_distance_between_ranges != 0
+                {
+                    return Err(io::Error::other("global homology closure cannot invent correspondence across gaps; --min-distance-between-ranges must be 0"));
+                }
+                if transitive
+                    || transitive_opts.transitive_dfs
+                    || depth_explicit("phase2_max_waves")
+                {
+                    info!("Global depth always computes transitive closure; legacy traversal/wave switches do not change groups");
+                }
+                if min_interval_len > 0 || merge_adjacent {
+                    info!("Global depth merges only compatible homologous members; short groups and copy/depth boundaries are preserved");
+                }
+            } else if copy_mode != depth_closure::CopyMode::All {
+                return Err(io::Error::other(
+                    "--copy-mode representative is a global-depth output option",
+                ));
+            }
 
             // Acquire before alignment discovery/index initialization so a
             // duplicate SLURM job fails immediately rather than spending
@@ -10609,11 +10635,13 @@ fn run() -> io::Result<()> {
 
             let alignment_files = resolve_alignment_files(&alignment)?;
 
+            let sequence_files = sequence.resolve_sequence_files()?;
+            let sequence_index = sequence.build_sequence_index()?;
             let impg = initialize_index(
                 &common,
                 &alignment,
                 alignment_files.as_slice(),
-                Vec::new(), // depth doesn't need sequence files
+                sequence_files,
             )?;
 
             // Load sample filter if provided
@@ -10630,7 +10658,8 @@ fn run() -> io::Result<()> {
                 min_transitive_len: transitive_opts.effective_min_transitive_len() as i64,
                 min_distance_between_ranges: transitive_opts.min_distance_between_ranges as i64,
                 merge_adjacent,
-                use_cigar_bfs: cigar_precise,
+                use_cigar_bfs: cigar_precise
+                    || coordinate_mode == Some(depth_closure::CoordinateMode::Exact),
                 phase2_max_waves: phase2_max_waves.get(),
                 compute_pangenome_bases: stats,
             };
@@ -10672,7 +10701,7 @@ fn run() -> io::Result<()> {
                         *start,
                         *end,
                         &region_context,
-                        None,
+                        sequence_index.as_ref(),
                     )?;
 
                     // Collect sample names
@@ -10723,12 +10752,6 @@ fn run() -> io::Result<()> {
             if min_seq_length > 0 {
                 info!("Minimum sequence length filter: {} bp", min_seq_length);
             }
-            if sample_filter.is_some() {
-                warn!(
-                    "--samples / --samples-file is ignored in global depth mode \
-                     (only honored with -r / -b region queries). Continuing without sample filter."
-                );
-            }
             // --resume reject early so the user gets a clear error before the
             // index load eats minutes of wall clock. Supported configurations:
             //   - non-transitive global depth (default path)
@@ -10766,23 +10789,26 @@ fn run() -> io::Result<()> {
                 (None, Some(list)) => Some(list.clone()),
                 (None, None) => None,
             };
-            depth::compute_depth_global(
+            depth_closure::compute(
                 &impg,
-                &config,
-                &separator,
-                output_prefix.as_deref(),
-                fai_list.as_deref(),
-                window_size,
-                min_interval_len,
-                ref_sample.as_deref(),
-                ref_only,
-                min_seq_length as i64,
-                stats,
-                combined_output,
-                resume,
-                alignment_files.as_slice(),
-                explicit_order.as_deref(),
-                dump_order.as_deref(),
+                &depth_closure::Options {
+                    copies: copy_mode,
+                    coordinates,
+                    separator: &separator,
+                    output_prefix: output_prefix.as_deref(),
+                    fai_list: fai_list.as_deref(),
+                    samples: sample_filter.as_ref(),
+                    sequence_index: sequence_index.as_ref(),
+                    min_seq_length,
+                    reference: ref_sample.as_deref(),
+                    ref_only,
+                    window_size,
+                    stats,
+                    combined: combined_output,
+                    resume,
+                    explicit_order: explicit_order.as_deref(),
+                    dump_order: dump_order.as_deref(),
+                },
             )?;
         }
     }
@@ -12135,13 +12161,11 @@ fn get_combined_index_filename(alignment_files: &[String], custom_index: Option<
     if alignment_files.len() == 1 {
         format!("{}.impg", alignment_files[0])
     } else {
-        // For multiple files, create a hash of the sorted filenames
-
-        let mut file_refs: Vec<&str> = alignment_files.iter().map(|s| s.as_str()).collect();
-        file_refs.sort();
-
+        // Metadata stores positional file IDs. Different input orders must
+        // never reuse the same index and read offsets from a different file.
         let mut hasher = DefaultHasher::new();
-        for file in &file_refs {
+        "ordered-alignment-files-v1".hash(&mut hasher);
+        for file in alignment_files {
             file.hash(&mut hasher);
         }
 

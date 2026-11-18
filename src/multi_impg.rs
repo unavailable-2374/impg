@@ -1648,6 +1648,93 @@ impl MultiImpg {
 }
 
 impl ImpgIndex for MultiImpg {
+    fn depth_scan_units(&self) -> usize {
+        self.index_paths.len()
+    }
+    fn depth_unit_sequence_ids(&self, unit: usize) -> io::Result<Vec<u32>> {
+        Ok(self
+            .local_to_unified
+            .get(unit)
+            .ok_or_else(|| io::Error::other("invalid depth source unit"))?
+            .iter()
+            .copied()
+            .filter(|&id| id != u32::MAX)
+            .collect())
+    }
+    fn scan_depth_unit_parallel(
+        &self,
+        unit: usize,
+        exact: bool,
+        sequence_index: Option<&UnifiedSequenceIndex>,
+        priorities: &[usize],
+        visit: &(dyn Fn(crate::impg_index::DepthAlignment) -> io::Result<()> + Sync),
+    ) -> io::Result<()> {
+        if unit >= self.index_paths.len() {
+            return Err(io::Error::other("invalid multi-index depth unit"));
+        }
+        let limiter = file_query_limiter();
+        let _permit = limiter.acquire(estimated_resident_bytes(self.index_sizes[unit]));
+        let impg = self.load_sub_index_transient(unit)?;
+        let mapping = &self.local_to_unified[unit];
+        let local_priorities: Vec<_> = mapping
+            .iter()
+            .map(|&id| priorities.get(id as usize).copied().unwrap_or(usize::MAX))
+            .collect();
+        impg.scan_depth_unit_parallel(
+            0,
+            exact,
+            sequence_index,
+            &local_priorities,
+            &|mut alignment| {
+                alignment.target_id = *mapping
+                    .get(alignment.target_id as usize)
+                    .filter(|&&id| id != u32::MAX)
+                    .ok_or_else(|| io::Error::other("unmapped depth target ID"))?;
+                alignment.query_id = *mapping
+                    .get(alignment.query_id as usize)
+                    .filter(|&&id| id != u32::MAX)
+                    .ok_or_else(|| io::Error::other("unmapped depth query ID"))?;
+                visit(alignment)
+            },
+        )
+    }
+    fn scan_depth_unit(
+        &self,
+        unit: usize,
+        exact: bool,
+        sequence_index: Option<&UnifiedSequenceIndex>,
+        priorities: &[usize],
+        visit: &mut (dyn FnMut(crate::impg_index::DepthAlignment) -> io::Result<()> + Send),
+    ) -> io::Result<()> {
+        if unit >= self.index_paths.len() {
+            return Err(io::Error::other("invalid multi-index depth unit"));
+        }
+        let limiter = file_query_limiter();
+        let _permit = limiter.acquire(estimated_resident_bytes(self.index_sizes[unit]));
+        let impg = self.load_sub_index_transient(unit)?;
+        let mapping = &self.local_to_unified[unit];
+        let local_priorities: Vec<_> = mapping
+            .iter()
+            .map(|&id| priorities.get(id as usize).copied().unwrap_or(usize::MAX))
+            .collect();
+        impg.scan_depth_unit(
+            0,
+            exact,
+            sequence_index,
+            &local_priorities,
+            &mut |mut alignment| {
+                alignment.target_id = *mapping
+                    .get(alignment.target_id as usize)
+                    .filter(|&&id| id != u32::MAX)
+                    .ok_or_else(|| io::Error::other("unmapped depth target ID"))?;
+                alignment.query_id = *mapping
+                    .get(alignment.query_id as usize)
+                    .filter(|&&id| id != u32::MAX)
+                    .ok_or_else(|| io::Error::other("unmapped depth query ID"))?;
+                visit(alignment)
+            },
+        )
+    }
     fn seq_index(&self) -> &SequenceIndex {
         &self.seq_index
     }
