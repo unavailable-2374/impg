@@ -6240,6 +6240,13 @@ GFA engine shorthand:
         #[clap(long, value_parser)]
         presence: Option<String>,
 
+        /// Directory of two-hop supplementary files (`<sample>.bin`) built on the same
+        /// sequence table as the store. Reported in separate columns; the direct
+        /// columns keep their meaning.
+        #[arg(help_heading = "Presence layer")]
+        #[clap(long, value_parser, requires = "presence")]
+        presence_hop: Option<String>,
+
         /// Split alignments at insertions or deletions of at least this many bases.
         #[arg(help_heading = "Presence layer")]
         #[clap(long, value_parser = parse_size, default_value = "50")]
@@ -10625,6 +10632,7 @@ fn run() -> io::Result<()> {
             resume,
             presence_out,
             presence,
+            presence_hop,
             presence_gap,
             presence_output,
             presence_mem,
@@ -10663,7 +10671,13 @@ fn run() -> io::Result<()> {
                     Some(p) => Box::new(BufWriter::new(File::create(format!("{p}.presence.tsv"))?)),
                     None => Box::new(BufWriter::new(io::stdout().lock())),
                 };
-                depth_presence::query(Path::new(&dir), &regions, mode, &mut out)?;
+                depth_presence::query(
+                    Path::new(&dir),
+                    presence_hop.as_deref().map(Path::new),
+                    &regions,
+                    mode,
+                    &mut out,
+                )?;
                 out.flush()?;
                 return Ok(());
             }

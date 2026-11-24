@@ -706,14 +706,70 @@ pub fn parse_region(s: &str) -> io::Result<(String, u64, u64)> {
     Ok((s[..colon].to_string(), a, b))
 }
 
+/// Call `f(start, end)` for every record of `(seq, other)` overlapping `[qs, qe)`, clipped to it.
+/// `rec` is sorted by `(seq, other, start)` and disjoint within `(seq, other)`.
+fn for_overlaps(rec: &[Rec], seq: u32, other: u32, qs: u32, qe: u32, mut f: impl FnMut(u32, u32)) {
+    let mut i = rec.partition_point(|r| (r.seq, r.other, r.s) < (seq, other, qs));
+    if i > 0 && rec[i - 1].seq == seq && rec[i - 1].other == other && rec[i - 1].e > qs {
+        i -= 1;
+    }
+    while i < rec.len() && rec[i].seq == seq && rec[i].other == other && rec[i].s < qe {
+        let (a, b) = (rec[i].s.max(qs), rec[i].e.min(qe));
+        if b > a {
+            f(a, b);
+        }
+        i += 1;
+    }
+}
+
+/// Load the hop-only records of sample `x` and check that they were built on the same table.
+fn read_hop(dir: &Path, t: &Table, x: u32) -> io::Result<Vec<Rec>> {
+    let path = dir.join(format!("{}.bin", t.samples[x as usize]));
+    let rec = read_recs(&path).map_err(|e| io::Error::other(format!("{}: {e}", path.display())))?;
+    let ok = rec.iter().all(|r| {
+        r.s < r.e
+            && t.own.get(r.seq as usize) == Some(&x)
+            && r.e as u64 <= t.len[r.seq as usize]
+            && (r.other as usize) < t.samples.len()
+            && r.other != x
+    });
+    let sorted = rec
+        .windows(2)
+        .all(|p| (p[0].seq, p[0].other, p[0].e) <= (p[1].seq, p[1].other, p[1].s));
+    if !ok || !sorted {
+        return Err(io::Error::other(format!(
+            "{} does not match the presence store (different sequence table, or not sorted)",
+            path.display()
+        )));
+    }
+    Ok(rec)
+}
+
 /// Answer region queries from a presence store.
-pub fn query(dir: &Path, regions: &[(String, u64, u64)], mode: QueryMode, w: &mut impl Write) -> io::Result<()> {
+///
+/// `hop` is an optional directory of two-hop supplementary files (`<X>.bin`, same record
+/// format, bases without direct presence only, built on the same sequence table). It adds
+/// columns and never changes the direct ones, except that a sample present only through
+/// the hop layer is listed in `hop_only` instead of `absent`.
+pub fn query(
+    dir: &Path,
+    hop: Option<&Path>,
+    regions: &[(String, u64, u64)],
+    mode: QueryMode,
+    w: &mut impl Write,
+) -> io::Result<()> {
     let t = Table::read(dir)?;
     let s = t.samples.len() as u32;
     match mode {
-        QueryMode::Samples => writeln!(w, "#region\tsample\tcovered_bp\tfraction")?,
-        QueryMode::Segments => writeln!(w, "#region\tstart\tend\tdepth\tpresent\tabsent")?,
+        QueryMode::Samples => write!(w, "#region\tsample\tcovered_bp\tfraction")?,
+        QueryMode::Segments => write!(w, "#region\tstart\tend\tdepth\tpresent\tabsent")?,
     }
+    match (hop, mode) {
+        (None, _) => writeln!(w)?,
+        (Some(_), QueryMode::Samples) => writeln!(w, "\thop_only_bp\thop_only_fraction")?,
+        (Some(_), QueryMode::Segments) => writeln!(w, "\thop_only_count\thop_only")?,
+    }
+    let mut hop_rec: Vec<Rec> = Vec::new();
     let mut loaded = u32::MAX;
     let mut rec: Vec<Rec> = Vec::new();
     for (name, qs0, qe0) in regions {
@@ -730,70 +786,76 @@ pub fn query(dir: &Path, regions: &[(String, u64, u64)], mode: QueryMode, w: &mu
         }
         if x != loaded {
             rec = read_recs(&dir.join("presence").join(format!("{}.bin", t.samples[x as usize])))?;
+            if let Some(h) = hop {
+                hop_rec = read_hop(h, &t, x)?;
+            }
             loaded = x;
         }
         let label = format!("{name}:{qs}-{qe}");
         let (qs32, qe32) = (qs as u32, qe as u32);
-        let mut ev: Vec<(u32, u32, i32)> = Vec::new(); // (pos, sample, delta)
+        // (pos, sample, layer, starts); layer 0 = direct, 1 = hop-only
+        let mut ev: Vec<(u32, u32, u8, bool)> = Vec::new();
+        let width = (qe - qs) as f64;
         for o in 0..s {
             if o == x {
                 continue;
             }
-            let key = (sq, o, qs32);
-            let mut i = rec.partition_point(|r| (r.seq, r.other, r.s) < key);
-            if i > 0 && rec[i - 1].seq == sq && rec[i - 1].other == o && rec[i - 1].e > qs32 {
-                i -= 1;
-            }
-            let mut cov = 0u64;
-            while i < rec.len() && rec[i].seq == sq && rec[i].other == o && rec[i].s < qe32 {
-                let (a, b) = (rec[i].s.max(qs32), rec[i].e.min(qe32));
-                if b > a {
-                    cov += (b - a) as u64;
-                    ev.push((a, o, 1));
-                    ev.push((b, o, -1));
-                }
-                i += 1;
+            let mut cov = [0u64; 2];
+            for (layer, r) in [&rec, &hop_rec].into_iter().enumerate() {
+                for_overlaps(r, sq, o, qs32, qe32, |a, b| {
+                    cov[layer] += (b - a) as u64;
+                    ev.push((a, o, layer as u8, true));
+                    ev.push((b, o, layer as u8, false));
+                });
             }
             if mode == QueryMode::Samples {
-                writeln!(w, "{}\t{}\t{}\t{:.6}", label, t.samples[o as usize], cov, cov as f64 / (qe - qs) as f64)?;
+                write!(w, "{}\t{}\t{}\t{:.6}", label, t.samples[o as usize], cov[0], cov[0] as f64 / width)?;
+                if hop.is_some() {
+                    write!(w, "\t{}\t{:.6}", cov[1], cov[1] as f64 / width)?;
+                }
+                writeln!(w)?;
             }
         }
         if mode == QueryMode::Samples {
             continue;
         }
-        ev.sort_unstable_by_key(|e| e.0);
-        let mut on = vec![false; s as usize];
-        let mut depth = 1u32;
+        ev.sort_unstable();
+        let mut on = [vec![false; s as usize], vec![false; s as usize]];
         let mut ss = qs32;
-        let emit = |a: u32, b: u32, depth: u32, on: &[bool], w: &mut dyn Write| -> io::Result<()> {
+        let join = |v: &[&str]| if v.is_empty() { "-".to_string() } else { v.join(",") };
+        let emit = |a: u32, b: u32, on: &[Vec<bool>; 2], w: &mut dyn Write| -> io::Result<()> {
             if b <= a {
                 return Ok(());
             }
-            let mut pres: Vec<&str> = Vec::new();
-            let mut abs: Vec<&str> = Vec::new();
-            for o in 0..s {
-                if o == x {
-                    continue;
+            let (mut present, mut absent, mut hops) = (Vec::new(), Vec::new(), Vec::new());
+            for o in (0..s as usize).filter(|&o| o != x as usize) {
+                let name = t.samples[o].as_str();
+                if on[0][o] {
+                    present.push(name);
+                } else if on[1][o] {
+                    hops.push(name);
+                } else {
+                    absent.push(name);
                 }
-                if on[o as usize] { pres.push(&t.samples[o as usize]) } else { abs.push(&t.samples[o as usize]) }
             }
-            let p = if pres.is_empty() { "-".to_string() } else { pres.join(",") };
-            let q = if abs.is_empty() { "-".to_string() } else { abs.join(",") };
-            writeln!(w, "{label}\t{a}\t{b}\t{depth}\t{p}\t{q}")
+            write!(w, "{label}\t{a}\t{b}\t{}\t{}\t{}", present.len() + 1, join(&present), join(&absent))?;
+            if hop.is_some() {
+                write!(w, "\t{}\t{}", hops.len(), join(&hops))?;
+            }
+            writeln!(w)
         };
         let mut j = 0;
         while j < ev.len() {
             let p = ev[j].0;
-            emit(ss, p, depth, &on, w)?;
+            emit(ss, p, &on, w)?;
+            // sorted so that an end precedes a start of the same sample, layer and position
             while j < ev.len() && ev[j].0 == p {
-                // intervals of one sample are merged, so a sample never ends and starts at one position
-                on[ev[j].1 as usize] = ev[j].2 > 0;
-                depth = (depth as i64 + ev[j].2 as i64) as u32;
+                on[ev[j].2 as usize][ev[j].1 as usize] = ev[j].3;
                 j += 1;
             }
             ss = p;
         }
-        emit(ss, qe32, depth, &on, w)?;
+        emit(ss, qe32, &on, w)?;
     }
     Ok(())
 }
@@ -881,15 +943,42 @@ mod tests {
         assert!(stat.contains("HIST\tA\t3\t50\n"), "{stat}");
 
         let mut buf = Vec::new();
-        query(&out, &[("A#0#c1".into(), 150, 260)], QueryMode::Samples, &mut buf).unwrap();
+        query(&out, None, &[("A#0#c1".into(), 150, 260)], QueryMode::Samples, &mut buf).unwrap();
         let text = String::from_utf8(buf).unwrap();
         assert!(text.contains("A#0#c1:150-260\tB\t110\t1.000000"), "{text}");
         assert!(text.contains("A#0#c1:150-260\tC\t50\t0.454545"), "{text}");
         let mut buf = Vec::new();
-        query(&out, &[("A#0#c1".into(), 150, 260)], QueryMode::Segments, &mut buf).unwrap();
+        query(&out, None, &[("A#0#c1".into(), 150, 260)], QueryMode::Segments, &mut buf).unwrap();
         let text = String::from_utf8(buf).unwrap();
         let rows: Vec<&str> = text.lines().skip(1).collect();
         assert_eq!(rows, vec!["A#0#c1:150-260\t150\t200\t2\tB\tC", "A#0#c1:150-260\t200\t250\t3\tB,C\t-", "A#0#c1:150-260\t250\t260\t2\tB\tC"]);
+    }
+
+    #[test]
+    fn query_reports_hop_layer_separately() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (files, list) = fixture(tmp.path());
+        let out = tmp.path().join("store");
+        build(&files, &list, "#", 50, 1 << 30, false, &out).unwrap();
+        let hop = tmp.path().join("hop");
+        fs::create_dir(&hop).unwrap();
+        // C is direct over [200,250); hop-only continues it over [250,280)
+        fs::write(hop.join("A.bin"), as_bytes(&[Rec { seq: 0, s: 250, e: 280, other: 2 }])).unwrap();
+        let region = [("A#0#c1".to_string(), 190, 290)];
+        let mut buf = Vec::new();
+        query(&out, Some(hop.as_path()), &region, QueryMode::Segments, &mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        let rows: Vec<&str> = text.lines().skip(1).map(|l| l.split_once('\t').unwrap().1).collect();
+        assert_eq!(
+            rows,
+            vec!["190\t200\t2\tB\tC\t0\t-", "200\t250\t3\tB,C\t-\t0\t-", "250\t280\t2\tB\t-\t1\tC", "280\t290\t2\tB\tC\t0\t-"]
+        );
+        let mut buf = Vec::new();
+        query(&out, Some(hop.as_path()), &region, QueryMode::Samples, &mut buf).unwrap();
+        assert!(String::from_utf8(buf).unwrap().contains("\tC\t50\t0.500000\t30\t0.300000\n"));
+        // a record on another sample's sequence means a different table
+        fs::write(hop.join("A.bin"), as_bytes(&[Rec { seq: 1, s: 0, e: 10, other: 2 }])).unwrap();
+        assert!(query(&out, Some(hop.as_path()), &region, QueryMode::Samples, &mut Vec::new()).is_err());
     }
 
     #[test]
